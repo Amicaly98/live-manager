@@ -1,0 +1,50 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+dist-electron/
+frontend/dist/
+release/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# Logs
+*.log
+backend.log
+main.log
+task_manager.log
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Environment
+.env
+.env.local
+
+# Electron builder
+release/
+
+# ==== 敏感/运行时数据（切勿提交）====
+bili_cookies.json
+settings.json
+live_state.json
+live_tasks.db
+live_tasks.xlsx
+rtmp_cache.json
+task_manager_last_run.json
+
+# FFmpeg 临时文件
+_ffmpeg_concat_*.txt
+_temp_*
