@@ -48,3 +48,4 @@ task_manager_last_run.json
 # FFmpeg 临时文件
 _ffmpeg_concat_*.txt
 _temp_*
+HANDOFF.md
