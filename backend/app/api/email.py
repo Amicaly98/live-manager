@@ -31,7 +31,11 @@ async def send_test_email():
 
 @router.post("/confirm-face-verify", summary="远程确认人脸验证（供邮件链接回调）")
 async def confirm_face_verify_remote(token: str = ""):
-    """通过邮件中的 token 远程确认人脸验证完成并重试开播"""
+    """通过邮件中的 token 远程确认人脸验证完成并重试开播。
+
+    A7：确认动作记录当前控制代际；确认与重试之间若用户执行了停止
+    （代际已推进），迟到的重试会在 start_streaming 的代际复核点作废。
+    """
     sender = get_email_sender()
     lc = get_live_controller()
     if not sender or not lc:
@@ -42,10 +46,14 @@ async def confirm_face_verify_remote(token: str = ""):
         expiry = sender._face_verify_tokens[token]
         if time.time() < expiry:
             del sender._face_verify_tokens[token]
+            # 记录确认时刻的控制代际（停止会推进代际，使本次确认失效）
+            confirm_epoch = getattr(lc, '_control_epoch', None)
             lc.confirm_face_verify()
-            # 重试开播
+            # 重试开播（代际守卫在控制器与 start_streaming 内复核）
             import threading
-            threading.Thread(target=sender._retry_after_face_verify, daemon=True).start()
+            threading.Thread(
+                target=sender._retry_after_face_verify,
+                args=(confirm_epoch,), daemon=True).start()
             return {'success': True, 'message': '人脸验证已确认，正在重试开播'}
         else:
             return {'success': False, 'message': '链接已过期（30分钟有效）'}

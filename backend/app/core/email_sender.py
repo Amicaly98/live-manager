@@ -332,13 +332,22 @@ B站验证页面：
         except OSError as e:
             logger.warning(f"人脸验证端口 {port} 被占用：{e}")
 
-    def _retry_after_face_verify(self):
-        """人脸验证确认后，等待 3 秒然后用完整流程重试开播"""
+    def _retry_after_face_verify(self, confirm_epoch=None):
+        """人脸验证确认后，等待 3 秒然后用完整流程重试开播。
+
+        A7：confirm_epoch 是用户确认时刻的控制代际。等待期间用户停止
+        （代际推进）后，这次迟到的重试直接作废；即便通过了这里的检查，
+        start_streaming 还会在自身复核点再次核对代际。
+        """
         time.sleep(3)
         try:
             from app.dependencies import get_live_controller
             lc = get_live_controller()
             if not lc or not lc.current_instruction:
+                return
+            # 代际守卫：确认属于已过去的代际（用户已停止/新意图）→ 不重试
+            guard = getattr(lc, 'retry_after_face_verify_guarded', None)
+            if guard is not None and not guard(confirm_epoch):
                 return
             # 重新查找视频
             video_path = lc.video_finder.find_video(lc.current_instruction.zone_name) or ''
@@ -347,7 +356,8 @@ B站验证页面：
                 logger.warning("FFmpeg 模式但未找到视频文件，跳过重试")
                 return
             logger.info("人脸验证已确认，启动完整开播流程...")
-            lc.start_streaming(lc.current_instruction, video_path, is_task_mode=True)
+            lc.start_streaming(lc.current_instruction, video_path,
+                               is_task_mode=True, epoch=confirm_epoch)
         except Exception as e:
             logger.error(f"人脸验证后重试失败：{e}")
 

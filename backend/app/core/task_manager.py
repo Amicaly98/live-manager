@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 from app.models.schemas import LiveInstruction, Task
 from app.core.db import TaskDB
+from app.core.config import last_run_file_path
 
 # 常量
 REQUIRED_COLUMNS = [
@@ -37,7 +38,7 @@ class TaskManager:
         self._reset_lock = threading.Lock()
         self._scheduler_running = True
         self._is_resetting = False
-        self._last_run_date_file = Path("task_manager_last_run.json")
+        self._last_run_date_file = last_run_file_path()  # A8/E3：统一数据目录
         self._last_run_date: Optional[date] = None
 
         self._load_last_run_date()
@@ -443,7 +444,12 @@ class TaskManager:
     def is_resetting(self) -> bool:
         return self._is_resetting
 
-    def wait_for_reset_complete(self, timeout: float = 120.0) -> bool:
+    def wait_for_reset_complete(self, timeout: float = 120.0, cancel=None) -> bool:
+        """等待每日重置完成（不改变重置行为本身）。
+
+        cancel: 可选 threading.Event（A2）——停止时立即打断等待，
+        让挂起的开播请求在下一个复核点作废，而不是傻等 120 秒。
+        """
         if not self._is_resetting:
             return True
         logger.info(" 等待每日重置完成...")
@@ -452,7 +458,11 @@ class TaskManager:
             if time.time() - start_time > timeout:
                 logger.warning(f"️ 等待重置超时（{timeout}秒）")
                 return False
-            time.sleep(1)
+            if cancel is not None and cancel.wait(1):
+                logger.info(" 等待重置被停止打断")
+                return False
+            if cancel is None:
+                time.sleep(1)
         logger.info(" 每日重置已完成")
         return True
 

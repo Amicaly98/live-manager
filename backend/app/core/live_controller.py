@@ -11,10 +11,13 @@ import json
 import time
 import random
 import logging
+import secrets
 import threading
 import subprocess
 import hashlib
+import collections
 import urllib.parse
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict, TYPE_CHECKING
 from datetime import datetime, date, timedelta
@@ -26,7 +29,10 @@ from app.core.config import (
     BILIBILI_APP_KEY, BILIBILI_APP_SEC,
     HEADERS, DEFAULT_LIVE_DURATION_BASE,
     MAX_RECONNECT_ATTEMPTS, MONITOR_INTERVAL,
-    CROSS_DAY_CHECK_INTERVAL
+    CROSS_DAY_CHECK_INTERVAL,
+    cookies_file_path, area_file_path, state_file_path,
+    rtmp_cache_file_path, ffmpeg_log_path, temp_dir_path,
+    FFMPEG_LOG_MAX_BYTES, stop_intent_file_path,
 )
 from app.models.schemas import LiveInstruction, Task
 
@@ -34,6 +40,9 @@ if TYPE_CHECKING:
     from app.core.task_manager import TaskManager
 
 logger = logging.getLogger(__name__)
+
+# 面板查询请求的有限重试上限（无取消上下文时）
+_PANEL_QUERY_MAX_ATTEMPTS = 3
 
 
 # ==================== VideoPathFinder（原样保留） ====================
@@ -79,10 +88,13 @@ class VideoPathFinder:
 class BilibiliApi:
     """B 站直播 API 封装（支持 cookies 持久化）"""
 
-    def __init__(self, cookie_file: str = "bili_cookies.json"):
+    def __init__(self, cookie_file: str = None):
         self.cookies = {}
         self.headers = HEADERS.copy()
-        self.cookie_file = Path(cookie_file)
+        self.cookie_file = Path(cookie_file) if cookie_file else cookies_file_path()
+        # 网络重试上下文：后台线程可用 retry_network_until_cancelled 注入
+        # 取消事件实现"无限重试直到恢复/取消"；面板查询保持有限重试。
+        self._retry_context = type('_RetryCtx', (), {'cancel': None})()
         self._load_cookies()
 
     def _load_cookies(self):
@@ -145,11 +157,39 @@ class BilibiliApi:
             f"{time.time()}_{random.randint(1000, 9999)}".encode()
         ).hexdigest()[:16]
 
+    @contextmanager
+    def retry_network_until_cancelled(self, cancel):
+        """仅当前后台线程持续重试网络错误，不改变面板查询的重试策略。
+
+        用法（后台线程内）：
+            with api.retry_network_until_cancelled(cancel_event):
+                ...  该线程内发起的 _req 遇网络错误将无限重试，
+                     每次 await cancel_event（停止时立即打断）
+        """
+        previous = getattr(self._retry_context, 'cancel', None)
+        self._retry_context.cancel = cancel
+        try:
+            yield
+        finally:
+            self._retry_context.cancel = previous
+
     def _req(self, method: str, url: str, params: dict = None, data: dict = None) -> Tuple[bool, dict]:
-        """发送 API 请求，网络层无限重试（指数退避，上限30s）"""
+        """发送 API 请求（A1：有界 + 可取消）。
+
+        - 有取消上下文（后台开播线程注入）：网络错误无限重试等待恢复，
+          每次等待用 cancel.wait() 可被停止立即打断；
+        - 无取消上下文（面板查询/登录等同步调用）：最多 _PANEL_QUERY_MAX_ATTEMPTS
+          次有限重试后返回失败——绝不在事件循环或调用线程里无限等待；
+        - HTTP 408/429/5xx 视为上游暂不可用（可重试），4xx 视为平台拒绝（不重试）。
+        """
+        cancel = getattr(self._retry_context, 'cancel', None)
         attempt = 0
+        resp = None
         while True:
+            if cancel is not None and cancel.is_set():
+                return False, {"code": -1, "msg": "操作已取消", "cancelled": True}
             attempt += 1
+            resp = None
             try:
                 url = url.strip()
                 req_cookies = self.cookies.copy()
@@ -162,8 +202,16 @@ class BilibiliApi:
                     resp = requests.get(url, params=params, cookies=req_cookies, headers=self.headers, timeout=timeout)
                 else:
                     resp = requests.post(url, params=params, data=data, cookies=req_cookies, headers=self.headers, timeout=timeout)
+                if cancel is not None and cancel.is_set():
+                    return False, {"code": -1, "msg": "操作已取消", "cancelled": True}
+                if resp.status_code in (408, 429) or resp.status_code >= 500:
+                    raise requests.ConnectionError(f"上游暂不可用 HTTP {resp.status_code}")
+                if resp.status_code >= 400:
+                    return False, {"code": resp.status_code, "msg": f"平台拒绝请求 HTTP {resp.status_code}"}
                 try:
                     json_data = resp.json()
+                    if not isinstance(json_data, dict) or 'code' not in json_data:
+                        raise ValueError('响应缺少业务状态码')
                     code = json_data.get("code", -1)
                     msg = json_data.get("message") or json_data.get("msg", "")
                     if code == 0:
@@ -173,14 +221,26 @@ class BilibiliApi:
                     return code == 0, json_data
                 except ValueError:
                     logger.error(f" JSON 解析失败：{resp.status_code} {resp.text[:100]}")
-                    return False, {"code": -1, "msg": "JSON 解析失败"}
+                    raise requests.ConnectionError('上游响应格式异常')
             except (requests.exceptions.Timeout, requests.exceptions.ConnectionError,
                     requests.exceptions.RequestException) as e:
                 err_name = type(e).__name__
                 logger.warning(f" 网络错误 {err_name} (第{attempt}次)：{url}")
-            # 指数退避：1s, 2s, 4s, 8s, 16s, 30s, 30s...
-            wait = min(2 ** (attempt - 1), 30)
-            time.sleep(wait)
+            finally:
+                if resp is not None:
+                    try:
+                        resp.close()
+                    except Exception:
+                        pass
+            # 无取消上下文 → 面板查询语义：有限重试后放弃
+            if cancel is None and attempt >= _PANEL_QUERY_MAX_ATTEMPTS:
+                return False, {"code": -1, "msg": "网络请求暂时失败", "retryable": True}
+            wait = min(2 ** min(attempt - 1, 5), 30)
+            if cancel is not None:
+                if cancel.wait(wait):
+                    return False, {"code": -1, "msg": "操作已取消", "cancelled": True}
+            else:
+                time.sleep(wait)
 
     # ==================== 公开 API 方法 ====================
     def get_qrcode(self) -> Tuple[bool, dict]:
@@ -202,7 +262,7 @@ class BilibiliApi:
             import io as _io
             resp = requests.get(qr_url, timeout=10)
             if resp.status_code == 200:
-                save_path = Path("_temp_qrcode.png")
+                save_path = temp_dir_path() / "_temp_qrcode.png"
                 with open(save_path, 'wb') as f:
                     f.write(resp.content)
                 logger.info(f" 二维码已保存：{save_path}")
@@ -362,8 +422,8 @@ class BilibiliApi:
 class AreaLoader:
     """直播分区动态加载器"""
 
-    def __init__(self, area_file: str = "bili_areas_full.json"):
-        self.area_file = Path(area_file)
+    def __init__(self, area_file: str = None):
+        self.area_file = Path(area_file) if area_file else area_file_path()
         self.areas: List[dict] = []
         self._search_cache: dict = {}
         self._load_areas()
@@ -484,8 +544,8 @@ except ImportError:
 class LiveState:
     """直播状态持久化管理器"""
 
-    def __init__(self, state_file: str = "live_state.json"):
-        self.state_file = Path(state_file)
+    def __init__(self, state_file: str = None):
+        self.state_file = Path(state_file) if state_file else state_file_path()
         self.is_streaming = False
         self.current_zone = ""
         self.elapsed_seconds = 0
@@ -611,22 +671,214 @@ class LiveState:
         }
 
 
+# ==================== 控制操作票据（A2/A3：识别"响应丢失后的重放"） ====================
+
+_ISSUED_TICKET = __import__('re').compile(r'^([0-9a-f]+):(\d+):(\d+)$')
+
+DEFAULT_TOKEN_TTL_SECONDS = 6 * 3600.0
+
+
+def _parse_issued_ticket(token: str):
+    """解析服务端签发票据 → (boot, epoch, seq)；自定义票据返回 (None, None, None)。"""
+    match = _ISSUED_TICKET.match(token or '')
+    if not match:
+        return None, None, None
+    return match.group(1), int(match.group(2)), int(match.group(3))
+
+
+class _OperationTokens:
+    """控制操作票据登记表。
+
+    三类票据语义（与服务器实现一致，裁剪自 bilibili-live-server 26c170c）：
+
+    - **服务端签发**（`<boot>:<epoch>:<seq>`，LiveController.issue_operation）：
+      只比较前缀（boot + epoch），不查登记表，永不受淘汰影响；
+    - **自定义票据**（旧客户端 UUID）：首次出现按当时代际登记，TTL 内保留；
+      再次出现且代际已变 = "停止之后的重放" → 拒绝；
+    - 超过 TTL 的票据被遗忘：明确的有效期边界。
+    """
+
+    def __init__(self, capacity: int = 4096, tombstone: int = 1024,
+                 ttl_seconds: float = DEFAULT_TOKEN_TTL_SECONDS,
+                 boot_id: str = None):
+        # RLock：accept()/register_stop() 持锁期间会调用 _reject()，
+        # 普通 Lock 会自锁死。
+        self._lock = threading.RLock()
+        self.capacity = max(1, int(capacity))
+        self._entries: 'collections.OrderedDict[str, tuple]' = collections.OrderedDict()
+        self._tombstone: 'collections.deque[str]' = collections.deque(
+            maxlen=max(1, int(tombstone)))
+        self._tombstone_set = set()
+        self.ttl_seconds = max(1.0, float(ttl_seconds))
+        self.boot_id = boot_id
+        self.evicted_total = 0
+        self.rejected = 0
+        self.expired_total = 0
+        self.last_reason = ''
+
+    def _purge_expired_unlocked(self) -> None:
+        if not self._entries:
+            return
+        now = time.monotonic()
+        expired = [token for token, (_, registered_at) in self._entries.items()
+                   if now - registered_at > self.ttl_seconds]
+        for token in expired:
+            self._entries.pop(token, None)
+            self.expired_total += 1
+
+    def _remember_evicted(self, token: str) -> None:
+        if self._tombstone.maxlen and len(self._tombstone) == self._tombstone.maxlen:
+            self._tombstone_set.discard(self._tombstone[0])
+        self._tombstone.append(token)
+        self._tombstone_set.add(token)
+        self.evicted_total += 1
+
+    def _reject(self, reason: str):
+        with self._lock:
+            self.rejected += 1
+            self.last_reason = reason
+        return False, reason
+
+    def _register_unlocked(self, token: str, epoch: int) -> None:
+        self._entries[token] = (epoch, time.monotonic())
+        self._entries.move_to_end(token)
+        while len(self._entries) > self.capacity:
+            evicted, _ = self._entries.popitem(last=False)
+            self._remember_evicted(evicted)
+
+    def accept(self, token: str, current_epoch: int,
+               allow_stale: bool = False) -> Tuple[bool, str]:
+        """返回 (是否可执行, 原因)。空票据不登记、不拦截。"""
+        if not isinstance(token, str) or not token:
+            return True, 'no_token'
+        boot, epoch, _seq = _parse_issued_ticket(token)
+        if boot is not None:
+            if self.boot_id is not None and boot != self.boot_id:
+                return self._reject('foreign_boot_ticket')
+            if epoch != current_epoch:
+                return self._reject('issued_ticket_stale_epoch')
+            return True, 'issued_ticket'
+        with self._lock:
+            self._purge_expired_unlocked()
+            if allow_stale:
+                self._tombstone_set.discard(token)
+                self._register_unlocked(token, current_epoch)
+                return True, 'registered_allow_stale'
+            if token in self._tombstone_set:
+                return self._reject('replay_of_evicted_ticket')
+            previous = self._entries.get(token)
+            if previous is None:
+                self._register_unlocked(token, current_epoch)
+                return True, 'registered'
+            self._entries.move_to_end(token)
+            if previous[0] != current_epoch:
+                return self._reject('replay_after_stop')
+            return True, 'replay_same_epoch'
+
+    def register_stop(self, token: str, current_epoch: int) -> Tuple[bool, str]:
+        """停止专用：返回 (是否需要执行, 原因)。
+
+        旧代际已登记 / 墓碑 / 其它服务进程的签发票据 → 该停止意图已经在
+        它自己的代际里处理完成，重放只应确认既有结果，绝不再执行——
+        否则响应丢失的旧停止会停掉后来明确开启的新直播。
+        """
+        if not isinstance(token, str) or not token:
+            return True, 'no_token'
+        boot, epoch, _seq = _parse_issued_ticket(token)
+        if boot is not None:
+            if self.boot_id is not None and boot != self.boot_id:
+                return False, 'foreign_boot_ticket'
+            if epoch != current_epoch:
+                return False, 'already_handled_in_prior_epoch'
+            return True, 'issued_ticket_current_epoch'
+        with self._lock:
+            self._purge_expired_unlocked()
+            previous = self._entries.get(token)
+            if previous is not None:
+                self._entries.move_to_end(token)
+                if previous[0] == current_epoch:
+                    return True, 'retry_same_epoch'
+                return False, 'already_handled_in_prior_epoch'
+            if token in self._tombstone_set:
+                return False, 'replay_of_evicted_ticket'
+            self._register_unlocked(token, current_epoch)
+            return True, 'first_seen'
+
+    def forget(self, token: str) -> None:
+        with self._lock:
+            self._entries.pop(token, None)
+
+    def stats(self) -> dict:
+        with self._lock:
+            return {
+                'tracked': len(self._entries),
+                'capacity': self.capacity,
+                'tombstoned': len(self._tombstone_set),
+                'ttl_seconds': self.ttl_seconds,
+                'expired_total': self.expired_total,
+                'evicted_total': self.evicted_total,
+                'rejected_total': self.rejected,
+                'last_reject_reason': self.last_reason,
+            }
+
+
+# ==================== FFmpeg 命令构建（A6：可测试的纯函数） ====================
+
+def build_ffmpeg_command(mode: str, concat_file, push_url: str, ffmpeg_exe: str) -> list:
+    """构建 FFmpeg 推流命令行（list argv，不带 shell）。
+
+    A6：`-flvflags no_duration_filesize` 必须放在输出 URL **之前**，
+    否则 FFmpeg 视其为 trailing option 产生告警且 FLV 头不更新。
+    不引入 rtmp_buffer/genpts；不改变编码器/码率参数。
+    """
+    concat_arg = str(concat_file)
+    if mode == 'reencode':
+        return [
+            ffmpeg_exe, '-re', '-f', 'concat', '-safe', '0', '-i', concat_arg,
+            '-c:v', 'libx264', '-preset', 'veryfast', '-b:v', '6000k',
+            '-maxrate', '8000k', '-bufsize', '12000k', '-pix_fmt', 'yuv420p',
+            '-c:a', 'aac', '-b:a', '128k',
+            '-f', 'flv', '-flvflags', 'no_duration_filesize', push_url,
+        ]
+    return [
+        ffmpeg_exe, '-re', '-f', 'concat', '-safe', '0', '-i', concat_arg,
+        '-c', 'copy', '-f', 'flv', '-flvflags', 'no_duration_filesize', push_url,
+    ]
+
+
+def _limit_ffmpeg_log_size(log_path: Path, max_bytes: int = FFMPEG_LOG_MAX_BYTES) -> None:
+    """ffmpeg.log 简单容量控制：超过上限时整体轮转为 .old（A8）。
+
+    轮转失败不影响推流（写失败不能使直播停止）。
+    """
+    try:
+        if log_path.exists() and log_path.stat().st_size > max_bytes:
+            old = log_path.with_suffix(log_path.suffix + '.old')
+            if old.exists():
+                old.unlink(missing_ok=True)
+            log_path.rename(old)
+            logger.info(f" ffmpeg.log 已轮转（超过 {max_bytes // (1024*1024)}MB）")
+    except Exception as e:
+        logger.debug(f" ffmpeg.log 轮转失败（忽略）：{e}")
+
+
 # ==================== LiveController（核心控制器重构） ====================
 class LiveController:
     """直播控制器（重构版，去除 GUI 依赖，面向 API）"""
 
+    _CLASS_FALLBACK_LOCK = threading.Lock()
+
     def __init__(
         self,
         task_manager: 'TaskManager' = None,
-        state_file: str = "live_state.json",
-        area_file: str = "bili_areas_full.json"
+        state_file: str = None,
+        area_file: str = None
     ):
         self.task_manager = task_manager
         self.api = BilibiliApi()
         self.area_loader = AreaLoader(area_file)
         self.video_finder = VideoPathFinder()
         self.state = LiveState(state_file)
-        self._ensure_areas_loaded()  # 启动时自动拉取分区
 
         self.current_room_id: Optional[int] = None
         self.is_streaming = False
@@ -656,14 +908,84 @@ class LiveController:
         self._pending_face_verify: bool = False
         self._face_verify_url: str = ''
 
+        # ---------- A2：控制代际与票据 ----------
+        self._start_lock = threading.Lock()
+        self._start_thread: Optional[threading.Thread] = None
+        self._start_cancel = threading.Event()
+        self._startup_cancel = threading.Event()
+        self._is_starting = False
+        self._recovery_blocked = ''
+        self._control_epoch = 0
+        self._operation_seq = 0
+        self._operation_token_limit = 4096
+        self._boot_id = secrets.token_hex(4)
+        self._operation_tokens = _OperationTokens(
+            self._operation_token_limit, boot_id=self._boot_id)
+
+        # ---------- A5：推流进程所有权（代际） ----------
+        self._pusher_lock = threading.Lock()
+        self._pusher_generation = 0
+        self._video_process_generation = -1
+        self._ffmpeg_unrecycled = False
+
+        # ---------- A4：状态查询未知失败计数 ----------
+        self._status_query_failures = 0
+        self._status_query_failures_total = 0
+        self._last_query_failure_notice = 0.0
+
+        # ---------- A7：停止意图持久化 ----------
+        self._stop_intent_epoch: Optional[int] = None
+        self._load_stop_intent()
+
         # 后端事件日志（供前端轮询展示）
         self._backend_events: list = []
 
-        # 启动时自动恢复登录态（从持久化 cookies）
-        if self.api.is_logged_in():
-            self.login()
+        # A1：启动时断网也不能阻塞服务就绪——登录/分区拉取放入后台引导线程，
+        # 保留登录和状态数据直至网络恢复。注意：桌面版**不自动恢复直播**，
+        # 仅保留 state 数据供前端显示恢复提示（A7 桌面语义）。
+        threading.Thread(target=self._bootstrap, name="LiveBootstrap", daemon=True).start()
 
-        # 注意：不自动恢复直播状态，仅保留 state 数据供前端显示恢复提示
+    # ---------------- 后台引导（A1：构造器不再同步刷网络） ----------------
+
+    def _bootstrap(self):
+        try:
+            with self.api.retry_network_until_cancelled(self._startup_cancel):
+                self._ensure_areas_loaded()
+                if self.api.is_logged_in() and not self._startup_cancel.is_set():
+                    self.login()
+        except Exception as e:
+            logger.warning(f" 后台引导异常（不阻塞服务）：{e}")
+
+    # ---------------- A7：停止意图持久化 ----------------
+
+    def _load_stop_intent(self):
+        """读取持久化的停止意图（应用重启后仍保留"用户已停止"语义）。"""
+        try:
+            f = stop_intent_file_path()
+            if f.exists():
+                data = json.loads(f.read_text(encoding='utf-8'))
+                self._stop_intent_epoch = data.get('epoch')
+                logger.info(" 检测到持久化的用户停止意图（重开后仅提示继续，不自动开播）")
+        except Exception as e:
+            logger.debug(f" 读取停止意图失败：{e}")
+
+    def _persist_stop_intent(self):
+        try:
+            stop_intent_file_path().write_text(json.dumps({
+                'stopped_at': datetime.now().isoformat(),
+                'zone': self.current_instruction.zone_name if self.current_instruction else (self.state.current_zone or ''),
+                'epoch': self._control_epoch,
+            }, ensure_ascii=False), encoding='utf-8')
+        except Exception as e:
+            logger.debug(f" 写入停止意图失败：{e}")
+
+    def _clear_stop_intent(self):
+        try:
+            f = stop_intent_file_path()
+            if f.exists():
+                f.unlink(missing_ok=True)
+        except Exception:
+            pass
 
     def _ensure_areas_loaded(self):
         """确保分区数据已加载（文件不存在或为空时自动从 API 拉取）"""
@@ -764,6 +1086,7 @@ class LiveController:
         """获取当前直播状态（供 API 响应）"""
         payload = self.state.get_status()
         payload['is_streaming'] = self.is_streaming
+        payload['is_starting'] = self._is_starting  # 后台开播进行中（A1/A2）
         payload['duration_seconds'] = getattr(self.state, 'duration_seconds', 0)
         payload['stream_mode'] = self._stream_mode or ''
         # 人脸验证待处理（自动切任务触发时前端轮询感知）
@@ -784,9 +1107,59 @@ class LiveController:
             payload['duration_seconds'] = self.current_instruction.duration_seconds
         return payload
 
+    # ---------------- 控制代际（A2：停止让此前的操作失效） ----------------
+
+    def issue_operation(self) -> str:
+        """为一次新发起的控制操作签发票据：`<boot>:<代际>:<序号>`。
+
+        客户端在重放请求时回传该票据，服务端只比较前缀（boot + 代际）就能
+        区分"停止前挂起的旧操作"与"停止完成后用户新发的请求"。
+        """
+        with self._start_lock:
+            self._operation_seq += 1
+            return f'{self._boot_id}:{self._control_epoch}:{self._operation_seq}'
+
+    def begin_control_operation(self, token: str = '') -> Optional[int]:
+        """在控制入口一次完成票据校验与控制代际快照。
+
+        返回本次操作归属的代际；票据过期（停止前发出、停止后重放）返回 None。
+        快照与停止推进代际共用同一把锁，不存在"先读代际、随后停止"的窗口。
+        """
+        with self._start_lock:
+            epoch = self._control_epoch
+            ok, reason = self._operation_tokens.accept(token, epoch)
+        if not ok:
+            logger.info("拒绝一次过期/重放的控制操作：%s", reason)
+            return None
+        return epoch
+
+    def claim_stop_operation(self, token: str = '') -> bool:
+        """停止入口专用：登记票据并判断这个停止是否还需要执行。
+
+        返回 False 表示该停止意图已经在它自己的代际里处理完成——典型场景
+        是停止的响应丢失、客户端重试，而期间用户又明确开启了新直播。此时
+        重放只应确认既有结果，绝不能再次执行下播，否则旧停止会停掉新直播。
+        """
+        if not isinstance(token, str) or not token:
+            return True
+        with self._start_lock:
+            execute, reason = self._operation_tokens.register_stop(token, self._control_epoch)
+        if not execute:
+            logger.info("旧停止请求重放（%s）：只确认既有结果，不再执行下播", reason)
+        return execute
+
+    def _is_epoch_current(self, epoch: int) -> bool:
+        return epoch == self._control_epoch
+
+    def _advance_control_epoch(self):
+        """推进控制代际：让此前所有挂起操作在下一个复核点失效。"""
+        with self._start_lock:
+            self._control_epoch += 1
+            return self._control_epoch
+
     def _pre_start_cleanup(self):
-        """开播前清理：检测 FFmpeg 残留 + 直播间是否已在播，先下播再继续"""
-        # 1. 清理所有残留 FFmpeg 进程（异常退出时可能未清理）
+        """开播前清理（A5：只回收自建进程，不动外部 FFmpeg/OBS）"""
+        # 1. 停掉自己上一代的 FFmpeg 循环与进程（所有权精确回收）
         if self.video_process or self._ffmpeg_loop_thread:
             logger.info(" 检测到残留 FFmpeg 状态，清理中...")
         self._ffmpeg_stop_event.set()
@@ -794,9 +1167,8 @@ class LiveController:
         if self._ffmpeg_loop_thread and self._ffmpeg_loop_thread.is_alive():
             self._ffmpeg_loop_thread.join(timeout=3.0)
         self._ffmpeg_stop_event.clear()
-        self._kill_all_ffmpeg()
-        self.video_process = None
-        self.ffmpeg_current_video = ''
+        # video_process 引用只能由所有权路径清除（_kill_ffmpeg/_release_pusher），
+        # 这里不再无条件置 None（A5：回收失败时保留引用并阻止重复创建）。
 
         # 2. 检查 B站直播间是否已在播（异常退出时可能未下播）
         if self.current_room_id:
@@ -819,8 +1191,56 @@ class LiveController:
         self.stop_monitor.clear()
         logger.info(" 开播前清理完成")
 
-    def start_streaming(self, instruction: LiveInstruction, video_path: str, is_task_mode: bool = True) -> bool:
-        """开始直播（核心逻辑）
+    def start_streaming(self, instruction: LiveInstruction, video_path: str,
+                        is_task_mode: bool = True, epoch: int = None) -> bool:
+        """接受开播请求，使用独立后台线程持续等待网络恢复（A1/A2）。
+
+        epoch=None 表示这是停止之后（或从未停止时）新发起的请求，取当前代际；
+        epoch 为旧代际说明该请求在停止之前挂起，现在必须作废。
+        返回 True 仅表示"已接受并开始后台执行"，具体结果通过 /status 轮询。
+        """
+        with self._start_lock:
+            if epoch is None:
+                epoch = self._control_epoch
+            elif not self._is_epoch_current(epoch):
+                logger.info("放弃一次已经过期的开播请求（停止已在其发起后生效）")
+                self._push_backend_event(
+                    '停止', 'info', '已放弃停止之前发起的开播请求，未重新开播')
+                return False
+            if self._is_starting or self.is_streaming:
+                return False
+            cancel = threading.Event()
+            self._start_cancel = cancel
+            self._is_starting = True
+            self._recovery_blocked = ''
+            self._pending_face_verify = False
+            self.current_instruction = instruction
+            self._start_thread = threading.Thread(
+                target=self._start_in_background,
+                args=(instruction, video_path, is_task_mode, cancel, epoch),
+                name="LiveStart", daemon=True)
+            self._start_thread.start()
+        return True
+
+    def _start_in_background(self, instruction: LiveInstruction, video_path: str,
+                             is_task_mode: bool, cancel: threading.Event,
+                             epoch: int):
+        """后台开播线程：网络重试无限等待（可取消），各边界复核代际（A2）。"""
+        try:
+            with self.api.retry_network_until_cancelled(cancel):
+                self._start_streaming_sync(instruction, video_path, is_task_mode,
+                                           cancel, epoch)
+        except Exception as e:
+            logger.error(f" 后台开播异常：{e}", exc_info=True)
+            self._push_backend_event('错误', 'danger', f'开播异常：{e}')
+        finally:
+            with self._start_lock:
+                self._is_starting = False
+
+    def _start_streaming_sync(self, instruction: LiveInstruction, video_path: str,
+                              is_task_mode: bool, cancel: threading.Event,
+                              epoch: int) -> bool:
+        """开始直播（核心逻辑，运行在后台线程）
         is_task_mode=True: 任务模式，保存 live_state、可继承已播时长
         is_task_mode=False: 手动模式，不触碰 live_state、已播时长始终=0、时长=0表示不限时
         """
@@ -828,12 +1248,33 @@ class LiveController:
         dur_label = '不限时' if (not is_task_mode and instruction.duration_seconds == 0) else f"{instruction.duration_seconds // 60}分钟"
         logger.info("=" * 70)
         logger.info(f"【开播】模式：{self._stream_mode} | 分区：{instruction.zone_name} | 时长：{dur_label}")
-        logger.info(f" 视频：{Path(video_path).name}")
+        logger.info(f" 视频：{Path(video_path).name if video_path else '（OBS 外部推流）'}")
         logger.info("=" * 70)
 
         if not self.current_room_id:
-            logger.error(" 未登录，请先调用 login()")
-            return False
+            # 登录在后台引导线程里进行；开播线程内等待登录完成（可取消）
+            waited = 0.0
+            while not self.current_room_id and waited < 60.0:
+                if cancel.is_set() or not self._is_epoch_current(epoch):
+                    logger.info(" 开播请求已取消（等待登录期间停止）")
+                    return False
+                if self._start_login_once():
+                    break
+                time.sleep(1.0)
+                waited += 1.0
+            if not self.current_room_id:
+                logger.error(" 未登录，无法开播")
+                self._push_backend_event('错误', 'danger', '开播失败：未登录（请先扫码登录）')
+                return False
+
+        # 等待跨日重置（任务模式，取消可打断）
+        if is_task_mode and self.task_manager and self.task_manager.is_resetting():
+            logger.info(" 检测到每日重置进行中，等待完成...")
+            if not self.task_manager.wait_for_reset_complete(
+                    timeout=120.0, cancel=cancel):
+                logger.warning(" 等待重置超时或被取消")
+                if cancel.is_set() or not self._is_epoch_current(epoch):
+                    return False
 
         # 开播前清理：检测残留 FFmpeg 和直播间状态，先下播再开始
         self._pre_start_cleanup()
@@ -853,6 +1294,17 @@ class LiveController:
         self.current_instruction = instruction
 
         success, resp = self.api.start_live(self.current_room_id, area_id, csrf)
+        if cancel.is_set() or not self._is_epoch_current(epoch):
+            # 停止发生在平台请求之后：撤销刚打开的房间，绝不把停止前发起的
+            # 开播当作成功（A2/A7：旧结果不能恢复直播）
+            logger.info(" 开播请求在平台返回后被停止，撤销刚打开的直播间")
+            if success and self.current_room_id:
+                try:
+                    self.api.stop_live(self.current_room_id, csrf)
+                except Exception:
+                    pass
+            return False
+
         if not success and resp.get('code') in (60024, 60043):
             # 人脸验证：返回固定 URL 给前端弹窗
             code = resp.get('code')
@@ -877,6 +1329,7 @@ class LiveController:
         self._extract_and_cache_rtmp(resp)
 
         self.is_streaming = True
+        self._clear_stop_intent()  # A7：成功开播即清除持久化的停止意图
         # 已播时长：任务模式可继承，手动模式始终为 0
         if is_task_mode:
             saved_elapsed = self.state.elapsed_seconds if self.state.is_streaming else 0
@@ -915,6 +1368,14 @@ class LiveController:
 
         logger.info(f"  直播时长：{dur_label}")
         return True
+
+    def _start_login_once(self) -> bool:
+        """后台开播线程内的单次登录尝试（不阻塞、不重试循环）。"""
+        try:
+            return self.login()
+        except Exception as e:
+            logger.debug(f" 登录尝试异常：{e}")
+            return False
 
     def _get_stream_settings(self) -> Tuple[str, bool]:
         """读取推流设置，返回 (stream_mode, auto_open_video)"""
@@ -978,7 +1439,7 @@ class LiveController:
 
     def _load_rtmp_cache(self) -> dict:
         """加载本地推流码缓存"""
-        cache_file = Path("rtmp_cache.json")
+        cache_file = rtmp_cache_file_path()
         if cache_file.exists():
             try:
                 with open(cache_file, 'r', encoding='utf-8') as f:
@@ -990,7 +1451,7 @@ class LiveController:
     def _save_rtmp_cache(self, cache: dict):
         """保存推流码缓存到本地"""
         try:
-            with open("rtmp_cache.json", 'w', encoding='utf-8') as f:
+            with open(rtmp_cache_file_path(), 'w', encoding='utf-8') as f:
                 json.dump(cache, f, ensure_ascii=False, indent=2)
         except Exception as e:
             logger.debug(f" 保存推流码缓存失败：{e}")
@@ -1012,15 +1473,18 @@ class LiveController:
 
     def _start_ffmpeg_stream(self) -> bool:
         """启动 FFmpeg 推流循环线程（使用缓存的推流码，播放完一个视频自动换下一个）"""
+        # A5：上一路推流进程未确认回收时，禁止再创建新的同房间推流
+        if self._ffmpeg_unrecycled:
+            logger.error(" 上一路推流进程未确认回收，禁止重复创建 FFmpeg 推流")
+            self._push_backend_event('推流', 'danger', '上一路推流进程未回收，已阻止重复开播（请重启应用或手动处理后重试）')
+            return False
         # 先停止旧循环（防止双线程同时运行，导致 poll() 竞态和文件冲突）
         if self._ffmpeg_loop_thread and self._ffmpeg_loop_thread.is_alive():
             logger.info(" 等待旧的 FFmpeg 循环线程退出...")
             self._ffmpeg_stop_event.set()
             self._ffmpeg_loop_thread.join(timeout=5.0)
             self._ffmpeg_stop_event.clear()
-        # 杀掉可能残留的 ffmpeg 进程（上次异常退出遗留）
-        self._kill_all_ffmpeg()
-        self.video_process = None
+        self._kill_ffmpeg()
         # 从缓存获取推流地址
         push_url = self._get_cached_push_url()
         if not push_url:
@@ -1047,14 +1511,17 @@ class LiveController:
 
         zone_name = self.current_instruction.zone_name if self.current_instruction else ''
 
+        # A5：登记新一代推流代际（所有权起点）
+        generation = self._new_pusher_generation()
+
         self._ffmpeg_loop_thread = threading.Thread(
             target=self._ffmpeg_loop,
-            args=(zone_name, push_url, ffmpeg_exe),
+            args=(zone_name, push_url, ffmpeg_exe, generation),
             name="FFmpegLoop",
             daemon=True
         )
         self._ffmpeg_loop_thread.start()
-        logger.info(f" FFmpeg 推流循环已启动")
+        logger.info(f" FFmpeg 推流循环已启动（代际 {generation}）")
         return True
 
     def _check_concat_compatible(self, video_list: list) -> bool:
@@ -1127,18 +1594,21 @@ class LiveController:
                 compatible.append(v)  # 无法判断，保留
         return compatible
 
-    def _ffmpeg_loop(self, zone_name: str, push_url: str, ffmpeg_exe: str):
+    def _ffmpeg_loop(self, zone_name: str, push_url: str, ffmpeg_exe: str, generation: int = 0):
         """FFmpeg 单进程推流：用 concat 播放列表串联所有视频。
         - 每轮 concat 结束后从 API 刷新推流 URL（B站 stream key 一次性）
         - 用时间戳文件名避免多线程/残留进程文件冲突
-        - 用 _ffmpeg_stop_event 可被外部中断"""
-        logger.info(f" FFmpeg 单进程推流开始 | 分区：{zone_name}")
+        - 用 _ffmpeg_stop_event 可被外部中断
+        - A5：进程引用登记在当前代际名下；旧代 finally 不清新代引用
+        - A6：-flvflags 放在输出 URL 之前（build_ffmpeg_command）
+        """
+        logger.info(f" FFmpeg 单进程推流开始 | 分区：{zone_name} | 代际：{generation}")
         rapid_fails = 0
         backoff = 5
         current_push_url = push_url
         # 时间戳唯一文件名，防止多线程 / 残留进程抢同一文件
         import uuid as _uuid
-        concat_file = Path(f"_ffmpeg_concat_{_uuid.uuid4().hex[:8]}.txt")
+        concat_file = temp_dir_path() / f"_ffmpeg_concat_{_uuid.uuid4().hex[:8]}.txt"
 
         def _refresh_push_url():
             """尝试从缓存/API 刷新推流地址，失败返回 None"""
@@ -1194,27 +1664,26 @@ class LiveController:
                     time.sleep(2)
                     continue
 
-                if use_reencode:
-                    cmd = f'{ffmpeg_exe} -re -f concat -safe 0 -i "{concat_file}" -c:v libx264 -preset veryfast -b:v 6000k -maxrate 8000k -bufsize 12000k -pix_fmt yuv420p -c:a aac -b:a 128k -f flv "{current_push_url}" -flvflags no_duration_filesize'
-                    logger.info(f" 生成 concat 列表：{len(video_list)} 个视频（重编码）")
-                else:
-                    cmd = f'{ffmpeg_exe} -re -f concat -safe 0 -i "{concat_file}" -c copy -f flv "{current_push_url}" -flvflags no_duration_filesize'
-                    logger.info(f" 生成 concat 列表：{len(video_list)} 个视频")
+                mode = 'reencode' if use_reencode else 'copy'
+                cmd = build_ffmpeg_command(mode, concat_file, current_push_url, ffmpeg_exe)
+                logger.info(f" 生成 concat 列表：{len(video_list)} 个视频（{mode}）")
 
-                ffmpeg_log = Path("ffmpeg.log")
-                log_fp = open(str(ffmpeg_log), 'a', encoding='utf-8', errors='replace')
+                _limit_ffmpeg_log_size(ffmpeg_log_path())
+                log_fp = open(str(ffmpeg_log_path()), 'a', encoding='utf-8', errors='replace')
                 log_fp.write(f"\n=== {datetime.now().isoformat()} | concat {len(video_list)} files ===\n")
                 log_fp.flush()
 
                 try:
                     t_start = time.time()
+                    # A5：不经 shell，直接持有 ffmpeg 进程（list argv）；
+                    # PID 即 ffmpeg 本体，taskkill /T /PID 才能真实命中进程树
                     proc = subprocess.Popen(
-                        cmd, shell=True,
+                        cmd,
                         stdout=log_fp, stderr=subprocess.STDOUT,
                     )
-                    self.video_process = proc
+                    self._claim_pusher(generation, proc)
                     self.ffmpeg_current_video = f"concat({len(video_list)}个)"
-                    logger.info(f" FFmpeg concat 进程已启动 (PID={proc.pid})")
+                    logger.info(f" FFmpeg concat 进程已启动 (PID={proc.pid}, 代际={generation})")
 
                     # 监控进程，使用本地变量 proc 避免与 _kill_ffmpeg 竞态
                     while proc.poll() is None:
@@ -1227,8 +1696,10 @@ class LiveController:
 
                     exit_code = proc.returncode
                     elapsed = time.time() - t_start
-                    self.video_process = None
                     log_fp.close()
+
+                    # A5：确认退出后才释放所有权；未退出保留引用并标记
+                    self._release_pusher(generation)
 
                     # 如果是被外部主动终止的（任务完成/停播），静默退出
                     if self._ffmpeg_stop_event.is_set() or self.stop_monitor.is_set() or not self.is_streaming:
@@ -1296,7 +1767,9 @@ class LiveController:
                     if self._ffmpeg_stop_event.wait(timeout=backoff):
                         return
         finally:
-            self.video_process = None
+            # A5：只释放仍归属本代的引用；新代引用（已被 _claim_pusher 覆盖）
+            # 不受旧循环退出影响
+            self._release_pusher(generation)
             self.ffmpeg_current_video = ''
             try:
                 if concat_file.exists():
@@ -1331,53 +1804,134 @@ class LiveController:
             return files
         return []
 
-    def _kill_ffmpeg(self):
-        """强制终止当前 FFmpeg 进程"""
-        if not self.video_process:
-            return
-        try:
-            pid = self.video_process.pid
-            if pid and sys.platform == 'win32':
-                subprocess.run(
-                    f'taskkill /F /T /PID {pid}',
-                    shell=True,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=10
-                )
-            else:
-                self.video_process.terminate()
-                try:
-                    self.video_process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    self.video_process.kill()
-            self.video_process = None
-            logger.info(" FFmpeg 进程已终止")
-        except Exception as e:
-            logger.debug(f" 终止 FFmpeg 异常：{e}")
-            self.video_process = None
+    # ---------------- 推流进程所有权（A5） ----------------
 
-    def _kill_all_ffmpeg(self):
-        """杀掉所有残留的 ffmpeg 进程（用于开播前清理）"""
-        self._kill_ffmpeg()
+    def _new_pusher_generation(self) -> int:
+        """登记新一代推流进程：旧循环不得动用新进程的引用。"""
+        with self._pusher_lock:
+            self._pusher_generation += 1
+            return self._pusher_generation
+
+    def _claim_pusher(self, generation: int, process) -> None:
+        """登记本代拥有的推流进程（Popen 成功后的所有权起点）。
+
+        代际与进程对象成对记录：`_kill_ffmpeg` 只有在"引用仍是同一个对象、
+        且代际与登记时一致"时才允许清除，旧清理不会覆盖新代的引用。
+        """
+        with self._pusher_lock:
+            self._pusher_generation = int(generation)
+            self.video_process = process
+            self._video_process_generation = int(generation)
+
+    def _pusher_owner_generation(self) -> int:
+        return self.__dict__.get('_video_process_generation', -1)
+
+    @staticmethod
+    def _process_alive(process) -> bool:
         try:
+            return process is not None and process.poll() is None
+        except Exception:
+            return False
+
+    def _release_pusher(self, generation: int):
+        """只在本代进程仍归属自己且已确认退出时才清除引用。
+
+        终止失败或退出延迟时保留引用并标记 _ffmpeg_unrecycled，
+        避免"以为清理成功"后另起一路同房间推流。
+        """
+        with self._pusher_lock:
+            if generation != self._pusher_generation:
+                # 已有更新的推流代：旧循环不能清除它的引用。
+                return
+            if self._process_alive(self.video_process):
+                self._ffmpeg_unrecycled = True
+                logger.warning("推流进程仍未确认退出：保留引用，不清除")
+                return
+            self.video_process = None
+            self._video_process_generation = -1
+            self.ffmpeg_current_video = ''
+            self._ffmpeg_unrecycled = False
+
+    def _kill_ffmpeg(self, timeout: float = 8.0):
+        """强制终止当前 FFmpeg 进程（A5：只回收本应用创建的进程树）。
+
+        - 只针对 self.video_process 持有的自建进程（PID 即 ffmpeg 本体，
+          因 spawn 不经 shell）；外部 FFmpeg/OBS/未知端口服务完全不受影响；
+        - Windows 用 taskkill /F /T /PID 回收真实子进程树；
+        - 只有确认进程已经退出、且引用仍属于同一个进程对象（代际一致）
+          才清除引用；终止失败或退出延迟时保留引用并标记 _ffmpeg_unrecycled。
+        """
+        process = self.video_process
+        if process is None:
+            return
+        generation_at_entry = self._pusher_owner_generation()
+        pid = None
+        try:
+            pid = process.pid
+        except Exception:
+            pass
+        if pid:
+            logger.info(f" 终止自建推流进程树 (PID={pid})")
             if sys.platform == 'win32':
-                subprocess.run(
-                    'taskkill /F /IM ffmpeg.exe 2>nul',
-                    shell=True,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=10
-                )
-                logger.info(" 已清理所有残留 ffmpeg 进程")
-        except Exception as e:
-            logger.debug(f" 清理残留 ffmpeg 异常：{e}")
+                try:
+                    subprocess.run(
+                        ['taskkill', '/F', '/T', '/PID', str(pid)],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=timeout,
+                    )
+                except Exception as e:
+                    logger.warning(f" taskkill 执行异常：{e}")
+            else:
+                try:
+                    process.terminate()
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    try:
+                        process.kill()
+                    except Exception:
+                        pass
+        # 等待确认退出（有界）
+        try:
+            process.wait(timeout=timeout)
+        except Exception:
+            pass
+        with self._pusher_lock:
+            if self.video_process is not process:
+                logger.info(" 推流引用已被新的一代替换，旧清理不覆盖")
+                return
+            if self.__dict__.get('_video_process_generation', -1) != generation_at_entry:
+                logger.info(" 推流代际已推进，旧清理不覆盖新代引用")
+                return
+            if self._process_alive(process):
+                self._ffmpeg_unrecycled = True
+                logger.warning(f" 推流进程 (PID={pid}) 在超时内未确认退出：保留引用，阻止重复创建")
+                return
+            self.video_process = None
+            self._video_process_generation = -1
+            self._ffmpeg_unrecycled = False
+            logger.info(" 推流进程已确认退出并回收")
 
     def confirm_face_verify(self) -> bool:
-        """清除人脸验证待处理状态，供前端确认后重试开播"""
+        """清除人脸验证待处理状态，供前端确认后重试开播。
+
+        A7：确认动作绑定当前控制代际——用户停止后（代际已推进）到达的
+        邮件/远程确认不会重试开播。
+        """
         self._pending_face_verify = False
         self._face_verify_url = ''
         logger.info(" 人脸验证状态已清除，可重试开播")
+        return True
+
+    def retry_after_face_verify_guarded(self, confirm_epoch: int = None) -> bool:
+        """邮件确认后的重试守卫（A7）。
+
+        返回 False 表示确认属于已过去的代际（用户已停止或已开启新意图），
+        不得据此重试开播。
+        """
+        if confirm_epoch is not None and not self._is_epoch_current(confirm_epoch):
+            logger.info(" 忽略迟到的验证确认（用户已停止或开启新意图）")
+            return False
         return True
 
     def _push_backend_event(self, tag: str, event_type: str, message: str):
@@ -1462,7 +2016,10 @@ class LiveController:
             self.reconnect_attempts += 1
             logger.info(f" 直播间异常，尝试重连 ({self.reconnect_attempts}/{max_retries})...")
             self._push_backend_event('重连', 'warning', f'直播间异常，尝试重连 ({self.reconnect_attempts}/{max_retries})')
-            time.sleep(min(2 ** self.reconnect_attempts, 30))
+            # 可取消等待：停止时立即打断，不再发起迟到的重连
+            if self.stop_monitor.wait(min(2 ** self.reconnect_attempts, 30)):
+                logger.info(" 重连等待被停止打断")
+                return
             self._retry_start_live()
         else:
             self._retry_cooldown_until = now + timedelta(minutes=cooldown_minutes)
@@ -1470,7 +2027,12 @@ class LiveController:
             self._push_backend_event('重连', 'danger', f'重试次数耗尽，冷却 {cooldown_minutes} 分钟')
 
     def _retry_start_live(self):
-        """内部重试开播：重开 B站 房间 + FFmpeg 模式则重启推流"""
+        """内部重试开播：重开 B站 房间 + 按实际推流方式恢复（A4）。
+
+        恢复判断不看任务/手动分区（task/manual），只看推流设置：
+        - stream_mode == 'ffmpeg' → 重启 FFmpeg 推流循环；
+        - 其他（OBS 外部推流）→ 不创建、不杀掉、不重启用户推流进程。
+        """
         if not self.current_room_id or not self.current_instruction:
             return
         csrf = self.api.get_csrf()
@@ -1483,15 +2045,19 @@ class LiveController:
             self._extract_and_cache_rtmp(resp)  # 更新推流码缓存
             self.reconnect_attempts = 0
             self._retry_cooldown_until = None
-            # FFmpeg 模式：重新启动推流循环
-            if self._stream_mode != 'manual':
-                stream_mode, _ = self._get_stream_settings()
-                if stream_mode == 'ffmpeg':
-                    logger.info(" 重启 FFmpeg 推流循环...")
-                    self._start_ffmpeg_stream()
+            # 按实际推流方式恢复（A4：手动分区 + FFmpeg 同样需要恢复推流）
+            stream_mode, _ = self._get_stream_settings()
+            if stream_mode == 'ffmpeg':
+                logger.info(" 重启 FFmpeg 推流循环...")
+                self._start_ffmpeg_stream()
         else:
             code = resp.get('code', -1)
             if code in (60024, 60043):
+                self._pending_face_verify = True
+                uid = self.api.cookies.get('DedeUserID', '')
+                self._face_verify_url = (
+                    "https://www.bilibili.com/blackboard/live/face-auth-middle.html"
+                    f"?source_event=400&mid={uid}")
                 logger.warning(" 重连遇到人脸验证，停止重试等待人工确认")
 
     def _monitor_streaming(self):
@@ -1546,45 +2112,49 @@ class LiveController:
                         should_stop = True
                         break
 
-                # === 分层重试逻辑 ===
+                # === 分层重试逻辑（A4：查询失败只记未知，不据此掐流） ===
                 if self.current_room_id:
                     success, status_resp = self.api.get_live_status(self.current_room_id)
                     live_ok = success and status_resp.get('data', {}).get('live_status') == 1
 
                     if live_ok:
-                        # 直播状态正常，重置重试计数
+                        # 直播状态正常，重置重试计数与未知计数
                         self.reconnect_attempts = 0
                         self._retry_cooldown_until = None
                         self._retry_window_start = None
+                        self._status_query_failures = 0
                     elif success:
-                        # API 成功但 live_status != 1（平台掐断）
+                        # API 成功但 live_status != 1（确认被平台关闭）
+                        self._status_query_failures = 0
                         logger.warning(" 直播间已被平台关闭 (live_status=0)")
                         if not self._check_network_ok():
                             logger.warning(" 自身网络不通，等待恢复...")
-                            time.sleep(10)
+                            if self.stop_monitor.wait(10):
+                                break
                             continue
-                        # 网络正常 → 尝试重开直播间
+                        # 网络正常 → 尝试重开直播间（限次）
                         self._handle_live_anomaly_retry(max_retries, cooldown_minutes)
                     else:
-                        # API 调用本身失败（网络错误等）
+                        # API 调用本身失败：状态未知 ≠ 直播已断。
+                        # 本地 FFmpeg 可能仍在正常推进，绝不能据此重开/停播（A4）。
                         code = status_resp.get('code', -1)
-                        # 人脸验证 → 不重试
                         if code in (60024, 60043):
                             logger.warning(" 直播状态异常（人脸验证），等待人工确认")
                             continue
+                        self._status_query_failures += 1
+                        self._status_query_failures_total += 1
+                        now = time.time()
+                        if now - self._last_query_failure_notice >= 60.0:
+                            self._last_query_failure_notice = now
+                            logger.warning(
+                                f" 状态查询失败（未知，第 {self._status_query_failures} 次），"
+                                f"保持当前直播不动，仅节流提示")
+                            self._push_backend_event(
+                                '监控', 'warning',
+                                f'直播状态查询失败（状态未知，不影响本地推流），已连续 {self._status_query_failures} 次')
 
-                        # 自身网络不通 → 无限重试
-                        if not self._check_network_ok():
-                            logger.warning(" 自身网络不通，等待网络恢复后重试...")
-                            time.sleep(10)
-                            if self._check_network_ok():
-                                self._retry_start_live()
-                            continue
-
-                        # 直播间状态异常 → 限次重试
-                        self._handle_live_anomaly_retry(max_retries, cooldown_minutes)
-
-            time.sleep(1)
+            if self.stop_monitor.wait(1):
+                break
 
         # 退出处理（不变）
         if should_stop:
@@ -1632,9 +2202,8 @@ class LiveController:
         """
         # 通知 FFmpeg 循环线程退出
         self._ffmpeg_stop_event.set()
-        # 终止 FFmpeg/视频进程
+        # 终止 FFmpeg/视频进程（A5：所有权精确回收，失败保留引用）
         self._kill_ffmpeg()
-        self.ffmpeg_current_video = ''
         # 等待循环线程退出
         if self._ffmpeg_loop_thread and self._ffmpeg_loop_thread.is_alive():
             self._ffmpeg_loop_thread.join(timeout=3.0)
@@ -1642,7 +2211,10 @@ class LiveController:
         if self.current_room_id:
             csrf = self.api.get_csrf()
             if csrf:
-                self.api.stop_live(self.current_room_id, csrf)
+                try:
+                    self.api.stop_live(self.current_room_id, csrf)
+                except Exception as e:
+                    logger.warning(f" 平台下播请求异常（本地进程仍会停止）：{e}")
         # 保留实际已播时长（在清除 stream_start_time 之前计算）
         actual_elapsed = 0
         if preserve_state and self.stream_start_time and self.current_instruction:
@@ -1658,31 +2230,44 @@ class LiveController:
         else:
             self.state.is_streaming = False
 
-    def stop_streaming(self) -> bool:
-        """停止直播（对外接口）。任务模式保留状态以便恢复，手动模式彻底清除。"""
+    def stop_streaming(self, token: str = '') -> bool:
+        """停止直播（用户对外接口，A7）。
+
+        - 先推进控制代际并取消在途开播：挂起中的 start 在各复核点失效，
+          其迟到结果被撤销（包括平台侧刚打开的房间）；
+        - 持久化用户停止意图：旧开播/邮件回调不能改回；重开应用只提示继续；
+        - 任务模式保留状态以便恢复（保持桌面默认"重开后提示继续，不自动开播"），
+          手动模式彻底清除。
+        """
         logger.info("  停止直播...")
+        # 1) 推进代际 + 取消在途开播（A2/A7：停止优先于一切挂起操作）
+        self._advance_control_epoch()
+        self._start_cancel.set()
+        # 2) 停监控
         self.stop_monitor.set()
         if self.monitor_thread and self.monitor_thread.is_alive():
             try:
                 self.monitor_thread.join(timeout=3.0)
-            except:
+            except Exception:
                 pass
+        # 3) 持久化停止意图（在动 state 之前记录原始分区名）
+        self._persist_stop_intent()
+        # 4) 停进程与平台侧
         preserve = (self._stream_mode == 'task')
         self._stop_live_process(preserve_state=preserve)
         self.current_instruction = None
         logger.info(" 直播已完全停止")
         return True
 
-    def run_next_task(self) -> bool:
-        """执行下一个直播任务（供 API 调用）"""
+    def run_next_task(self, epoch: int = None) -> bool:
+        """执行下一个直播任务（供 API 调用）。
+
+        epoch 来自控制入口的代际快照：等待重置/选任务期间发生停止时，
+        旧代际的请求在 start_streaming 的复核点作废。
+        """
         logger.info("=" * 70)
         logger.info(" 开始执行新任务")
         logger.info("=" * 70)
-
-        if self.task_manager and self.task_manager.is_resetting():
-            logger.info(" 检测到每日重置进行中，等待完成...")
-            if not self.task_manager.wait_for_reset_complete(timeout=120.0):
-                logger.warning("️  等待重置超时，继续执行")
 
         instruction = self.task_manager.select_next_instruction() if self.task_manager else None
         if not instruction:
@@ -1694,7 +2279,8 @@ class LiveController:
             logger.error(f" 未找到视频文件，跳过任务：{instruction.zone_name}")
             return False
 
-        return self.start_streaming(instruction, video_path)
+        return self.start_streaming(instruction, video_path, is_task_mode=True,
+                                    epoch=epoch)
 
     def get_qrcode_for_login(self) -> dict:
         """获取登录二维码数据（供 API 使用）"""
@@ -1705,8 +2291,14 @@ class LiveController:
 
     def shutdown(self):
         logger.info(" 正在关闭直播控制模块...")
+        # 取消后台开播/引导线程（A1/A2）
+        self._startup_cancel.set()
+        self._advance_control_epoch()
+        self._start_cancel.set()
         self._ffmpeg_stop_event.set()
-        if self.is_streaming:
+        self.stop_monitor.set()
+        if self.is_streaming or self._is_starting:
             self.stop_streaming()
-        self._kill_all_ffmpeg()
+        # A5：只回收自建进程（所有权感知），绝不全局 taskkill
+        self._kill_ffmpeg()
         logger.info(" 直播控制模块已关闭")

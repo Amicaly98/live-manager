@@ -3,11 +3,16 @@ main.py - FastAPI 后端入口
 
 将所有业务逻辑包装为 RESTful API，供 Vue3 前端调用。
 使用 app/dependencies.py 作为全局单例容器，避免循环导入。
+
+A8/E3：数据目录在导入任何业务模块之前初始化（由 run.py 调用
+config.init_data_dir），所有可写文件落在统一数据目录；基础运行日志
+有容量控制（RotatingFileHandler），日志写失败不使直播停止。
 """
 
 import sys
 import time
 import logging
+import logging.handlers
 from pathlib import Path
 from contextlib import asynccontextmanager
 
@@ -19,18 +24,42 @@ backend_dir = Path(__file__).resolve().parent.parent
 if str(backend_dir) not in sys.path:
     sys.path.insert(0, str(backend_dir))
 
-# 日志配置
+# ---- 数据目录（必须在导入业务模块之前；run.py 已通过环境变量传入）----
+from app.core.config import (
+    init_data_dir, backend_log_path,
+    db_file_path, excel_file_path, state_file_path, area_file_path,
+    BACKEND_LOG_MAX_BYTES, BACKEND_LOG_BACKUPS,
+)
+try:
+    _data_dir = init_data_dir()  # 幂等：run.py 已初始化则直接返回
+except Exception as e:
+    # 数据目录不可用：仍启动 API（health 可达）但业务模块会给出明确错误
+    logging.basicConfig(level=logging.ERROR)
+    logging.getLogger(__name__).error(f"数据目录初始化失败：{e}")
+    _data_dir = None
+
+# 日志配置（A8：有容量控制的轮转日志）
+def _build_log_handlers():
+    handlers = [logging.StreamHandler()]
+    if _data_dir is not None:
+        try:
+            backend_log_path().parent.mkdir(parents=True, exist_ok=True)
+            handlers.append(logging.handlers.RotatingFileHandler(
+                backend_log_path(), encoding='utf-8',
+                maxBytes=BACKEND_LOG_MAX_BYTES,
+                backupCount=BACKEND_LOG_BACKUPS))
+        except Exception as e:
+            # 日志文件不可写不能阻塞启动（A8：写失败不使直播停止）
+            logging.getLogger(__name__).warning(f"日志文件不可用，仅输出到控制台：{e}")
+    return handlers
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)-8s | %(message)s',
-    handlers=[
-        logging.FileHandler('backend.log', encoding='utf-8'),
-        logging.StreamHandler()
-    ]
+    handlers=_build_log_handlers(),
 )
 logger = logging.getLogger(__name__)
 
-from app.core.config import API_HOST, API_PORT
 from app.dependencies import init_globals, shutdown_globals, get_task_manager, get_live_controller
 
 
@@ -51,8 +80,8 @@ async def lifespan(app: FastAPI):
 
     try:
         task_manager_instance = TaskManager(
-            db_path="live_tasks.db",
-            excel_path="live_tasks.xlsx"
+            db_path=str(db_file_path()),
+            excel_path=str(excel_file_path())
         )
         task_manager_instance.print_summary()
         logger.info("任务管理器初始化成功")
@@ -63,8 +92,8 @@ async def lifespan(app: FastAPI):
     try:
         live_controller_instance = LiveController(
             task_manager_instance,
-            state_file="live_state.json",
-            area_file="bili_areas_full.json"
+            state_file=str(state_file_path()),
+            area_file=str(area_file_path())
         )
         logger.info("直播控制器初始化成功")
     except Exception as e:
@@ -93,11 +122,13 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="直播控制系统 API",
     description="面向主播的一站式自动化直播管理工具后端",
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan
 )
 
 # CORS 配置（允许前端开发服务器和 Electron 访问）
+# file:// 协议下浏览器 Origin 为字符串 "null"（Electron 打包后取票/控制
+# 请求需要被 CORS 放行）。
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -105,11 +136,12 @@ app.add_middleware(
         "http://localhost:5174",
         "http://localhost:3000",
         "http://127.0.0.1:5173",
-        "file://",
+        "http://127.0.0.1:5174",
+        "null",
     ],
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["*", "X-Operation-Token"],
 )
 
 # 注册路由（API 导入放在 lifespan 之后，确保不会触发循环）

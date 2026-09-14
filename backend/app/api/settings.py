@@ -3,9 +3,11 @@ from pathlib import Path
 from fastapi import APIRouter
 from pydantic import BaseModel
 
+from app.core.config import settings_file_path, rtmp_cache_file_path
+
 logger = logging.getLogger(__name__)
 router = APIRouter()
-SETTINGS_FILE = Path('settings.json')
+SETTINGS_FILE = settings_file_path()  # A8/E3：统一数据目录
 
 class AppSettings(BaseModel):
     video_path: str = 'F:/videosforlive'
@@ -92,7 +94,7 @@ async def check_videos():
 
 @router.get('/rtmp-code', summary='获取缓存的推流码')
 async def get_rtmp_code():
-    cache_file = Path('rtmp_cache.json')
+    cache_file = rtmp_cache_file_path()
     result = {'rtmp_addr': '', 'rtmp_code': '', 'full_url': '', 'room_id': ''}
     if cache_file.exists():
         try:

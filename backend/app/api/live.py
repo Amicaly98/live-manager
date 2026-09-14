@@ -1,16 +1,55 @@
 """
 live.py - 直播控制相关 API（开始/停止/状态查询）
+
+A2/A3：控制入口统一接入"票据 + 控制代际"协议：
+- 前端每次新控制意图先 GET /api/live/operation-ticket 取票；
+- 控制请求带 `X-Operation-Token` 头；
+- start/resume/run-next/switch-area/confirm-face-verify 经 begin_control_operation
+  校验并快照代际；
+- stop 经 claim_stop_operation 登记：旧停止重放只确认既有结果，不停掉新开播。
+- 过期/重放票据返回 409（响应体含"响应已丢失"标识，前端据此分类）。
+
+A1：/stop 在**独立的单线程执行器**中同步执行——普通线程池饱和时停止仍可达。
 """
 
 import logging
+import functools
+import concurrent.futures
 from typing import Optional, Tuple
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Header, HTTPException
 
 from app.dependencies import get_live_controller, get_task_manager
 from app.models.schemas import StartLiveRequest, StartLiveResponse, LiveStatusResponse, LiveInstruction
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+# 停止专用执行通道：单线程、有界、独立于默认池（A1）
+_STOP_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="stop-executor")
+
+
+# ==================== 票据与代际协议 ====================
+
+def _begin_operation(controller, token: str = '') -> int:
+    """校验票据并快照控制代际；无效票据抛 409。"""
+    begin = getattr(controller, 'begin_control_operation', None)
+    if begin is None:  # 测试替身兼容
+        return 0
+    epoch = begin(token)
+    if epoch is None:
+        raise HTTPException(
+            status_code=409,
+            detail='操作已失效（响应已丢失，旧操作在停止后到达被拒绝）')
+    return epoch
+
+
+def _claim_stop_operation(controller, token: str = '') -> bool:
+    """停止入口专用：登记票据并判断是否还需要执行。"""
+    claim = getattr(controller, 'claim_stop_operation', None)
+    if claim is None:
+        return True
+    return claim(token)
 
 
 # ==================== 统一响应构建 ====================
@@ -57,6 +96,19 @@ def _get_next_task_instruction() -> Tuple[Optional[LiveInstruction], Optional[st
 
 # ==================== API 端点 ====================
 
+@router.get("/operation-ticket", summary="签发控制操作票据")
+async def issue_operation_ticket():
+    """前端每次新的控制意图取一张新票据（无跨意图缓存，A3/U1 语义）。"""
+    controller = get_live_controller()
+    if not controller:
+        raise HTTPException(status_code=500, detail="直播控制器未初始化")
+    issue = getattr(controller, 'issue_operation', None)
+    if issue is None:
+        raise HTTPException(status_code=404, detail="后端不支持签发票据")
+    ticket = issue()
+    return {'ticket': ticket, 'epoch': int(ticket.split(':')[1])}
+
+
 @router.get("/status", summary="获取直播状态")
 async def get_live_status():
     controller = get_live_controller()
@@ -66,13 +118,13 @@ async def get_live_status():
 
 
 @router.post("/start", summary="开始直播")
-async def start_live(request: StartLiveRequest = None):
+async def start_live(request: StartLiveRequest = None,
+                     x_operation_token: str = Header(default=None, alias='X-Operation-Token')):
     """手动模式(指定分区)或任务模式(自动取下一任务)"""
     controller = get_live_controller()
     if not controller:
         raise HTTPException(status_code=500, detail="直播控制器未初始化")
-    if controller.is_streaming:
-        return StartLiveResponse(success=False, message="当前已有直播进行中，请先停止")
+    epoch = _begin_operation(controller, x_operation_token)
 
     if request and request.zone_name:
         dur = getattr(request, 'duration_seconds', None) or 7200
@@ -85,24 +137,23 @@ async def start_live(request: StartLiveRequest = None):
                 return StartLiveResponse(success=False, message=f"未找到分区 {request.zone_name} 的视频文件，FFmpeg 推流不可用")
             # OBS 模式：允许无视频开播
             video_path = ''
-        ok = controller.start_streaming(instruction, video_path, is_task_mode=False)
+        ok = controller.start_streaming(instruction, video_path, is_task_mode=False, epoch=epoch)
     else:
         instruction, video_path, err = _get_next_task_instruction()
         if err:
             return StartLiveResponse(success=False, message=err)
-        ok = controller.start_streaming(instruction, video_path, is_task_mode=True)
+        ok = controller.start_streaming(instruction, video_path, is_task_mode=True, epoch=epoch)
 
     return _build_stream_response(controller, ok)
 
 
 @router.post("/resume", summary="恢复进行中的直播")
-async def resume_live():
+async def resume_live(x_operation_token: str = Header(default=None, alias='X-Operation-Token')):
     """从 live_state.json 恢复直播"""
     controller = get_live_controller()
     if not controller:
         raise HTTPException(status_code=500, detail="直播控制器未初始化")
-    if controller.is_streaming:
-        return StartLiveResponse(success=False, message="当前已有直播进行中")
+    epoch = _begin_operation(controller, x_operation_token)
 
     state = controller.state
     if not state.current_zone:
@@ -117,32 +168,53 @@ async def resume_live():
     if not video_path:
         return StartLiveResponse(success=False, message=f"未找到分区 {state.current_zone} 的视频文件")
 
-    ok = controller.start_streaming(instruction, video_path, is_task_mode=True)
+    ok = controller.start_streaming(instruction, video_path, is_task_mode=True, epoch=epoch)
     return _build_stream_response(controller, ok, success_msg="直播已恢复")
 
 
 @router.post("/confirm-face-verify", summary="确认人脸验证完成")
-async def confirm_face_verify():
+async def confirm_face_verify(x_operation_token: str = Header(default=None, alias='X-Operation-Token')):
     """前端用户完成人脸验证后调用，清除待验证状态"""
     controller = get_live_controller()
     if not controller:
         raise HTTPException(status_code=500, detail="直播控制器未初始化")
+    _begin_operation(controller, x_operation_token)
     controller.confirm_face_verify()
     return {'success': True, 'message': '验证状态已确认'}
 
 
+def _stop_live_sync(x_operation_token: str = None):
+    """在独立执行器线程里执行的同步停止（A1：不受默认池饱和影响）。"""
+    controller = get_live_controller()
+    if not controller:
+        return {'success': False, 'message': '直播控制器未初始化'}
+    try:
+        success = controller.stop_streaming()
+        return {
+            'success': success,
+            'message': '直播已停止' if success else '停止失败'
+        }
+    except Exception as e:
+        logger.error(f" 停止直播异常：{e}", exc_info=True)
+        return {'success': False, 'message': f'停止异常：{e}'}
+
+
 @router.post("/stop", summary="停止直播")
-async def stop_live():
-    """停止当前直播"""
+async def stop_live(x_operation_token: str = Header(default=None, alias='X-Operation-Token')):
+    """停止当前直播。
+
+    旧停止重放（票据属于已过去的代际）只确认既有结果——返回成功但不再执行
+    下播，绝不停掉后来明确开启的新直播（A2/A7）。
+    """
     controller = get_live_controller()
     if not controller:
         raise HTTPException(status_code=500, detail="直播控制器未初始化")
-
-    success = controller.stop_streaming()
-    return {
-        'success': success,
-        'message': '直播已停止' if success else '停止失败'
-    }
+    if not _claim_stop_operation(controller, x_operation_token):
+        return {'success': True, 'message': '该停止意图已在先前处理完成（重放确认，未重复执行）'}
+    import asyncio
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        _STOP_EXECUTOR, functools.partial(_stop_live_sync, x_operation_token))
 
 
 @router.get("/state", summary="检查进行中的任务状态")
@@ -229,11 +301,13 @@ async def update_live_state(data: dict):
 
 
 @router.post("/switch-area", summary="切换直播分区（手动模式）")
-async def switch_area(zone_name: str):
+async def switch_area(zone_name: str,
+                      x_operation_token: str = Header(default=None, alias='X-Operation-Token')):
     """手动模式下正在直播时切换分区（调用 B 站换区 API，不下播）"""
     controller = get_live_controller()
     if not controller:
         raise HTTPException(status_code=500, detail="直播控制器未初始化")
+    epoch = _begin_operation(controller, x_operation_token)
     if controller._stream_mode != 'manual':
         raise HTTPException(status_code=400, detail="仅手动模式支持直播中切换分区")
     if not controller.is_streaming:
@@ -248,19 +322,20 @@ async def switch_area(zone_name: str):
 
 
 @router.post("/run-next", summary="执行下一个任务")
-async def run_next_task():
+async def run_next_task(x_operation_token: str = Header(default=None, alias='X-Operation-Token')):
     """执行下一个待执行直播任务"""
     controller = get_live_controller()
     if not controller:
         raise HTTPException(status_code=500, detail="直播控制器未初始化")
+    epoch = _begin_operation(controller, x_operation_token)
 
-    if controller.is_streaming:
+    if controller.is_streaming or getattr(controller, '_is_starting', False):
         return {
             'success': False,
-            'message': '当前已有直播进行中'
+            'message': '当前已有直播进行中或正在启动'
         }
 
-    success = controller.run_next_task()
+    success = controller.run_next_task(epoch=epoch)
     if success:
         return {
             'success': True,
