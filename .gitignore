@@ -56,3 +56,5 @@ backend/build/
 .venv-test/
 backend/tests/_test_data/
 backend/tests/_endurance_results/
+release-1.1.0/
+*.ts.timestamp-*.mjs
