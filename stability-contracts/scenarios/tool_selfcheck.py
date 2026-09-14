@@ -5,22 +5,28 @@
     python tool_selfcheck.py --product server
     python tool_selfcheck.py --product desktop --data-dir <隔离数据目录>
 
-检查项（全部必须成立；任何一项不成立即非零退出）：
+检查项（共 **13** 条断言，全部必须成立；任何一条不成立即非零退出）：
 1. 受控交错 worker 抛异常时，``interleaved_worker`` 必须把异常回传到主线程
    （只凭"线程已结束"不得判通过）；
 2. ``--only`` 指定不存在的场景 ID → 非零退出，且报错点名该 ID；
 3. ``--only`` 混合"存在 + 不存在" → 非零退出（不得只跑存在的部分）；
 4. ``--only`` 解析出 0 个场景 → 非零退出（不得把 0/0 当通过）；
-5. 场景失败时结果 JSON 仍然写出，且带**有效**被测快照（真实提交格式）；
-6. 有效运行时快照确实归属于本仓：head 等于真实 ``rev-parse HEAD``（40 位 hex）、
-   每个共享/适配器文件的哈希等于磁盘现算值、工作区差异哈希自洽；
-7. git ``safe.directory`` 只针对本仓的**规范化绝对路径**（不得含反斜杠、不得用
-   ``*`` 通配）；
-8. 受控 Git 失败（把仓库根指向非 git 目录）→ 快照必须被判无效：
-   ``snapshot_valid=False``、``head_commit`` 为空、``worktree_diff_sha256`` 为空、
-   原始错误进 ``snapshot_error``；**不能**把错误文本（或其哈希）当成有效来源；
-9. 发布验收路径（``--require-valid-snapshot``）：行为场景全通过但快照无效时返回
-   3（不可验收），同时仍然保存实际场景结果与原始错误。
+5. 工具/选择错误也要写结果 JSON，且含被测快照字段；
+6. 场景失败时结果 JSON 仍然写出，且带**有效**被测快照（真实提交格式）；
+7. 有效运行时 head_commit 等于真实 ``rev-parse HEAD`` 且为 40 位 hex；
+8. 有效运行时适配器/共享场景文件哈希等于磁盘现算值（且不含 (missing)）；
+9. 有效运行时工作区差异哈希与现算 sha256(status+diff) 自洽；
+10. git ``safe.directory`` 只针对本仓的**规范化绝对路径**（不得含反斜杠、
+    不得用 ``*`` 通配）；
+11. 受控 Git 失败（把仓库根指向非 git 目录）→ 快照必须被判无效：
+    ``snapshot_valid=False``、``head_commit`` 为空、``worktree_diff_sha256`` 为空、
+    原始错误进 ``snapshot_error``；**不能**把错误文本（或其哈希）当成有效来源；
+12. 发布验收路径（``--require-valid-snapshot``）：行为场景全通过但快照无效时返回
+    3（不可验收），同时仍然保存实际场景结果与原始错误；
+13. CLI 开关在快照有效时不阻断（rc=0 且 snapshot_valid=True）。
+
+注：日志里会出现一条 ``FAIL SELFTEST-FAIL``，那是**故意失败**的场景，用于验证
+"失败运行仍保存有效快照"（第 6 条），不是自测失败。
 """
 
 import argparse

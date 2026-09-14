@@ -3,7 +3,7 @@
   "contract_set_version": "2026-09-14.3",
   "source_repository": "bilibili-live-server",
   "source_branch": "stability/local-validated-20260913",
-  "contract_commit": "9d008c04c37fcc4b2007d556d962b3cbeeb91dfc",
+  "contract_commit": "7a8ab682ebd0c9f152d69c47d1bdd571aa162476",
   "mirror_targets": [
     "bilibili-live-manager"
   ],
@@ -15,7 +15,7 @@
     },
     {
       "path": "stability-contracts/contracts.json",
-      "sha256": "1141fdac73a53d2adf9a1fe9fb08b095ba7bfbe3f791eb4801ecd2fca29cc5bd"
+      "sha256": "8e85607a83bee3ecd2d4bcf1ef48a2eb37aacbb34124ecd4d547aaf8ba173e3d"
     },
     {
       "path": "stability-contracts/scenarios/__init__.py",
@@ -31,7 +31,7 @@
     },
     {
       "path": "stability-contracts/scenarios/tool_selfcheck.py",
-      "sha256": "835d3f4ec5e812afa64a89f83e415c3a0535aeccdaf6e168fe1d44d7a0fc6d6c"
+      "sha256": "b98fff8d6e90eb56f5c94d4645e3f4ab517d44aebfba9df22a309388dcdaa6e2"
     },
     {
       "path": "stability-contracts/scenarios/sync_mirror.py",
@@ -50,5 +50,5 @@
     "stability-contracts/upstream.json"
   ],
   "sync_rule": "只同步 mirrored_files；先 dry-run 列差异再复制；禁止盲删目录；两端按 sha256 逐文件校验（行尾归一化）；adapter_* 为端内自持，不参与镜像。",
-  "generated_at": "2026-09-14T23:53:55"
+  "generated_at": "2026-09-14T23:58:04"
 }
