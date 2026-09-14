@@ -80,7 +80,9 @@ def test_data_dir_init_and_write_probe(tmp_path):
         d = tmp_path / "iso-data"
         p1 = config.init_data_dir(str(d))
         assert p1 == d.resolve() and p1.exists()
-        assert not (p1 / ".write_probe").exists()  # 探测后删除
+        # 探测文件写入并可读回（保留不删除：兼容环境的删除保护）
+        probe = p1 / ".write_probe"
+        assert probe.exists() and probe.read_text(encoding="utf-8") != ""
         p2 = config.init_data_dir()  # 幂等（已初始化时直接返回）
         assert p2 == p1
     finally:

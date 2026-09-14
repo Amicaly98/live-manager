@@ -16,6 +16,7 @@ config.py - 后端配置（统一管理路径、API 地址等）
 
 import os
 import logging
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -46,10 +47,12 @@ def init_data_dir(data_dir: Optional[str] = None) -> Path:
     resolved = Path(candidate).resolve()
     try:
         resolved.mkdir(parents=True, exist_ok=True)
-        # 可写性探测：真实写入一个小文件
+        # 可写性探测：真实写入并读回（文件保留，不删除——部分环境的
+        # 文件删除保护会拦截删除操作，且保留探测文件本身无害）
         probe = resolved / ".write_probe"
-        probe.write_text("ok", encoding="utf-8")
-        probe.unlink(missing_ok=True)
+        probe.write_text(datetime.now().isoformat(), encoding="utf-8")
+        if probe.read_text(encoding="utf-8") == "":
+            raise RuntimeError("探测文件写入后读回为空")
     except Exception as e:
         raise RuntimeError(f"数据目录不可用：{resolved}（{e}）") from e
     DATA_DIR = resolved
