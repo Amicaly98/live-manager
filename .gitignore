@@ -58,3 +58,7 @@ backend/tests/_test_data/
 backend/tests/_endurance_results/
 release-1.1.0/
 *.ts.timestamp-*.mjs
+frontend/.test-build/
+backend/build-r2/
+backend/dist-r2/
+release-1.1.0-rc2/

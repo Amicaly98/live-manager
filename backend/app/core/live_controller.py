@@ -2105,15 +2105,19 @@ class LiveController:
         if not self.current_room_id or not self.current_instruction:
             return
         epoch = self._control_epoch  # D1：捕获代际，平台返回后复核
+        intent_at_entry = self._start_intent_id  # D1：新意图已存在时不回滚房间
         csrf = self.api.get_csrf()
         if not csrf:
             return
         area_id = self.area_loader.get_area_id(self.current_instruction.zone_name, auto_update=False)
         success, resp = self.api.start_live(self.current_room_id, area_id, csrf)
-        # D1：平台响应期间的停止 → 撤销刚重开的房间，绝不恢复推流
+        # D1：平台响应期间的停止 → 撤销刚重开的房间，绝不恢复推流。
+        # 若期间用户已接受新开播意图，房间状态归新意图的清理流程管，
+        # 这里不再补发下播（避免误关新任务的房间）。
         if self.stop_monitor.is_set() or not self._is_epoch_current(epoch):
             logger.info(" 重连请求在平台返回后被停止，撤销刚重开的直播间")
-            if success and self.current_room_id:
+            if (success and self.current_room_id
+                    and self._start_intent_id == intent_at_entry):
                 try:
                     self.api.stop_live(self.current_room_id, csrf)
                 except Exception:
