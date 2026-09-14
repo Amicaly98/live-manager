@@ -144,10 +144,16 @@ export class BackendLifecycle {
     if (!reclaimed) {
       this.deps.log('warn', '[backend] 旧进程在超时内未确认退出');
     }
-    // 代际核对：仅当仍是本代进程时才清引用（旧 close 不清新引用）
+    // 代际核对：仅当仍是本代进程时才处理引用（旧 close 不清新引用）
     if (this.generation === generationAtEntry && this.current === proc) {
-      this.current = null;
-      this.state = 'exited';
+      if (reclaimed) {
+        this.current = null;
+        this.state = 'exited';
+      } else {
+        // 未确认回收：保留引用并停留在 stopping——后续 start 被拒绝，
+        // 防止"以为清理成功"后出现双后端（与后端所有权语义一致）。
+        this.state = 'stopping';
+      }
     } else {
       this.state = previous === 'stopping' ? 'exited' : previous;
     }
@@ -155,9 +161,9 @@ export class BackendLifecycle {
   }
 
   /** 重启后端（E2）：取消挂起重启 → 停止并等待回收 → 才拉起 */
-  async restart(): Promise<boolean> {
+  async restart(killTimeoutMs: number = 10000): Promise<boolean> {
     this.cancelAutoRestart();
-    const reclaimed = await this.stop(true);
+    const reclaimed = await this.stop(true, killTimeoutMs);
     if (!reclaimed) {
       this.deps.log('error', '[backend] 重启失败：旧进程未确认回收，不拉起新代');
       return false;
