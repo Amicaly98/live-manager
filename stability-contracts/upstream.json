@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "contract_set_version": "2026-09-14.1",
+  "source_repository": "bilibili-live-server",
+  "source_branch": "stability/local-validated-20260913",
+  "contract_commit": "6fc7d54f2eaa7575201f7dc48ee23058f8b4ab77",
+  "mirror_targets": [
+    "bilibili-live-manager"
+  ],
+  "mirrored_files": [
+    {
+      "path": "stability-contracts/README.md",
+      "sha256": "8c9b123582c0b07740fe1863ede1a8889689313bff5bd84f4e397ce2ccb7b559"
+    },
+    {
+      "path": "stability-contracts/contracts.json",
+      "sha256": "6247e769d17065ebbb461420054010bca92aad276d4355136d318a7573c8419a"
+    },
+    {
+      "path": "stability-contracts/scenarios/__init__.py",
+      "sha256": "63723543ede0e969265af0b50353dad3fdcec1aebb36d47eac7f05bc3364048d"
+    },
+    {
+      "path": "stability-contracts/scenarios/contract_core.py",
+      "sha256": "d581a57479a8a600841ec563394ef3d85d29ae6fa597b89d52d40e626a8f42eb"
+    },
+    {
+      "path": "stability-contracts/scenarios/run_contracts.py",
+      "sha256": "00667515236ef685db015672ab064c1357146395e95ba8850cadc996210ccbf5"
+    },
+    {
+      "path": "stability-contracts/scenarios/sync_mirror.py",
+      "sha256": "3b6244709b82e5153d2247ec9774352d17b83bd69bea62419b296538cf4a559d"
+    },
+    {
+      "path": "backend/tests/test_cross_repo_contracts.py",
+      "sha256": "b671b999814d3a39dbbe9bddf455eba6712741440c652f112d6837d0d0c170d0"
+    }
+  ],
+  "end_local_files": [
+    "stability-contracts/scenarios/adapter_server.py",
+    "stability-contracts/scenarios/adapter_desktop.py"
+  ],
+  "sync_rule": "只同步 mirrored_files；先 dry-run 列差异再复制；禁止盲删目录；两端按 sha256 逐文件校验；adapter_* 为端内自持，不参与镜像。",
+  "generated_at": "2026-09-14T20:29:33"
+}

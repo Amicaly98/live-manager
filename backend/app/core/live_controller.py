@@ -1526,11 +1526,21 @@ class LiveController:
                 return f"{addr}/{code}"      # rtmp://host/app/key
 
     def _start_ffmpeg_stream(self) -> bool:
-        """启动 FFmpeg 推流循环线程（使用缓存的推流码，播放完一个视频自动换下一个）"""
+        """启动 FFmpeg 推流循环线程（使用缓存的推流码，播放完一个视频自动换下一个）
+
+        CTRL-01：停止/代际复核必须位于**任何进程或线程副作用之前**。旧实现
+        先 `_kill_ffmpeg` 再检查停止，会让停止之后迟到的旧请求（重连/恢复）
+        把新代的推流进程当成"残留"清理掉。本函数不接收 epoch 参数（由调用方
+        `_retry_start_live` 负责代际复核），这里以"未在播/停止已置位/恢复被
+        阻断"作为最后一道闸门。
+        """
         # A5：上一路推流进程未确认回收时，禁止再创建新的同房间推流
         if self._ffmpeg_unrecycled:
             logger.error(" 上一路推流进程未确认回收，禁止重复创建 FFmpeg 推流")
             self._push_backend_event('推流', 'danger', '上一路推流进程未回收，已阻止重复开播（请重启应用或手动处理后重试）')
+            return False
+        if not self.is_streaming or self.stop_monitor.is_set() or self._recovery_blocked:
+            logger.info("停止/未在播/恢复被阻断：不启动 FFmpeg 推流")
             return False
         # 先停止旧循环（防止双线程同时运行，导致 poll() 竞态和文件冲突）
         if self._ffmpeg_loop_thread and self._ffmpeg_loop_thread.is_alive():
@@ -2126,6 +2136,12 @@ class LiveController:
         if success:
             logger.info(" 重连成功，直播间已重新开启")
             self._extract_and_cache_rtmp(resp)  # 更新推流码缓存
+            # CTRL-01：缓存/准备期间同样可能发生停止；stop_monitor 会被下一次
+            # 开播清除，不能作为唯一判据——必须复核本代是否仍是当前代，之后才
+            # 提交重连计数与本地推流启动。
+            if not self._is_epoch_current(epoch) or self.stop_monitor.is_set():
+                logger.info(" 重连缓存准备期间停止生效，不恢复本地推流")
+                return
             self.reconnect_attempts = 0
             self._retry_cooldown_until = None
             # 按实际推流方式恢复（A4：手动分区 + FFmpeg 同样需要恢复推流）

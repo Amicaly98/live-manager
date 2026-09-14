@@ -1,0 +1,171 @@
+{
+  "schema_version": 1,
+  "contract_set_version": "2026-09-14.1",
+  "maintenance_location": "bilibili-live-server/stability-contracts",
+  "note": "本文件放在服务器仓库只表示维护位置，不代表服务器实现是标准答案。桌面仓库保留同内容镜像，一致性由 upstream.json 的逐文件 SHA256 校验。",
+  "products": {
+    "server": {
+      "repo": "bilibili-live-server",
+      "branch": "stability/local-validated-20260913",
+      "entry": "backend/app/core/live_controller.py",
+      "adapter": "stability-contracts/scenarios/adapter_server.py"
+    },
+    "desktop": {
+      "repo": "bilibili-live-manager",
+      "branch": "stability-desktop-port-20260914",
+      "entry": "backend/app/core/live_controller.py",
+      "adapter": "stability-contracts/scenarios/adapter_desktop.py"
+    }
+  },
+  "intentional_differences": [
+    {
+      "id": "DIFF-AUTO-RESUME",
+      "products": ["server"],
+      "desc": "服务器在非人为中断后可自动恢复（auto_resume + .no_auto_resume 标记）；桌面重启只提示继续，不自动开播。契约只约束“人为停止不得被迟到回调复活”，不约束恢复策略。"
+    },
+    {
+      "id": "DIFF-STOP-ENTRY",
+      "products": ["server"],
+      "desc": "服务器 stop_streaming 是异步受理（受理后由后台线程清理）；桌面是同一次调用内完成受理+清理。共同场景需要“只受理”时，各适配器用本产品机制收窄（server: _is_starting；desktop: 临时替换 _stop_live_process）。"
+    },
+    {
+      "id": "DIFF-EPOCH-ARG",
+      "products": ["server"],
+      "desc": "server 的 _retry_start_live/_start_ffmpeg_stream 接收显式代际参数；desktop 在重连入口内部捕获代际。契约约束行为，不约束内部接口形状。"
+    },
+    {
+      "id": "DIFF-PANEL-AUTH",
+      "products": ["server"],
+      "desc": "面板鉴权方式不同（服务器有 panel_auth）；CTRL-02 只约束票据/停止重放行为。"
+    },
+    {
+      "id": "DIFF-DEPLOY-INSTANCES",
+      "products": ["server"],
+      "desc": "部署实例数量不同（服务器可多实例/常驻）；CTRL-03 的事件循环隔离程度按各自部署形态评估。"
+    },
+    {
+      "id": "DIFF-PROCESS-TREE",
+      "products": ["both"],
+      "desc": "进程回收实现不同（Linux 进程组 killpg vs Windows taskkill /T）；PUSH-01 用合成不可回收进程验证所有权记账，真实进程树回收由各仓自身测试覆盖。"
+    }
+  ],
+  "contracts": [
+    {
+      "id": "CTRL-01",
+      "title": "停止使旧启动/恢复/选任务/邮件确认结果失效；每个等待后的最终副作用须核对原代",
+      "status": {"server": "verified", "desktop": "verified"},
+      "scenarios": ["CTRL-01a", "CTRL-01b", "CTRL-01c", "CTRL-01d", "CTRL-01e"],
+      "evidence": {
+        "runner": "stability-contracts/scenarios/run_contracts.py",
+        "server_fix_commit": "a32feb19ff219fdcd27f9f3e1a0ddce8574b8745",
+        "results": "deliveries/cross-repo-alignment/contract-results-server.json; deliveries/cross-repo-alignment/contract-results-desktop.json"
+      },
+      "negative_control": "去掉补偿所有权判定（server）/ 去掉缓存后复核（desktop）后 CTRL-01e / CTRL-01b 分别转红，判据并非空跑。",
+      "coverage_note": "覆盖：首次开播缓存边界、重连平台响应内停止、重连缓存边界停止、旧代响应丢弃、停止→新意图→旧响应交错的补偿边界。未覆盖：邮件/人脸确认入口与选任务入口的代际复核（由各仓自身测试覆盖）。"
+    },
+    {
+      "id": "CTRL-02",
+      "title": "旧停止重放不得停止后来新直播；新意图有新票，重试复用原票",
+      "status": {"server": "verified", "desktop": "verified"},
+      "scenarios": ["CTRL-02a", "CTRL-02b"],
+      "evidence": {
+        "runner": "stability-contracts/scenarios/run_contracts.py",
+        "repo_tests": "server: backend/tests/test_u1_ticket_protocol.py; desktop: backend/tests/test_a2_control_epoch.py"
+      },
+      "coverage_note": "覆盖：旧停止重放只确认、停止使旧票据失效、新票据有效。未覆盖：前端“重试复用同票”的 HTTP 链路（桌面侧由 backend/tests/frontend/frontendChain.test.cjs 覆盖）。"
+    },
+    {
+      "id": "CTRL-03",
+      "title": "慢普通操作不堵住状态/停止入口；停止优先且队列不无限积压",
+      "status": {"server": "pending", "desktop": "pending"},
+      "scenarios": [],
+      "evidence": {},
+      "note": "本轮未纳入共同场景：两端入口形态不同（server 为同步 def + 控制门闸，desktop 修复为线程池 + 独立停止执行器）。登记为下一步对齐项；不把“线程数有限”当作队列有界。"
+    },
+    {
+      "id": "PUSH-01",
+      "title": "只回收当前拥有的进程；未回收前禁止重复启动；旧代不能清新引用",
+      "status": {"server": "verified", "desktop": "verified"},
+      "scenarios": ["PUSH-01a", "PUSH-01b"],
+      "evidence": {
+        "runner": "stability-contracts/scenarios/run_contracts.py",
+        "repo_tests": "server: backend/tests/test_control_safety.py; desktop: backend/tests/test_a5_ownership.py"
+      },
+      "coverage_note": "共同场景用合成不可回收进程（pid=None，不执行真实 taskkill）验证所有权记账；真实子进程树回收由各仓自身测试覆盖（server 真实 taskkill /T、desktop 真实 sleeper）。"
+    },
+    {
+      "id": "MODE-01",
+      "title": "task/manual 选分区 × FFmpeg/OBS 四组合分别有效；OBS 不得误启动本地 FFmpeg",
+      "status": {"server": "verified", "desktop": "verified"},
+      "scenarios": ["MODE-01a", "MODE-01b"],
+      "evidence": {
+        "runner": "stability-contracts/scenarios/run_contracts.py",
+        "repo_tests": "server: backend/tests/test_normal_flow.py; desktop: backend/tests/test_a4_monitor_semantics.py"
+      },
+      "coverage_note": "共同场景覆盖“恢复/重连路径”下的 ffmpeg/OBS 二分。四组合的入口（任务 start/resume/run-next）分别由各仓自身测试覆盖（server: api/live.py 入口测试；desktop: 监督反例三入口）。"
+    },
+    {
+      "id": "INTENT-01",
+      "title": "人为停止保留可继续进度，旧回调不得清除停止意图",
+      "status": {"server": "verified", "desktop": "verified"},
+      "scenarios": ["INTENT-01a", "INTENT-01b"],
+      "evidence": {
+        "runner": "stability-contracts/scenarios/run_contracts.py",
+        "repo_tests": "server: backend/tests/test_release_resume_intent.py; desktop: backend/tests/test_a7_e3_data_intent.py"
+      },
+      "coverage_note": "停止意图的存储介质不同（server: .no_auto_resume 标记 + state.auto_resume；desktop: stop_intent.json），适配器归一化为 stop_intent_present。恢复策略差异见 DIFF-AUTO-RESUME。"
+    },
+    {
+      "id": "FFMPEG-01",
+      "title": "输出选项在 URL 前；保留有用进度日志",
+      "status": {"server": "verified", "desktop": "verified"},
+      "scenarios": [],
+      "evidence": {
+        "repo_tests": "server: backend/tests/test_release_ffmpeg_options.py; desktop: backend/tests/test_a6_ffmpeg_options.py"
+      },
+      "note": "两端各仓自身测试已覆盖（build_ffmpeg_command 纯函数断言 -flvflags 在输出 URL 之前）。本轮未新增共同场景；不因对齐而改编码/码率/材料顺序。"
+    },
+    {
+      "id": "LOG-01",
+      "title": "长运行日志可控；日志故障不影响媒体；关闭诊断没有额外管道责任",
+      "status": {"server": "verified", "desktop": "verified"},
+      "scenarios": [],
+      "evidence": {
+        "repo_tests": "server: backend/tests/test_consolidation_v2.py（长运行日志/诊断生命周期）; desktop: backend/tests/test_d6_log_rotation.py（真实写句柄跨阈值）"
+      },
+      "note": "两端实现不同（server 运维期维护、desktop 存活期原地截断），断言语义一致：文件总量受控且不中断输出。诊断本身继续按桌面 D 系列整体延期。"
+    },
+    {
+      "id": "RETRY-01",
+      "title": "短/长存活的异常退出都不能绕过退避；停止可立即取消等待",
+      "status": {"server": "accepted_risk", "desktop": "accepted_risk"},
+      "scenarios": [],
+      "evidence": {
+        "plan": "deliveries/cross-repo-alignment/ALIGNMENT-PLAN.md",
+        "location": "server live_controller.py（>30 秒异常退出分支，约 2005 行）/ desktop live_controller.py 同构分支"
+      },
+      "note": "两端都保留“计数递减 + 仅等 5 秒”的旧行为，未证明是首次断流根因。本轮不擅改退避阈值。有界方案（不改数值即可先行落地）：1) 长存活异常退出也走同一退避计算函数（仅统一入口，不改数值）；2) 引入冷却期与最大频率上限的可配置项；3) 记录每次退避原因用于后续参数设计。需先有参数设计与实测证据再改。"
+    },
+    {
+      "id": "MEDIA-01",
+      "title": "兼容性检查覆盖范围与未知结果明确，不能把未知标成确定兼容",
+      "status": {"server": "accepted_risk", "desktop": "accepted_risk"},
+      "scenarios": [],
+      "evidence": {
+        "plan": "deliveries/cross-repo-alignment/ALIGNMENT-PLAN.md",
+        "location": "两端 live_controller.py 的 _check_concat_compatible（只抽前 8 个视频、只看 v:0、探测失败放行）"
+      },
+      "note": "两端同构风险，未证明真实文件因此断流。本轮不加入每轮全量 ffprobe。有界方案（按成本排序）：1) 把“未知/探测失败”从“兼容”改为“未知”并单独计数与告警（不改决策，仅改口径）；2) 抽样从固定前 8 个改为稳定的哈希抽样，覆盖全集；3) 仅在检测到不一致时才扩大抽样范围。需先有实测数据支撑成本。"
+    },
+    {
+      "id": "DATA-01",
+      "title": "SQLite 迁移/在线备份保留已提交 WAL 内容，不覆盖新数据",
+      "status": {"server": "not_applicable", "desktop": "verified"},
+      "scenarios": [],
+      "evidence": {
+        "desktop_tests": "backend/tests/test_a7_e3_data_intent.py（SQLite backup API 一致性快照 + 内容验证 + 原子替换）"
+      },
+      "note": "桌面升级迁移路径已验证。服务器没有同款桌面升级迁移模块，且本轮没有证据要求改生产备份脚本；服务器数据库同样启用 WAL，若将来新增在线备份流程必须遵守同一一致性原则（backup API 或离线 checkpoint）。"
+    }
+  ]
+}
