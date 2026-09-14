@@ -49,3 +49,10 @@ task_manager_last_run.json
 _ffmpeg_concat_*.txt
 _temp_*
 HANDOFF.md
+
+# Backend packaging & local test env
+backend/dist/
+backend/build/
+.venv-test/
+backend/tests/_test_data/
+backend/tests/_endurance_results/
