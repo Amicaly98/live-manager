@@ -21,6 +21,34 @@ if backend_dir not in sys.path:
     sys.path.insert(0, backend_dir)
 
 
+def _legacy_data_candidates() -> list:
+    """旧版本（1.0.x）数据目录候选（D4：冻结版不再猜仓库根）。
+
+    旧版 Electron 用 spawn 拉起后端且未传 cwd → 旧数据落在进程工作目录，
+    安装场景即安装根目录（exe 所在目录）。候选优先级：
+    1. BILIBILI_LEGACY_DATA_DIR 环境变量 / --legacy-data-dir 参数
+       （Electron 明确传入可确认的旧位置，多个用 os.pathsep 分隔）；
+    2. 冻结版：run.exe 自身目录（resources/backend）、上级（resources）、
+       上上级（安装根，旧版快捷方式启动时的工作目录）；
+    3. 源码运行：仓库根（backend 的上级）。
+    """
+    env = os.environ.get("BILIBILI_LEGACY_DATA_DIR", "")
+    candidates = [Path(p) for p in env.split(os.pathsep) if p] if env else []
+    if getattr(sys, "frozen", False):
+        exe_dir = Path(sys.executable).resolve().parent
+        candidates += [exe_dir, exe_dir.parent, exe_dir.parent.parent]
+    else:
+        candidates.append(Path(backend_dir).parent)  # 仓库根
+    # 去重保序
+    seen, uniq = set(), []
+    for c in candidates:
+        r = str(c.resolve()) if c.exists() else str(c)
+        if r not in seen:
+            seen.add(r)
+            uniq.append(c)
+    return uniq
+
+
 def main():
     parser = argparse.ArgumentParser(description="直播控制系统后端")
     parser.add_argument(
@@ -31,18 +59,22 @@ def main():
     parser.add_argument("--reload", action="store_true", help="热重载（仅开发）")
     parser.add_argument("--data-dir", type=str, default=None,
                         help="统一数据目录（Electron 传入 userData/data；A8/E3）")
+    parser.add_argument("--legacy-data-dir", type=str, default=None,
+                        help="旧版本数据目录（D4：Electron 明确传入，os.pathsep 分隔多个）")
     args = parser.parse_args()
+    if args.legacy_data_dir:
+        os.environ["BILIBILI_LEGACY_DATA_DIR"] = (
+            args.legacy_data_dir + os.pathsep + os.environ.get("BILIBILI_LEGACY_DATA_DIR", ""))
 
     # 数据目录必须先于业务模块导入初始化（config.init_data_dir 幂等）
     from app.core.config import init_data_dir, area_file_path
     from app.core.data_migration import migrate_legacy_data
     try:
         data_dir = init_data_dir(args.data_dir)
-        # 旧版本数据散落在仓库根/backend；带备份迁移进数据目录（E3）。
+        # 旧版本数据散落在旧安装目录/仓库根；带备份迁移进数据目录（E3/D4）。
         # BILIBILI_SKIP_MIGRATION=1 可跳过（测试隔离用，避免复制真实账号数据）。
         if os.environ.get("BILIBILI_SKIP_MIGRATION") != "1":
-            legacy_dirs = [Path(backend_dir).parent]  # 仓库根
-            for legacy in legacy_dirs:
+            for legacy in _legacy_data_candidates():
                 try:
                     migrate_legacy_data(data_dir, legacy)
                 except Exception as e:

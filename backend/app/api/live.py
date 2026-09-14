@@ -12,8 +12,9 @@ A2/A3：控制入口统一接入"票据 + 控制代际"协议：
 A1：/stop 在**独立的单线程执行器**中同步执行——普通线程池饱和时停止仍可达。
 """
 
-import logging
+import asyncio
 import functools
+import logging
 import concurrent.futures
 from typing import Optional, Tuple
 from fastapi import APIRouter, Header, HTTPException
@@ -24,9 +25,16 @@ from app.models.schemas import StartLiveRequest, StartLiveResponse, LiveStatusRe
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-# 停止专用执行通道：单线程、有界、独立于默认池（A1）
+# 停止专用执行通道：单线程、独立于默认池（A1）。
+# 注意：max_workers=1 只保证串行执行，不等于提交队列有界——队列语义由
+# 目标意图绑定保证（见 _stop_live_sync：执行时核对登记时刻的目标意图，
+# 期间新接受的开播意图不会被旧队列任务停掉）。
 _STOP_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
     max_workers=1, thread_name_prefix="stop-executor")
+
+# 慢控制操作（同步网络往返）统一离开事件循环执行的线程池（D1）
+_BLOCKING_POOL = concurrent.futures.ThreadPoolExecutor(
+    max_workers=2, thread_name_prefix="blocking-control")
 
 
 # ==================== 票据与代际协议 ====================
@@ -44,12 +52,20 @@ def _begin_operation(controller, token: str = '') -> int:
     return epoch
 
 
-def _claim_stop_operation(controller, token: str = '') -> bool:
-    """停止入口专用：登记票据并判断是否还需要执行。"""
+def _claim_stop_operation(controller, token: str = '') -> Optional[int]:
+    """停止入口专用：登记票据并返回目标意图快照（None=重放，不再执行）。"""
     claim = getattr(controller, 'claim_stop_operation', None)
     if claim is None:
-        return True
+        return 0
     return claim(token)
+
+
+def _epoch_current(controller, epoch: int) -> bool:
+    """代际复核（测试替身兼容）。"""
+    check = getattr(controller, '_is_epoch_current', None)
+    if check is None:
+        return True
+    return check(epoch)
 
 
 # ==================== 统一响应构建 ====================
@@ -80,7 +96,11 @@ def _make_instruction(zone_name: str, duration_seconds: int = 7200) -> LiveInstr
 
 
 def _get_next_task_instruction() -> Tuple[Optional[LiveInstruction], Optional[str], Optional[str]]:
-    """获取下一个待执行任务的指令，返回 (instruction, video_path, error_msg)"""
+    """获取下一个待执行任务的指令，返回 (instruction, video_path, error_msg)
+
+    D3：OBS（非 ffmpeg 推流设置）模式下无本地视频不阻断任务入口；
+    仅 FFmpeg 推流必须有视频文件。
+    """
     tm = get_task_manager()
     if not tm:
         return None, None, "任务管理器未初始化"
@@ -90,7 +110,10 @@ def _get_next_task_instruction() -> Tuple[Optional[LiveInstruction], Optional[st
     controller = get_live_controller()
     video_path = controller.video_finder.find_video(task_ins.zone_name) if controller else None
     if not video_path:
-        return None, None, f"未找到分区 {task_ins.zone_name} 的视频文件"
+        stream_mode, _ = controller._get_stream_settings() if controller else ('ffmpeg', False)
+        if stream_mode == 'ffmpeg':
+            return None, None, f"未找到分区 {task_ins.zone_name} 的视频文件，FFmpeg 推流不可用"
+        return task_ins, '', None  # OBS 外部推流：允许无本地视频
     return task_ins, video_path, None
 
 
@@ -166,7 +189,11 @@ async def resume_live(x_operation_token: str = Header(default=None, alias='X-Ope
     instruction = _make_instruction(state.current_zone, dur)
     video_path = controller.video_finder.find_video(state.current_zone)
     if not video_path:
-        return StartLiveResponse(success=False, message=f"未找到分区 {state.current_zone} 的视频文件")
+        # D3：OBS 外部推流模式无本地视频不阻断恢复
+        stream_mode, _ = controller._get_stream_settings()
+        if stream_mode == 'ffmpeg':
+            return StartLiveResponse(success=False, message=f"未找到分区 {state.current_zone} 的视频文件，FFmpeg 推流不可用")
+        video_path = ''
 
     ok = controller.start_streaming(instruction, video_path, is_task_mode=True, epoch=epoch)
     return _build_stream_response(controller, ok, success_msg="直播已恢复")
@@ -183,11 +210,24 @@ async def confirm_face_verify(x_operation_token: str = Header(default=None, alia
     return {'success': True, 'message': '验证状态已确认'}
 
 
-def _stop_live_sync(x_operation_token: str = None):
-    """在独立执行器线程里执行的同步停止（A1：不受默认池饱和影响）。"""
+def _stop_live_sync(x_operation_token: str = None, target_intent: Optional[int] = None):
+    """在独立执行器线程里执行的同步停止（A1：不受默认池饱和影响）。
+
+    D1：target_intent 是登记时刻的目标开播意图快照。执行时核对当前意图：
+    队列等待期间新接受的开播意图（id 已变）不会被旧队列任务停掉；
+    target_intent=None 表示无绑定（兼容直调），始终执行。
+    """
     controller = get_live_controller()
     if not controller:
         return {'success': False, 'message': '直播控制器未初始化'}
+    if target_intent is not None:
+        current = getattr(controller, '_start_intent_id', 0)
+        if current != target_intent:
+            logger.info(
+                " 停止执行时目标意图已变更（登记=%s 当前=%s）：不执行下播",
+                target_intent, current)
+            return {'success': True,
+                    'message': '该停止意图的目标已被新开播取代或已结束（未重复执行）'}
     try:
         success = controller.stop_streaming()
         return {
@@ -205,16 +245,19 @@ async def stop_live(x_operation_token: str = Header(default=None, alias='X-Opera
 
     旧停止重放（票据属于已过去的代际）只确认既有结果——返回成功但不再执行
     下播，绝不停掉后来明确开启的新直播（A2/A7）。
+    D1：登记与执行分离——登记时刻快照目标意图，执行器队列中迟到执行时
+    仍关联原意图，不停掉期间新接受的开播。
     """
     controller = get_live_controller()
     if not controller:
         raise HTTPException(status_code=500, detail="直播控制器未初始化")
-    if not _claim_stop_operation(controller, x_operation_token):
+    target = _claim_stop_operation(controller, x_operation_token)
+    if target is None:
         return {'success': True, 'message': '该停止意图已在先前处理完成（重放确认，未重复执行）'}
-    import asyncio
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(
-        _STOP_EXECUTOR, functools.partial(_stop_live_sync, x_operation_token))
+        _STOP_EXECUTOR,
+        functools.partial(_stop_live_sync, x_operation_token, target))
 
 
 @router.get("/state", summary="检查进行中的任务状态")
@@ -303,7 +346,12 @@ async def update_live_state(data: dict):
 @router.post("/switch-area", summary="切换直播分区（手动模式）")
 async def switch_area(zone_name: str,
                       x_operation_token: str = Header(default=None, alias='X-Operation-Token')):
-    """手动模式下正在直播时切换分区（调用 B 站换区 API，不下播）"""
+    """手动模式下正在直播时切换分区（调用 B 站换区 API，不下播）
+
+    D1：换区是同步网络往返，放到线程池执行——事件循环不被慢换区阻塞
+    （停止等控制入口可及时获得执行）；返回结果在提交前复核代际，
+    换区期间发生停止时不把结果提交到已停止的会话。
+    """
     controller = get_live_controller()
     if not controller:
         raise HTTPException(status_code=500, detail="直播控制器未初始化")
@@ -312,7 +360,12 @@ async def switch_area(zone_name: str,
         raise HTTPException(status_code=400, detail="仅手动模式支持直播中切换分区")
     if not controller.is_streaming:
         raise HTTPException(status_code=400, detail="当前未在直播")
-    success = controller.switch_partition(zone_name)
+    loop = asyncio.get_running_loop()
+    success = await loop.run_in_executor(
+        _BLOCKING_POOL, functools.partial(controller.switch_partition, zone_name))
+    # D1：换区期间发生停止 → 结果不提交（不修改 current_instruction）
+    if not _epoch_current(controller, epoch):
+        return {'success': False, 'message': '直播已停止，换区结果未提交'}
     if success:
         # 更新当前指令的分区名
         if controller.current_instruction:
@@ -371,11 +424,17 @@ async def search_areas(keyword: str = ""):
 
 @router.post("/areas/refresh", summary="刷新分区列表")
 async def refresh_areas():
-    """从 B 站 API 获取最新分区列表"""
+    """从 B 站 API 获取最新分区列表
+
+    D1：网络往返同步调用离开事件循环执行，不阻塞停止等控制入口。
+    """
     controller = get_live_controller()
     if not controller:
         raise HTTPException(status_code=500, detail="直播控制器未初始化")
-    success = controller.area_loader.fetch_and_save_areas(controller.api)
+    loop = asyncio.get_running_loop()
+    success = await loop.run_in_executor(
+        _BLOCKING_POOL,
+        functools.partial(controller.area_loader.fetch_and_save_areas, controller.api))
     if success:
         return {'success': True, 'message': f'已更新 {len(controller.area_loader.areas)} 个分区'}
     raise HTTPException(status_code=500, detail='获取分区列表失败')

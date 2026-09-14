@@ -849,6 +849,8 @@ def build_ffmpeg_command(mode: str, concat_file, push_url: str, ffmpeg_exe: str)
 def _limit_ffmpeg_log_size(log_path: Path, max_bytes: int = FFMPEG_LOG_MAX_BYTES) -> None:
     """ffmpeg.log 简单容量控制：超过上限时整体轮转为 .old（A8）。
 
+    仅在打开日志/启动 FFmpeg **之前**调用（此时无打开句柄，rename 安全）。
+    存活期容量控制见 _truncate_ffmpeg_log_inplace（D6）。
     轮转失败不影响推流（写失败不能使直播停止）。
     """
     try:
@@ -860,6 +862,28 @@ def _limit_ffmpeg_log_size(log_path: Path, max_bytes: int = FFMPEG_LOG_MAX_BYTES
             logger.info(f" ffmpeg.log 已轮转（超过 {max_bytes // (1024*1024)}MB）")
     except Exception as e:
         logger.debug(f" ffmpeg.log 轮转失败（忽略）：{e}")
+
+
+def _truncate_ffmpeg_log_inplace(log_fp, max_bytes: int = FFMPEG_LOG_MAX_BYTES) -> bool:
+    """D6：存活期 ffmpeg.log 原地截断（容量控制贯穿长会话）。
+
+    Windows 下打开中的文件不能 rename，但子进程继承的句柄与父进程
+    log_fp **共享同一内核文件指针**——seek(0) 同时复位两者的写位置，
+    truncate(0) 把文件裁回零，随后的输出从文件头继续：推流不中断、
+    容量受控。截断失败绝不影响推流。返回是否执行了截断。
+    """
+    try:
+        log_fp.flush()
+        log_fp.seek(0)
+        log_fp.truncate(0)
+        log_fp.write(
+            f"\n=== {datetime.now().isoformat()} | log truncated in place "
+            f"(exceeded {max_bytes} bytes) ===\n")
+        log_fp.flush()
+        return True
+    except Exception as e:
+        logger.debug(f" ffmpeg.log 原地截断失败（忽略，不影响推流）：{e}")
+        return False
 
 
 # ==================== LiveController（核心控制器重构） ====================
@@ -916,6 +940,9 @@ class LiveController:
         self._is_starting = False
         self._recovery_blocked = ''
         self._control_epoch = 0
+        # D1：每次被接受的开播意图分配唯一 id；停止在登记时快照目标意图，
+        # 执行器队列中迟到的停止不再停掉"之后新接受"的开播意图。
+        self._start_intent_id = 0
         self._operation_seq = 0
         self._operation_token_limit = 4096
         self._boot_id = secrets.token_hex(4)
@@ -1133,20 +1160,26 @@ class LiveController:
             return None
         return epoch
 
-    def claim_stop_operation(self, token: str = '') -> bool:
-        """停止入口专用：登记票据并判断这个停止是否还需要执行。
+    def claim_stop_operation(self, token: str = '') -> Optional[int]:
+        """停止入口专用：登记票据并返回本次停止的目标开播意图。
 
-        返回 False 表示该停止意图已经在它自己的代际里处理完成——典型场景
-        是停止的响应丢失、客户端重试，而期间用户又明确开启了新直播。此时
-        重放只应确认既有结果，绝不能再次执行下播，否则旧停止会停掉新直播。
+        返回值（D1）：
+        - None：该停止意图已经在它自己的代际里处理完成（重放确认）——
+          典型场景是停止的响应丢失、客户端重试，而期间用户又明确开启了
+          新直播。此时重放只应确认既有结果，绝不能再次执行下播；
+        - int：登记时刻的 `_start_intent_id` 快照。执行器队列中的停止
+          执行时用快照核对当前意图——期间新接受的开播意图不会被
+          旧队列任务停掉。
         """
         if not isinstance(token, str) or not token:
-            return True
+            return self._start_intent_id
         with self._start_lock:
             execute, reason = self._operation_tokens.register_stop(token, self._control_epoch)
+            target = self._start_intent_id
         if not execute:
             logger.info("旧停止请求重放（%s）：只确认既有结果，不再执行下播", reason)
-        return execute
+            return None
+        return target
 
     def _is_epoch_current(self, epoch: int) -> bool:
         return epoch == self._control_epoch
@@ -1212,6 +1245,7 @@ class LiveController:
             cancel = threading.Event()
             self._start_cancel = cancel
             self._is_starting = True
+            self._start_intent_id += 1  # D1：新接受的开播意图（停止执行时核对）
             self._recovery_blocked = ''
             self._pending_face_verify = False
             self.current_instruction = instruction
@@ -1325,47 +1359,67 @@ class LiveController:
 
         logger.info(" 直播已开始")
 
-        # 从 start_live 返回中提取并本地缓存推流码（同账号推流码恒定不变）
+        # 从 start_live 返回中提取并本地缓存推流码（同账号推流码恒定不变）。
+        # D1：缓存/收尾可能让出执行权，期间到达的停止由下方提交复核拦截。
         self._extract_and_cache_rtmp(resp)
 
-        self.is_streaming = True
-        self._clear_stop_intent()  # A7：成功开播即清除持久化的停止意图
-        # 已播时长：任务模式可继承，手动模式始终为 0
-        if is_task_mode:
-            saved_elapsed = self.state.elapsed_seconds if self.state.is_streaming else 0
-        else:
-            saved_elapsed = 0
-        self.stream_start_time = datetime.now() - timedelta(seconds=saved_elapsed)
-        self.stop_monitor.clear()
-        # 任务模式保存 state，手动模式不触碰
-        if is_task_mode:
-            self.state.start_streaming_with_duration(
-                instruction.zone_name, self.current_room_id, instruction.duration_seconds,
-                initial_elapsed=saved_elapsed)
-
-        # 推送开播事件（触发邮件/Server酱通知）
-        mode_label = '任务模式' if is_task_mode else '手动模式'
-        saved_label = f'（恢复，已播{saved_elapsed // 60}分钟）' if saved_elapsed > 0 else ''
-        self._push_backend_event('开播', 'success', f'{mode_label}开播{saved_label} - {instruction.zone_name}，时长{dur_label}')
-
-        # 启动视频/FFmpeg（在 start_live 之后，因为 FFmpeg 需要推流码）
-        stream_mode, auto_open = self._get_stream_settings()
-        if stream_mode == 'ffmpeg':
-            if not self._start_ffmpeg_stream():
-                logger.error(" FFmpeg 推流启动失败")
+        # D1：最终状态提交与停止的代际推进共用 _start_lock——
+        # 停止要么在提交前推进代际（本次提交作废并撤销平台房间），
+        # 要么在提交之后执行（由停止自身的回收路径处理已提交状态），
+        # 不存在"平台检查已过、提交区间内被停止却仍复活"的窗口。
+        with self._start_lock:
+            if cancel.is_set() or not self._is_epoch_current(epoch):
+                logger.info(" 开播在最终提交前被停止，撤销刚打开的直播间")
+                if success and self.current_room_id:
+                    try:
+                        self.api.stop_live(self.current_room_id, csrf)
+                    except Exception:
+                        pass
                 return False
-        elif auto_open and video_path:
-            if not self.play_video(video_path):
-                logger.warning(" 视频播放失败，但直播已开始")
 
-        # 启动监控线程
-        self.monitor_thread = threading.Thread(
-            target=self._monitor_streaming,
-            name="StreamMonitor",
-            daemon=True
-        )
-        self.monitor_thread.start()
+            self.is_streaming = True
+            self._clear_stop_intent()  # A7：成功开播即清除持久化的停止意图
+            # 已播时长：任务模式可继承，手动模式始终为 0
+            if is_task_mode:
+                saved_elapsed = self.state.elapsed_seconds if self.state.is_streaming else 0
+            else:
+                saved_elapsed = 0
+            self.stream_start_time = datetime.now() - timedelta(seconds=saved_elapsed)
+            self.stop_monitor.clear()
+            # 任务模式保存 state，手动模式不触碰
+            if is_task_mode:
+                self.state.start_streaming_with_duration(
+                    instruction.zone_name, self.current_room_id, instruction.duration_seconds,
+                    initial_elapsed=saved_elapsed)
 
+            # 推送开播事件（触发邮件/Server酱通知）
+            mode_label = '任务模式' if is_task_mode else '手动模式'
+            saved_label = f'（恢复，已播{saved_elapsed // 60}分钟）' if saved_elapsed > 0 else ''
+            self._push_backend_event('开播', 'success', f'{mode_label}开播{saved_label} - {instruction.zone_name}，时长{dur_label}')
+
+            # 启动视频/FFmpeg（在 start_live 之后，因为 FFmpeg 需要推流码）。
+            # D1：仍在同一锁内复核后启动，杜绝"提交与推流启动之间"的停止窗口
+            # 造成复活；_start_ffmpeg_stream 只做本地进程管理，不取 _start_lock。
+            stream_mode, auto_open = self._get_stream_settings()
+            local_push_started = True
+            if stream_mode == 'ffmpeg':
+                local_push_started = self._start_ffmpeg_stream()
+                if not local_push_started:
+                    logger.error(" FFmpeg 推流启动失败")
+            elif auto_open and video_path:
+                if not self.play_video(video_path):
+                    logger.warning(" 视频播放失败，但直播已开始")
+
+            # 启动监控线程
+            self.monitor_thread = threading.Thread(
+                target=self._monitor_streaming,
+                name="StreamMonitor",
+                daemon=True
+            )
+            self.monitor_thread.start()
+
+        if not local_push_started:
+            return False
         logger.info(f"  直播时长：{dur_label}")
         return True
 
@@ -1685,7 +1739,9 @@ class LiveController:
                     self.ffmpeg_current_video = f"concat({len(video_list)}个)"
                     logger.info(f" FFmpeg concat 进程已启动 (PID={proc.pid}, 代际={generation})")
 
-                    # 监控进程，使用本地变量 proc 避免与 _kill_ffmpeg 竞态
+                    # 监控进程，使用本地变量 proc 避免与 _kill_ffmpeg 竞态；
+                    # D6：存活期日志容量控制——每 10 秒检查一次，跨阈值原地截断
+                    _log_check_ticks = 0
                     while proc.poll() is None:
                         if self._ffmpeg_stop_event.is_set() or self.stop_monitor.is_set() or not self.is_streaming:
                             self._kill_ffmpeg()
@@ -1693,6 +1749,15 @@ class LiveController:
                             logger.info(" FFmpeg 被中断")
                             return
                         time.sleep(1)
+                        _log_check_ticks += 1
+                        if _log_check_ticks >= 10:
+                            _log_check_ticks = 0
+                            try:
+                                if ffmpeg_log_path().stat().st_size > FFMPEG_LOG_MAX_BYTES:
+                                    if _truncate_ffmpeg_log_inplace(log_fp):
+                                        logger.info(" ffmpeg.log 存活期已原地截断（容量控制）")
+                            except Exception as e:
+                                logger.debug(f" ffmpeg.log 容量检查失败（忽略）：{e}")
 
                     exit_code = proc.returncode
                     elapsed = time.time() - t_start
@@ -2032,14 +2097,28 @@ class LiveController:
         恢复判断不看任务/手动分区（task/manual），只看推流设置：
         - stream_mode == 'ffmpeg' → 重启 FFmpeg 推流循环；
         - 其他（OBS 外部推流）→ 不创建、不杀掉、不重启用户推流进程。
+
+        D1：进入时捕获控制代际；平台 start_live 返回后复核——重连请求
+        在平台响应期间被停止（代际推进/stop_monitor 置位）时，迟到的成功
+        响应不能恢复本地推流，还要撤销刚重新打开的平台房间。
         """
         if not self.current_room_id or not self.current_instruction:
             return
+        epoch = self._control_epoch  # D1：捕获代际，平台返回后复核
         csrf = self.api.get_csrf()
         if not csrf:
             return
         area_id = self.area_loader.get_area_id(self.current_instruction.zone_name, auto_update=False)
         success, resp = self.api.start_live(self.current_room_id, area_id, csrf)
+        # D1：平台响应期间的停止 → 撤销刚重开的房间，绝不恢复推流
+        if self.stop_monitor.is_set() or not self._is_epoch_current(epoch):
+            logger.info(" 重连请求在平台返回后被停止，撤销刚重开的直播间")
+            if success and self.current_room_id:
+                try:
+                    self.api.stop_live(self.current_room_id, csrf)
+                except Exception:
+                    pass
+            return
         if success:
             logger.info(" 重连成功，直播间已重新开启")
             self._extract_and_cache_rtmp(resp)  # 更新推流码缓存
@@ -2264,6 +2343,7 @@ class LiveController:
 
         epoch 来自控制入口的代际快照：等待重置/选任务期间发生停止时，
         旧代际的请求在 start_streaming 的复核点作废。
+        D3：OBS（非 ffmpeg 推流设置）模式下无本地视频不阻断任务执行。
         """
         logger.info("=" * 70)
         logger.info(" 开始执行新任务")
@@ -2276,8 +2356,11 @@ class LiveController:
 
         video_path = self.video_finder.find_video(instruction.zone_name)
         if not video_path:
-            logger.error(f" 未找到视频文件，跳过任务：{instruction.zone_name}")
-            return False
+            stream_mode, _ = self._get_stream_settings()
+            if stream_mode == 'ffmpeg':
+                logger.error(f" 未找到视频文件，跳过任务：{instruction.zone_name}")
+                return False
+            video_path = ''  # OBS 外部推流：允许无本地视频
 
         return self.start_streaming(instruction, video_path, is_task_mode=True,
                                     epoch=epoch)
@@ -2289,7 +2372,13 @@ class LiveController:
             return {'success': True, 'data': result}
         return {'success': False, 'message': '获取二维码失败'}
 
-    def shutdown(self):
+    def shutdown(self, stop_platform: bool = True):
+        """关闭直播控制模块。
+
+        D2：stop_platform=False 用于"不停止并退出"——保存进度、回收自建
+        本地推流进程（FFmpeg/视频播放），**不调用平台下播 API**、不碰
+        外部 OBS 推流；平台侧房间保持原状。
+        """
         logger.info(" 正在关闭直播控制模块...")
         # 取消后台开播/引导线程（A1/A2）
         self._startup_cancel.set()
@@ -2298,7 +2387,23 @@ class LiveController:
         self._ffmpeg_stop_event.set()
         self.stop_monitor.set()
         if self.is_streaming or self._is_starting:
-            self.stop_streaming()
+            if stop_platform:
+                self.stop_streaming()
+            else:
+                # D2：退出不停播——只回收自建进程 + 保存进度
+                self._kill_ffmpeg()
+                if self._ffmpeg_loop_thread and self._ffmpeg_loop_thread.is_alive():
+                    self._ffmpeg_loop_thread.join(timeout=3.0)
+                if self.monitor_thread and self.monitor_thread.is_alive():
+                    self.monitor_thread.join(timeout=2.0)
+                # 保存进度：任务模式把已播时长写入 live_state（重开后提示继续）
+                if self._stream_mode == 'task' and self.stream_start_time:
+                    elapsed = int((datetime.now() - self.stream_start_time).total_seconds())
+                    self.state.elapsed_seconds = max(self.state.elapsed_seconds, elapsed)
+                    self.state.is_streaming = True
+                    self.state.save()
+                    logger.info(f" 已保存进度（已播={self.state.elapsed_seconds}秒），平台侧未下播")
+                self.is_streaming = False  # 本地控制器视角停止；平台/OBS 不受影响
         # A5：只回收自建进程（所有权感知），绝不全局 taskkill
         self._kill_ffmpeg()
         logger.info(" 直播控制模块已关闭")

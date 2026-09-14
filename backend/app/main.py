@@ -175,17 +175,19 @@ async def health_check():
 
 
 @app.post("/api/shutdown", tags=["系统"])
-async def shutdown():
+async def shutdown(stop_live: bool = True):
     """安全关闭（保存状态 + 触发 uvicorn 优雅退出）。
 
     E2：优雅关闭路径——先落盘，再让 uvicorn 完成在途请求后退出；
     Electron 的强杀进程树只是兜底（优雅路径正常时不会走到）。
+    D2：stop_live=false 用于"不停止并退出"——保存进度、回收自建本地
+    推流进程，**不调用平台下播 API**（不碰外部 OBS 推流）。
     """
-    logger.info("收到关闭请求，正在保存状态...")
+    logger.info("收到关闭请求（stop_live=%s），正在保存状态...", stop_live)
     tm = get_task_manager()
     lc = get_live_controller()
     if lc:
-        lc.shutdown()
+        lc.shutdown(stop_platform=stop_live)
     if tm:
         tm.shutdown()
     server = getattr(app.state, "uvicorn_server", None)

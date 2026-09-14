@@ -63,12 +63,16 @@ def test_issued_ticket_rejected_after_stop(controller):
 
 
 def test_old_stop_replay_confirms_without_executing(controller):
-    """旧停止重放只确认既有结果（claim 返回 False），绝不停掉新直播。"""
+    """旧停止重放只确认既有结果（claim 返回 None），绝不停掉新直播。
+
+    D1 夹具迁移：claim_stop_operation 由 bool 改为 Optional[int]
+    （None=重放不执行；int=登记时刻的目标开播意图快照）。
+    """
     stop_ticket = "uuid-stop-1"
-    assert controller.claim_stop_operation(stop_ticket) is True
+    assert controller.claim_stop_operation(stop_ticket) is not None
     controller._advance_control_epoch()  # 停止执行 → 代际推进
     # 之后用户开启了新直播，旧停止的重放到达：
-    assert controller.claim_stop_operation(stop_ticket) is False, \
+    assert controller.claim_stop_operation(stop_ticket) is None, \
         "旧代际停止重放必须只确认结果，不得再次执行下播"
 
 
@@ -81,7 +85,7 @@ def test_new_start_after_stop_with_fresh_ticket_succeeds(controller):
     new_ticket = controller.issue_operation()
     assert controller.begin_control_operation(new_ticket) is not None
     # 旧停止此刻重放：不得影响新代际
-    assert controller.claim_stop_operation(old_stop) is False
+    assert controller.claim_stop_operation(old_stop) is None
 
 
 def test_boot_change_invalidates_all_tickets():
@@ -136,5 +140,30 @@ def test_stop_during_slow_start_via_executor(controller, fake_api):
         result = future.result(timeout=15)
         assert result["success"] is True, f"stop_live_sync 异常：{result.get('message')}"
         assert controller.is_streaming is False
+    finally:
+        dependencies.init_globals(None, None, None)
+
+
+def test_duplicate_queued_stops_do_not_kill_new_intent(controller, monkeypatch):
+    """D1：两个停止登记入队 → 期间新意图开播 → 队列中的停止执行时
+    仍关联登记时刻的目标意图，不得停掉之后新接受的开播。"""
+    from app.api.live import _stop_live_sync
+    from app import dependencies
+    dependencies.init_globals(None, controller, None)
+    try:
+        t1 = controller.claim_stop_operation('uuid-q1')
+        t2 = controller.claim_stop_operation('uuid-q2')  # 同代际不同票据：均需执行
+        assert t1 is not None and t2 is not None and t1 == t2
+        # 期间新意图被接受（模拟新开播）
+        controller._start_intent_id += 1
+        controller.is_streaming = True
+        stopped = []
+        monkeypatch.setattr(controller, 'stop_streaming',
+                            lambda: stopped.append(1) or True)
+        r1 = _stop_live_sync(None, t1)
+        r2 = _stop_live_sync(None, t2)
+        assert stopped == [], "旧队列中的停止不得停掉新意图"
+        assert r1["success"] and r2["success"]
+        assert controller.is_streaming
     finally:
         dependencies.init_globals(None, None, None)

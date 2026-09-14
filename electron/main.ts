@@ -19,7 +19,7 @@ import { spawn, ChildProcess, execFile } from 'child_process';
 import * as path from 'path';
 import * as fs from 'fs';
 import {
-  BackendLifecycle, OwnedProcess,
+  BackendLifecycle, OwnedProcess, OwnedPidRecord,
   parseNetstatListeners, classifyPortConflict,
 } from './backendManager';
 
@@ -37,7 +37,7 @@ let _forceQuit = false;
 const BACKEND_HOST = '127.0.0.1';
 const BACKEND_PORT = 8000;
 
-// ==================== 数据目录（E3） ====================
+// ==================== 数据目录（E3/D4） ====================
 
 function getDataDir(): string {
   // userData：<用户名>/AppData/Roaming/直播控制系统/ → data/
@@ -47,34 +47,47 @@ function getDataDir(): string {
 function ensureDataDir(): void {
   const dir = getDataDir();
   fs.mkdirSync(dir, { recursive: true });
-  // 可写性探测
+  // 可写性探测（探测文件保留不删除：部分环境的删除保护会拦截 unlink）
   const probe = path.join(dir, '.write_probe');
   fs.writeFileSync(probe, 'ok');
-  fs.unlinkSync(probe);
 }
 
 function getPidFilePath(): string {
   return path.join(getDataDir(), 'backend.pid');
 }
 
-function readOwnedPids(): number[] {
+/** 读取 PID 文件（JSON：pid + 拉起时命令行）。D2：数字相同不等于身份相同。 */
+function readOwnedRecords(): OwnedPidRecord[] {
   try {
-    const raw = fs.readFileSync(getPidFilePath(), 'utf-8');
-    return raw.split(/\s+/).map(s => parseInt(s, 10)).filter(n => Number.isInteger(n) && n > 4);
+    const raw = fs.readFileSync(getPidFilePath(), 'utf-8').trim();
+    if (!raw) return [];
+    if (raw.startsWith('{')) {
+      const rec = JSON.parse(raw);
+      if (Number.isInteger(rec.pid) && rec.pid > 4 && typeof rec.command === 'string') {
+        return [{ pid: rec.pid, command: rec.command }];
+      }
+      return [];
+    }
+    // 兼容旧格式（纯数字）：无身份证据，视为不可验证
+    const pid = parseInt(raw, 10);
+    if (Number.isInteger(pid) && pid > 4) return [{ pid, command: '' }];
+    return [];
   } catch {
     return [];
   }
 }
 
-function writePidFile(pid: number): void {
-  try { fs.writeFileSync(getPidFilePath(), String(pid), 'utf-8'); } catch { /* 非致命 */ }
+function writePidFile(pid: number, command: string): void {
+  try {
+    fs.writeFileSync(getPidFilePath(), JSON.stringify({ pid, command }), 'utf-8');
+  } catch { /* 非致命 */ }
 }
 
 function clearPidFile(): void {
   try { fs.unlinkSync(getPidFilePath()); } catch { /* 非致命 */ }
 }
 
-// ==================== E1：端口冲突处理 ====================
+// ==================== E1/D2：端口冲突处理 ====================
 
 function listPortListeners(port: number): number[] {
   if (process.platform !== 'win32') return [];
@@ -98,15 +111,54 @@ function killTreeByPid(pid: number): Promise<boolean> {
 }
 
 /**
- * E1：确保 8000 端口可用。
- * 返回 null = 可用（或已回收自己的旧后端）；返回 string = 阻断启动的错误说明。
+ * D2：实时查询系统里 pid 的进程命令行（身份验证证据）。
+ * 查询失败/不可得一律返回 null（按"无法验证"处理，绝不回收）。
+ */
+function queryProcessCommandLine(pid: number): string | null {
+  const { execFileSync } = require('child_process');
+  try {
+    // PowerShell CIM：Win11/Win10 均可用
+    const out = execFileSync('powershell', [
+      '-NoProfile', '-Command',
+      `(Get-CimInstance Win32_Process -Filter 'ProcessId=${pid}').CommandLine`,
+    ], { encoding: 'utf-8', timeout: 5000 });
+    const s = String(out || '').trim();
+    return s || null;
+  } catch { /* 回退 wmic */ }
+  try {
+    const out = execFileSync('wmic', [
+      'process', 'where', `processid=${pid}`, 'get', 'commandline',
+    ], { encoding: 'utf-8', timeout: 5000 });
+    const lines = String(out || '').split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+    // wmic 输出首行是表头 "CommandLine"，第二行起是值
+    const value = lines.slice(1).join(' ').trim();
+    return value || null;
+  } catch {
+    return null;
+  }
+}
+
+/** 命令行归一化比较：压空白与引号差异，忽略路径大小写 */
+function commandLineMatches(recorded: string, live: string | null): boolean {
+  if (!recorded || !live) return false;
+  const norm = (s: string) => s.replace(/\s+/g, ' ').replace(/"/g, '').toLowerCase().trim();
+  return norm(recorded) === norm(live);
+}
+
+/**
+ * E1/D2：确保 8000 端口可用。
+ * 返回 null = 可用（或已回收经身份验证的旧后端）；返回 string = 阻断启动的错误说明。
  */
 async function ensurePortAvailable(): Promise<string | null> {
   const listeners = listPortListeners(BACKEND_PORT);
-  const conflict = classifyPortConflict(listeners, readOwnedPids());
+  const conflict = classifyPortConflict(listeners, readOwnedRecords(), record => {
+    // PID 相同 + 实时命令行与登记命令行一致才认作自家旧后端；
+    // PID 复用（别的进程顶了旧 PID）命令行不匹配 → foreign。
+    return commandLineMatches(record.command, queryProcessCommandLine(record.pid));
+  });
   if (conflict === 'none') return null;
   if (conflict === 'own_stale') {
-    console.log(`[Electron] 端口 ${BACKEND_PORT} 由本应用上一代后端占用，回收中…`);
+    console.log(`[Electron] 端口 ${BACKEND_PORT} 由本应用上一代后端占用（身份已验证），回收中…`);
     for (const pid of listeners) {
       await killTreeByPid(pid);
     }
@@ -119,11 +171,11 @@ async function ensurePortAvailable(): Promise<string | null> {
   }
   const detail = listeners.join(', ');
   return `端口 ${BACKEND_PORT} 被其它程序占用（PID: ${detail}），` +
-    '本应用不会强制结束未知程序。请关闭占用该端口的程序后重试，' +
+    '本应用不会强制结束无法确认身份的程序。请关闭占用该端口的程序后重试，' +
     '或联系开发者调整端口。';
 }
 
-// ==================== 后端路径（E5） ====================
+// ==================== 后端路径（E5/D4） ====================
 
 function getBackendCommand(): { cmd: string; args: string[] } {
   const dataDir = getDataDir();
@@ -141,6 +193,28 @@ function getBackendCommand(): { cmd: string; args: string[] } {
   // 兜底：随包 Python 源码 + 系统 Python（须已安装并在 PATH）
   const script = path.join(resourcePath, 'backend', 'run.py');
   return { cmd: process.platform === 'win32' ? 'python' : 'python3', args: [script, ...dataArgs] };
+}
+
+/**
+ * D4：旧版本（1.0.x）数据目录候选，经 --legacy-data-dir 明确传给后端。
+ * 旧版 spawn 未设 cwd → 数据落在进程工作目录（安装根）；另含 resources
+ * 目录作为兜底候选。只传"存在且含已知旧数据文件"的目录。
+ */
+function getLegacyDataDirs(): string[] {
+  const knownOldFiles = ['live_state.json', 'live_tasks.db', 'bili_cookies.json', 'settings.json'];
+  const candidates: string[] = [];
+  try {
+    candidates.push(path.dirname(app.getPath('exe'))); // 安装根
+    if (process.resourcesPath) {
+      candidates.push(process.resourcesPath);
+      candidates.push(path.join(process.resourcesPath, 'backend'));
+    }
+  } catch { /* 忽略 */ }
+  return candidates.filter(dir => {
+    try {
+      return knownOldFiles.some(f => fs.existsSync(path.join(dir, f)));
+    } catch { return false; }
+  });
 }
 
 // ==================== 后端生命周期（E2） ====================
@@ -166,13 +240,21 @@ const lifecycle = new BackendLifecycle({
     const portErr = await ensurePortAvailable();
     if (portErr) throw new Error(portErr);
     const { cmd, args } = getBackendCommand();
-    console.log(`[Electron] Starting backend: ${cmd} ${args.join(' ')}`);
+    // D4：旧数据目录候选明确传给后端（不猜测、不全盘扫描）
+    const legacyDirs = getLegacyDataDirs();
+    if (legacyDirs.length > 0) {
+      args.push('--legacy-data-dir', legacyDirs.join(path.delimiter));
+    }
+    const fullCommand = [cmd, ...args].join(' ');
+    console.log(`[Electron] Starting backend: ${fullCommand}`);
     const child = spawn(cmd, args, {
       cwd: getDataDir(), // E3：工作目录=数据目录，杜绝安装目录写入
       stdio: ['pipe', 'pipe', 'pipe'],
       env: { ...process.env, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' },
     });
-    writePidFile(child.pid ?? -1);
+    // D2：PID 文件记录身份证据（PID + 拉起命令行）
+    writePidFile(child.pid ?? -1, fullCommand);
+    const generationAtSpawn = lifecycle.getGeneration(); // start() 已先自增代际
     child.stdout?.on('data', (data: Buffer) => {
       console.log(`[Python] ${data.toString('utf-8').trim()}`);
     });
@@ -180,15 +262,22 @@ const lifecycle = new BackendLifecycle({
       console.error(`[Python] ${data.toString('utf-8').trim()}`);
     });
     child.on('close', (code: number | null) => {
-      if (child.pid === (lifecycle.getPid() ?? -1)) clearPidFile();
-      lifecycle.handleClose(code);
+      // D2：close 携带 owner 身份；只有当前代的 close 才清 PID 文件
+      if (child.pid !== undefined && child.pid === lifecycle.getPid()
+          && generationAtSpawn === lifecycle.getGeneration()) {
+        clearPidFile();
+      }
+      lifecycle.handleClose(code, child.pid ?? null, generationAtSpawn);
     });
-    child.on('error', (err: Error) => lifecycle.handleError(err));
+    child.on('error', (err: Error) => lifecycle.handleError(err, child.pid ?? null, generationAtSpawn));
     return wrapChildProcess(child);
   },
-  async requestShutdown(): Promise<boolean> {
+  async requestShutdown(stopPlatform: boolean): Promise<boolean> {
     try {
-      const res = await fetch(`http://${BACKEND_HOST}:${BACKEND_PORT}/api/shutdown`, {
+      // D2：stopPlatform=false → "不停止并退出"：后端只保存进度并回收
+      // 自建本地进程，不调用平台下播 API（不碰 OBS 推流）
+      const res = await fetch(
+        `http://${BACKEND_HOST}:${BACKEND_PORT}/api/shutdown?stop_live=${stopPlatform}`, {
         method: 'POST', signal: AbortSignal.timeout(2500),
       });
       return res.ok;
@@ -341,7 +430,10 @@ function setupIPC(): void {
     };
   });
 
-  // 确认关闭（E2：退出收尾幂等且有总时限；停止→回收→退出）
+  // 确认关闭（E2/D2：退出收尾幂等且有总时限；停止→回收→退出）
+  // D2：stopLive=false（"不停止并退出"）绝不能触发平台下播——
+  // 优雅关闭带 stop_live=false，后端只保存进度并回收自建本地进程；
+  // 外部 OBS 推流不受影响。
   ipcMain.handle('confirm-quit', async (_event, stopLive: boolean) => {
     _forceQuit = true;
     lifecycle.setQuitting();
@@ -352,7 +444,7 @@ function setupIPC(): void {
         });
       } catch { /* */ }
     }
-    await lifecycle.stop(true, 10000);
+    await lifecycle.stop(true, 10000, stopLive);
     app.quit();
   });
 
@@ -459,15 +551,16 @@ app.on('window-all-closed', () => {
   }
 });
 
-// E2：before-quit 兜底——正常退出路径（confirm-quit）已完整收尾；
+// E2/D2：before-quit 兜底——正常退出路径（confirm-quit）已完整收尾；
 // 其它退出来源（window-all-closed、更新安装）在此标记退出并尽力回收。
+// 属无人值守路径：不发送平台命令（stop_live=false），只回收本地进程。
 app.on('before-quit', () => {
   (app as any).isQuitting = true;
   _forceQuit = true;
   if (!lifecycle.isQuitting()) {
     lifecycle.setQuitting();
     // 有界异步收尾：不阻塞退出，但给后端 2 秒优雅退出窗口
-    void lifecycle.stop(true, 2000);
+    void lifecycle.stop(true, 2000, false);
   }
 });
 
