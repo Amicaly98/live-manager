@@ -2,141 +2,219 @@
  * main.ts - Electron 主进程
  *
  * 功能：
- * 1. 启动/管理 Python 后端子进程
+ * 1. 启动/管理 Python 后端子进程（E2：单一 owner 状态机，见 backendManager.ts）
  * 2. 创建 BrowserWindow 加载前端
  * 3. 实现系统托盘
  * 4. IPC 通信（前后端桥梁）
+ *
+ * E1：不再为了腾出 8000 端口杀未知进程——只有能确认属于本应用上一代
+ *     后端（PID 文件匹配）的监听者才被回收，未知占用直接报错。
+ * E3：后端使用统一数据目录（userData/data），通过 --data-dir 传入，
+ *     工作目录设为数据目录，避免在安装目录（可能只读）写入任何文件。
  */
 
-import { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, shell } from 'electron';
+import { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, shell, dialog, Notification } from 'electron';
 import { autoUpdater } from 'electron-updater';
-import { spawn, ChildProcess } from 'child_process';
+import { spawn, ChildProcess, execFile } from 'child_process';
 import * as path from 'path';
 import * as fs from 'fs';
+import {
+  BackendLifecycle, OwnedProcess,
+  parseNetstatListeners, classifyPortConflict,
+} from './backendManager';
 
 // 开发/生产环境判断
 const isDev = process.env.NODE_ENV === 'development' || process.argv.includes('--dev');
-const isPackaged = app.isPackaged;
 
 // 去掉默认菜单栏（File, Edit, View 等）
 Menu.setApplicationMenu(null);
 
 let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
-let pythonProcess: ChildProcess | null = null;
 let _forceQuit = false;
 
 // 后端地址
 const BACKEND_HOST = '127.0.0.1';
 const BACKEND_PORT = 8000;
 
-// ==================== 后端管理 ====================
+// ==================== 数据目录（E3） ====================
 
-/** 释放被占用的端口（仅处理 LISTENING 状态的 Python 进程） */
-function freePort(port: number): void {
-  if (process.platform !== 'win32') return
+function getDataDir(): string {
+  // userData：<用户名>/AppData/Roaming/直播控制系统/ → data/
+  return path.join(app.getPath('userData'), 'data');
+}
+
+function ensureDataDir(): void {
+  const dir = getDataDir();
+  fs.mkdirSync(dir, { recursive: true });
+  // 可写性探测
+  const probe = path.join(dir, '.write_probe');
+  fs.writeFileSync(probe, 'ok');
+  fs.unlinkSync(probe);
+}
+
+function getPidFilePath(): string {
+  return path.join(getDataDir(), 'backend.pid');
+}
+
+function readOwnedPids(): number[] {
   try {
-    const { execSync } = require('child_process')
-    // 只查找 LISTENING 状态的连接
+    const raw = fs.readFileSync(getPidFilePath(), 'utf-8');
+    return raw.split(/\s+/).map(s => parseInt(s, 10)).filter(n => Number.isInteger(n) && n > 4);
+  } catch {
+    return [];
+  }
+}
+
+function writePidFile(pid: number): void {
+  try { fs.writeFileSync(getPidFilePath(), String(pid), 'utf-8'); } catch { /* 非致命 */ }
+}
+
+function clearPidFile(): void {
+  try { fs.unlinkSync(getPidFilePath()); } catch { /* 非致命 */ }
+}
+
+// ==================== E1：端口冲突处理 ====================
+
+function listPortListeners(port: number): number[] {
+  if (process.platform !== 'win32') return [];
+  try {
+    const { execSync } = require('child_process');
     const output = execSync(`netstat -ano | findstr LISTENING | findstr :${port}`, {
-      encoding: 'buffer', timeout: 3000
-    })
-    const text = output.toString('utf-8')
-    const lines = text.trim().split('\n').filter(Boolean)
-    for (const line of lines) {
-      const parts = line.trim().split(/\s+/)
-      const pid = parseInt(parts[parts.length - 1], 10)
-      // 跳过系统 PID
-      if (!pid || pid <= 4) continue
-      console.log(`[Electron] Releasing port ${port} (PID ${pid})...`)
-      try { execSync(`taskkill /PID ${pid} /F`, { timeout: 3000, encoding: 'buffer' }) } catch { /* ignore */ }
-    }
-  } catch { /* 端口空闲 */ }
-}
-
-function getBackendPath(): string {
-  // 开发时在 backend 目录，打包后可能内嵌 python
-  if (isDev) {
-    return path.join(__dirname, '..', 'backend', 'run.py');
-  }
-  // 打包后，假设 python 解压到 resources 下
-  const resourcePath = process.resourcesPath || path.join(__dirname, '..', '..');
-  return path.join(resourcePath, 'backend', 'run.py');
-}
-
-function startBackend(): void {
-  const backendScript = getBackendPath();
-  console.log(`[Electron] Starting backend: ${backendScript}`);
-
-  // 释放可能被占用的端口
-  freePort(BACKEND_PORT);
-
-  // 如果后端脚本不存在，可能已经打包成 exe
-  if (!fs.existsSync(backendScript)) {
-    console.log('[Electron] 后端脚本不存在，尝试直接启动打包后的后端服务');
-    // 假设打包时已内置后端
-    const bundledBackend = path.join(process.resourcesPath || '', 'backend', 'run.exe');
-    if (fs.existsSync(bundledBackend)) {
-      pythonProcess = spawn(bundledBackend, ['--mode', 'service'], {
-        stdio: ['pipe', 'pipe', 'pipe']
-      });
-    } else {
-      console.error('[Electron] 后端程序不存在，请先打包后端');
-      return;
-    }
-  } else {
-    // 使用系统 python 启动
-    const pythonCmd = process.platform === 'win32' ? 'python' : 'python3';
-    pythonProcess = spawn(pythonCmd, [backendScript, '--mode', 'service'], {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      env: { ...process.env, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' }
+      encoding: 'buffer', timeout: 3000,
     });
+    return parseNetstatListeners(output.toString('utf-8'), port);
+  } catch {
+    return []; // findstr 无匹配时非零退出 = 端口空闲
   }
+}
 
-  if (!pythonProcess) return;
-
-  pythonProcess.stdout?.on('data', (data: Buffer) => {
-    console.log(`[Python] ${data.toString('utf-8').trim()}`);
-  });
-
-  pythonProcess.stderr?.on('data', (data: Buffer) => {
-    console.error(`[Python] ${data.toString('utf-8').trim()}`);
-  });
-
-  pythonProcess.on('close', (code: number | null) => {
-    console.log(`[Python] 后端进程退出，code=${code}`);
-    pythonProcess = null;
-    // 如果是意外退出，可以尝试重启
-    if (code !== 0 && !(app as any).isQuitting) {
-      console.log('[Electron] 后端异常退出，5秒后重启...');
-      setTimeout(startBackend, 5000);
-    }
-  });
-
-  pythonProcess.on('error', (err: Error) => {
-    console.error('[Electron] 启动后端失败:', err.message);
+function killTreeByPid(pid: number): Promise<boolean> {
+  return new Promise(resolve => {
+    execFile('taskkill', ['/F', '/T', '/PID', String(pid)], { timeout: 8000 }, err => {
+      resolve(!err);
+    });
   });
 }
 
-async function stopBackend(graceful: boolean = true): Promise<void> {
-  if (pythonProcess) {
-    if (graceful) {
-      console.log('[Electron] 通知后端正常退出...');
+/**
+ * E1：确保 8000 端口可用。
+ * 返回 null = 可用（或已回收自己的旧后端）；返回 string = 阻断启动的错误说明。
+ */
+async function ensurePortAvailable(): Promise<string | null> {
+  const listeners = listPortListeners(BACKEND_PORT);
+  const conflict = classifyPortConflict(listeners, readOwnedPids());
+  if (conflict === 'none') return null;
+  if (conflict === 'own_stale') {
+    console.log(`[Electron] 端口 ${BACKEND_PORT} 由本应用上一代后端占用，回收中…`);
+    for (const pid of listeners) {
+      await killTreeByPid(pid);
+    }
+    // 等待端口真正释放（有界）
+    for (let i = 0; i < 10; i++) {
+      if (listPortListeners(BACKEND_PORT).length === 0) return null;
+      await new Promise(r => setTimeout(r, 300));
+    }
+    return '本应用旧后端占用端口但无法回收，请重启电脑或手动结束后端进程';
+  }
+  const detail = listeners.join(', ');
+  return `端口 ${BACKEND_PORT} 被其它程序占用（PID: ${detail}），` +
+    '本应用不会强制结束未知程序。请关闭占用该端口的程序后重试，' +
+    '或联系开发者调整端口。';
+}
+
+// ==================== 后端路径（E5） ====================
+
+function getBackendCommand(): { cmd: string; args: string[] } {
+  const dataDir = getDataDir();
+  const dataArgs = ['--data-dir', dataDir];
+  if (isDev) {
+    const script = path.join(__dirname, '..', 'backend', 'run.py');
+    return { cmd: process.platform === 'win32' ? 'python' : 'python3', args: [script, ...dataArgs] };
+  }
+  // 打包后：优先内置 run.exe（PyInstaller 产物，extraResources/backend/run.exe）
+  const resourcePath = process.resourcesPath || path.join(__dirname, '..', '..');
+  const bundledExe = path.join(resourcePath, 'backend', 'run.exe');
+  if (fs.existsSync(bundledExe)) {
+    return { cmd: bundledExe, args: [...dataArgs] };
+  }
+  // 兜底：随包 Python 源码 + 系统 Python（须已安装并在 PATH）
+  const script = path.join(resourcePath, 'backend', 'run.py');
+  return { cmd: process.platform === 'win32' ? 'python' : 'python3', args: [script, ...dataArgs] };
+}
+
+// ==================== 后端生命周期（E2） ====================
+
+function wrapChildProcess(child: ChildProcess): OwnedProcess {
+  return {
+    pid: child.pid ?? -1,
+    isAlive: () => child.pid !== undefined && child.exitCode === null && !child.killed,
+    killTree: () => new Promise<boolean>(resolve => {
+      if (process.platform === 'win32' && child.pid !== undefined) {
+        execFile('taskkill', ['/F', '/T', '/PID', String(child.pid)], { timeout: 8000 }, err => {
+          resolve(!err);
+        });
+      } else {
+        try { child.kill('SIGTERM'); resolve(true); } catch { resolve(false); }
+      }
+    }),
+  };
+}
+
+const lifecycle = new BackendLifecycle({
+  async spawn(): Promise<OwnedProcess> {
+    const portErr = await ensurePortAvailable();
+    if (portErr) throw new Error(portErr);
+    const { cmd, args } = getBackendCommand();
+    console.log(`[Electron] Starting backend: ${cmd} ${args.join(' ')}`);
+    const child = spawn(cmd, args, {
+      cwd: getDataDir(), // E3：工作目录=数据目录，杜绝安装目录写入
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: { ...process.env, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' },
+    });
+    writePidFile(child.pid ?? -1);
+    child.stdout?.on('data', (data: Buffer) => {
+      console.log(`[Python] ${data.toString('utf-8').trim()}`);
+    });
+    child.stderr?.on('data', (data: Buffer) => {
+      console.error(`[Python] ${data.toString('utf-8').trim()}`);
+    });
+    child.on('close', (code: number | null) => {
+      if (child.pid === (lifecycle.getPid() ?? -1)) clearPidFile();
+      lifecycle.handleClose(code);
+    });
+    child.on('error', (err: Error) => lifecycle.handleError(err));
+    return wrapChildProcess(child);
+  },
+  async requestShutdown(): Promise<boolean> {
+    try {
+      const res = await fetch(`http://${BACKEND_HOST}:${BACKEND_PORT}/api/shutdown`, {
+        method: 'POST', signal: AbortSignal.timeout(2500),
+      });
+      return res.ok;
+    } catch {
+      return false;
+    }
+  },
+  async waitReady(timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
       try {
-        await fetch(`http://${BACKEND_HOST}:${BACKEND_PORT}/api/shutdown`, { method: 'POST' }).catch(() => {});
-        await new Promise(r => setTimeout(r, 1000));
-      } catch { /* 后端可能已退出 */ }
+        const res = await fetch(`http://${BACKEND_HOST}:${BACKEND_PORT}/api/health`, {
+          signal: AbortSignal.timeout(2000),
+        });
+        if (res.ok) return true;
+      } catch { /* not ready */ }
+      await new Promise(r => setTimeout(r, 1000));
     }
-
-    console.log('[Electron] 停止后端进程...');
-    if (process.platform === 'win32') {
-      spawn('taskkill', ['/pid', String(pythonProcess.pid), '/f', '/t']);
-    } else {
-      pythonProcess.kill('SIGTERM');
-    }
-    pythonProcess = null;
-  }
-}
+    return false;
+  },
+  log: (level, message) => {
+    if (level === 'error') console.error(message);
+    else if (level === 'warn') console.warn(message);
+    else console.log(message);
+  },
+});
 
 // ==================== 窗口管理 ====================
 
@@ -248,54 +326,53 @@ function setupIPC(): void {
     return `http://${BACKEND_HOST}:${BACKEND_PORT}`;
   });
 
-  // 重启后端
-  ipcMain.handle('restart-backend', () => {
-    stopBackend();
-    setTimeout(startBackend, 1000);
-    return { success: true };
+  // 重启后端（E2：等待旧进程回收后再拉起；旧重启定时器被取消）
+  ipcMain.handle('restart-backend', async () => {
+    const ok = await lifecycle.restart();
+    return { success: ok };
   });
 
   // 获取后端状态
   ipcMain.handle('get-backend-status', () => {
     return {
-      running: pythonProcess !== null,
-      pid: pythonProcess?.pid || null
+      running: lifecycle.getState() === 'ready' || lifecycle.getState() === 'starting',
+      state: lifecycle.getState(),
+      pid: lifecycle.getPid(),
     };
   });
 
-  // 确认关闭
+  // 确认关闭（E2：退出收尾幂等且有总时限；停止→回收→退出）
   ipcMain.handle('confirm-quit', async (_event, stopLive: boolean) => {
-    _forceQuit = true
+    _forceQuit = true;
+    lifecycle.setQuitting();
     if (stopLive) {
       try {
-        await fetch(`http://${BACKEND_HOST}:${BACKEND_PORT}/api/live/stop`, { method: 'POST' });
-        await new Promise(r => setTimeout(r, 500));
+        await fetch(`http://${BACKEND_HOST}:${BACKEND_PORT}/api/live/stop`, {
+          method: 'POST', signal: AbortSignal.timeout(5000),
+        });
       } catch { /* */ }
-      await stopBackend(true);
-    } else {
-      await stopBackend(false);
     }
+    await lifecycle.stop(true, 10000);
     app.quit();
   });
 
-  // 强制退出（不弹确认，直接杀）
+  // 强制退出（不弹确认，直接退）
   ipcMain.on('force-quit', () => {
-    _forceQuit = true
-    app.quit()
-  })
+    _forceQuit = true;
+    lifecycle.setQuitting();
+    app.quit();
+  });
 
   // 选择文件/目录
   ipcMain.handle('select-file', async (event, options: { filters?: { name: string; extensions: string[] }[] }) => {
-    const { dialog } = require('electron');
     const result = await dialog.showOpenDialog(mainWindow!, {
       properties: ['openFile'],
-      filters: options.filters || [{ name: '所有文件', extensions: ['*'] }]
+      filters: options?.filters || [{ name: '所有文件', extensions: ['*'] }]
     });
     return result.filePaths[0] || null;
   });
 
   ipcMain.handle('select-directory', async () => {
-    const { dialog } = require('electron');
     const result = await dialog.showOpenDialog(mainWindow!, {
       properties: ['openDirectory']
     });
@@ -304,7 +381,6 @@ function setupIPC(): void {
 
   // 通知渲染进程
   ipcMain.handle('show-notification', (event, { title, body }: { title: string; body: string }) => {
-    const { Notification } = require('electron');
     new Notification({ title, body }).show();
   });
 
@@ -328,43 +404,26 @@ function setupIPC(): void {
 
 // ==================== 应用生命周期 ====================
 
-/** 轮询等待后端就绪（超时 30s） */
-async function waitForBackend(maxRetries: number = 30, interval: number = 1000): Promise<boolean> {
-  const http = require('http') as typeof import('http')
-  for (let i = 0; i < maxRetries; i++) {
-    try {
-      await new Promise<void>((resolve, reject) => {
-        const req = http.get(`http://${BACKEND_HOST}:${BACKEND_PORT}/api/health`, (res: any) => {
-          if (res.statusCode === 200) resolve()
-          else reject(new Error(`status ${res.statusCode}`))
-        })
-        req.on('error', reject)
-        req.setTimeout(2000, () => { req.destroy(); reject(new Error('timeout')) })
-      })
-      console.log(`[Electron] Backend ready (attempt ${i + 1})`)
-      return true
-    } catch {
-      if (i === 0) console.log('[Electron] Waiting for backend...')
-      await new Promise(r => setTimeout(r, interval))
-    }
-  }
-  console.error('[Electron] Backend failed to start within timeout')
-  return false
-}
-
 app.whenReady().then(async () => {
   setupIPC();
-  startBackend();
-  
-  // 等后端就绪后再加载窗口
-  const backendReady = await waitForBackend()
-  if (backendReady) {
-    createWindow();
-    createTray();
-  } else {
-    // 后端未就绪也显示窗口（允许查看缓存的离线数据）
-    createWindow();
+
+  // E3：初始化数据目录（失败则提示并继续——后端会给健康检查错误）
+  try {
+    ensureDataDir();
+  } catch (err) {
+    dialog.showErrorBox('数据目录不可用', `无法创建或写入数据目录：\n${getDataDir()}\n\n${err}`);
   }
+
+  // E1/E2：端口可用性预检（未知占用 → 明确报错，不杀进程）
+  const portErr = await ensurePortAvailable();
+  if (portErr) {
+    dialog.showErrorBox('端口被占用', portErr);
+  }
+
+  await lifecycle.start();
+
+  createWindow();
+  createTray();
 
   // 配置自动更新（仅生产环境）
   if (!isDev) {
@@ -400,9 +459,16 @@ app.on('window-all-closed', () => {
   }
 });
 
+// E2：before-quit 兜底——正常退出路径（confirm-quit）已完整收尾；
+// 其它退出来源（window-all-closed、更新安装）在此标记退出并尽力回收。
 app.on('before-quit', () => {
   (app as any).isQuitting = true;
-  stopBackend();
+  _forceQuit = true;
+  if (!lifecycle.isQuitting()) {
+    lifecycle.setQuitting();
+    // 有界异步收尾：不阻塞退出，但给后端 2 秒优雅退出窗口
+    void lifecycle.stop(true, 2000);
+  }
 });
 
 // 防止多个实例
