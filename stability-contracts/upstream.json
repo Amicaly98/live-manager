@@ -1,9 +1,9 @@
 {
   "schema_version": 2,
-  "contract_set_version": "2026-09-14.3",
+  "contract_set_version": "2026-09-15.1",
   "source_repository": "bilibili-live-server",
-  "source_branch": "stability/local-validated-20260913",
-  "contract_commit": "7a8ab682ebd0c9f152d69c47d1bdd571aa162476",
+  "source_branch": "main",
+  "contract_commit": "77f3306f17ebea0772dbb38c279fc92c7ea8b6c1",
   "mirror_targets": [
     "bilibili-live-manager"
   ],
@@ -15,7 +15,7 @@
     },
     {
       "path": "stability-contracts/contracts.json",
-      "sha256": "8e85607a83bee3ecd2d4bcf1ef48a2eb37aacbb34124ecd4d547aaf8ba173e3d"
+      "sha256": "18297beeb3cab532c3324e3e7b2c865f45a42206a745597b3af8b32261a945ad"
     },
     {
       "path": "stability-contracts/scenarios/__init__.py",
@@ -50,5 +50,5 @@
     "stability-contracts/upstream.json"
   ],
   "sync_rule": "只同步 mirrored_files；先 dry-run 列差异再复制；禁止盲删目录；两端按 sha256 逐文件校验（行尾归一化）；adapter_* 为端内自持，不参与镜像。",
-  "generated_at": "2026-09-14T23:58:04"
+  "generated_at": "2026-09-15T03:11:55"
 }
