@@ -34,17 +34,32 @@ def main():
     args = parser.parse_args()
 
     # 数据目录必须先于业务模块导入初始化（config.init_data_dir 幂等）
-    from app.core.config import init_data_dir
+    from app.core.config import init_data_dir, area_file_path
     from app.core.data_migration import migrate_legacy_data
     try:
         data_dir = init_data_dir(args.data_dir)
-        # 旧版本数据散落在仓库根/backend；带备份迁移进数据目录（E3）
-        legacy_dirs = [Path(backend_dir).parent]  # 仓库根
-        for legacy in legacy_dirs:
-            try:
-                migrate_legacy_data(data_dir, legacy)
-            except Exception as e:
-                print(f"[data-migration] 迁移检查失败（忽略）：{e}")
+        # 旧版本数据散落在仓库根/backend；带备份迁移进数据目录（E3）。
+        # BILIBILI_SKIP_MIGRATION=1 可跳过（测试隔离用，避免复制真实账号数据）。
+        if os.environ.get("BILIBILI_SKIP_MIGRATION") != "1":
+            legacy_dirs = [Path(backend_dir).parent]  # 仓库根
+            for legacy in legacy_dirs:
+                try:
+                    migrate_legacy_data(data_dir, legacy)
+                except Exception as e:
+                    print(f"[data-migration] 迁移检查失败（忽略）：{e}")
+        # E5：打包种子分区表（PyInstaller _MEIPASS 内）→ 数据目录首启复制，
+        # 不覆盖已有分区数据
+        try:
+            meipass = getattr(sys, "_MEIPASS", None)
+            if meipass:
+                seed = Path(meipass) / "bili_areas_full.json"
+                target = area_file_path()
+                if seed.exists() and not target.exists():
+                    import shutil
+                    shutil.copy2(seed, target)
+                    print(f"[seed] 分区表已初始化：{target}")
+        except Exception as e:
+            print(f"[seed] 分区表初始化失败（运行时会尝试在线获取）：{e}")
     except Exception as e:
         print(f"[fatal] 数据目录初始化失败：{e}", file=sys.stderr)
         sys.exit(2)
@@ -62,13 +77,18 @@ def main():
         print("服务模式：控制台输出将重定向")
     print("=" * 70)
 
-    uvicorn.run(
-        "app.main:app",
-        host=args.host,
-        port=args.port,
-        reload=args.reload,
-        log_level="info"
-    )
+    from app.main import app as fastapi_app
+    if args.reload:
+        # 热重载必须用导入字符串（仅开发）
+        uvicorn.run("app.main:app", host=args.host, port=args.port,
+                    reload=True, log_level="info")
+    else:
+        # 显式持有 Server 句柄：/api/shutdown 通过 should_exit 优雅退出（E2）
+        config = uvicorn.Config(fastapi_app, host=args.host, port=args.port,
+                                log_level="info")
+        server = uvicorn.Server(config)
+        fastapi_app.state.uvicorn_server = server
+        server.run()
 
 
 if __name__ == "__main__":

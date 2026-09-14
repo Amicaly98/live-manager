@@ -1,0 +1,34 @@
+{
+  "started_at": "2026-09-14T16:20:34.894439",
+  "cycles": [
+    {
+      "cycle": 1,
+      "started_at": "2026-09-14T16:20:34.895251",
+      "pid": 6408,
+      "health_ok": true,
+      "metrics_ready": {
+        "rss_mb": 5.0546875,
+        "handles": 1
+      },
+      "shutdown_http": true,
+      "exit_code": "killed_after_timeout",
+      "residual_alive": false,
+      "finished_at": "2026-09-14T16:20:58.934205"
+    },
+    {
+      "cycle": 2,
+      "started_at": "2026-09-14T16:20:58.935120",
+      "pid": 36972,
+      "health_ok": true,
+      "metrics_ready": {
+        "rss_mb": 5.0546875,
+        "handles": 1
+      },
+      "shutdown_http": true,
+      "exit_code": "killed_after_timeout",
+      "residual_alive": false,
+      "finished_at": "2026-09-14T16:21:22.957678"
+    }
+  ],
+  "endurance": null
+}

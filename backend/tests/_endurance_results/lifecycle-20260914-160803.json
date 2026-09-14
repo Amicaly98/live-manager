@@ -1,0 +1,116 @@
+{
+  "started_at": "2026-09-14T16:08:03.270841",
+  "cycles": [
+    {
+      "cycle": 1,
+      "started_at": "2026-09-14T16:08:03.272129",
+      "pid": 23932,
+      "health_ok": false,
+      "shutdown_http": false,
+      "shutdown_err": "HTTP Error 502: Bad Gateway",
+      "exit_code": 1,
+      "residual_alive": false,
+      "finished_at": "2026-09-14T16:08:46.362116"
+    },
+    {
+      "cycle": 2,
+      "started_at": "2026-09-14T16:08:46.396592",
+      "pid": 47592,
+      "health_ok": false,
+      "shutdown_http": false,
+      "shutdown_err": "HTTP Error 502: Bad Gateway",
+      "exit_code": 1,
+      "residual_alive": false,
+      "finished_at": "2026-09-14T16:09:29.436781"
+    },
+    {
+      "cycle": 3,
+      "started_at": "2026-09-14T16:09:29.477450",
+      "pid": 48476,
+      "health_ok": false,
+      "shutdown_http": false,
+      "shutdown_err": "HTTP Error 502: Bad Gateway",
+      "exit_code": 1,
+      "residual_alive": false,
+      "finished_at": "2026-09-14T16:10:12.580111"
+    },
+    {
+      "cycle": 4,
+      "started_at": "2026-09-14T16:10:12.599972",
+      "pid": 27900,
+      "health_ok": false,
+      "shutdown_http": false,
+      "shutdown_err": "HTTP Error 502: Bad Gateway",
+      "exit_code": 1,
+      "residual_alive": false,
+      "finished_at": "2026-09-14T16:10:55.642583"
+    },
+    {
+      "cycle": 5,
+      "started_at": "2026-09-14T16:10:55.663082",
+      "pid": 43140,
+      "health_ok": false,
+      "shutdown_http": false,
+      "shutdown_err": "HTTP Error 502: Bad Gateway",
+      "exit_code": 1,
+      "residual_alive": false,
+      "finished_at": "2026-09-14T16:11:38.791100"
+    },
+    {
+      "cycle": 6,
+      "started_at": "2026-09-14T16:11:38.809789",
+      "pid": 12824,
+      "health_ok": false,
+      "shutdown_http": false,
+      "shutdown_err": "HTTP Error 502: Bad Gateway",
+      "exit_code": 1,
+      "residual_alive": false,
+      "finished_at": "2026-09-14T16:12:21.806611"
+    },
+    {
+      "cycle": 7,
+      "started_at": "2026-09-14T16:12:21.827249",
+      "pid": 18760,
+      "health_ok": false,
+      "shutdown_http": false,
+      "shutdown_err": "HTTP Error 502: Bad Gateway",
+      "exit_code": 1,
+      "residual_alive": false,
+      "finished_at": "2026-09-14T16:13:04.807153"
+    },
+    {
+      "cycle": 8,
+      "started_at": "2026-09-14T16:13:04.827624",
+      "pid": 5724,
+      "health_ok": false,
+      "shutdown_http": false,
+      "shutdown_err": "HTTP Error 502: Bad Gateway",
+      "exit_code": 1,
+      "residual_alive": false,
+      "finished_at": "2026-09-14T16:13:47.921326"
+    },
+    {
+      "cycle": 9,
+      "started_at": "2026-09-14T16:13:47.941279",
+      "pid": 43844,
+      "health_ok": false,
+      "shutdown_http": false,
+      "shutdown_err": "HTTP Error 502: Bad Gateway",
+      "exit_code": 1,
+      "residual_alive": false,
+      "finished_at": "2026-09-14T16:14:30.994814"
+    },
+    {
+      "cycle": 10,
+      "started_at": "2026-09-14T16:14:31.014822",
+      "pid": 24076,
+      "health_ok": false,
+      "shutdown_http": false,
+      "shutdown_err": "HTTP Error 502: Bad Gateway",
+      "exit_code": 1,
+      "residual_alive": false,
+      "finished_at": "2026-09-14T16:15:14.093518"
+    }
+  ],
+  "endurance": null
+}

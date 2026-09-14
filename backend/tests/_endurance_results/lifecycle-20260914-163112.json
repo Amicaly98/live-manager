@@ -1,0 +1,146 @@
+{
+  "started_at": "2026-09-14T16:31:12.857846",
+  "cycles": [
+    {
+      "cycle": 1,
+      "started_at": "2026-09-14T16:31:12.858523",
+      "pid": 25072,
+      "health_ok": true,
+      "metrics_ready": {
+        "rss_mb": 5.05859375,
+        "handles": 1
+      },
+      "shutdown_http": true,
+      "exit_code": "killed_after_timeout",
+      "residual_alive": false,
+      "finished_at": "2026-09-14T16:31:35.997880"
+    },
+    {
+      "cycle": 2,
+      "started_at": "2026-09-14T16:31:35.998881",
+      "pid": 46664,
+      "health_ok": true,
+      "metrics_ready": {
+        "rss_mb": 5.05859375,
+        "handles": 1
+      },
+      "shutdown_http": true,
+      "exit_code": "killed_after_timeout",
+      "residual_alive": false,
+      "finished_at": "2026-09-14T16:32:00.143796"
+    },
+    {
+      "cycle": 3,
+      "started_at": "2026-09-14T16:32:00.144704",
+      "pid": 31676,
+      "health_ok": true,
+      "metrics_ready": {
+        "rss_mb": 5.05859375,
+        "handles": 1
+      },
+      "shutdown_http": true,
+      "exit_code": "killed_after_timeout",
+      "residual_alive": false,
+      "finished_at": "2026-09-14T16:32:23.277534"
+    },
+    {
+      "cycle": 4,
+      "started_at": "2026-09-14T16:32:23.278262",
+      "pid": 33020,
+      "health_ok": true,
+      "metrics_ready": {
+        "rss_mb": 5.05859375,
+        "handles": 1
+      },
+      "shutdown_http": true,
+      "exit_code": "killed_after_timeout",
+      "residual_alive": false,
+      "finished_at": "2026-09-14T16:32:46.413493"
+    },
+    {
+      "cycle": 5,
+      "started_at": "2026-09-14T16:32:46.423933",
+      "pid": 27300,
+      "health_ok": true,
+      "metrics_ready": {
+        "rss_mb": 5.05859375,
+        "handles": 1
+      },
+      "shutdown_http": true,
+      "exit_code": "killed_after_timeout",
+      "residual_alive": false,
+      "finished_at": "2026-09-14T16:33:09.531620"
+    },
+    {
+      "cycle": 6,
+      "started_at": "2026-09-14T16:33:09.532608",
+      "pid": 30552,
+      "health_ok": true,
+      "metrics_ready": {
+        "rss_mb": 5.05859375,
+        "handles": 1
+      },
+      "shutdown_http": true,
+      "exit_code": "killed_after_timeout",
+      "residual_alive": false,
+      "finished_at": "2026-09-14T16:33:32.617304"
+    },
+    {
+      "cycle": 7,
+      "started_at": "2026-09-14T16:33:32.618244",
+      "pid": 11348,
+      "health_ok": true,
+      "metrics_ready": {
+        "rss_mb": 5.0546875,
+        "handles": 1
+      },
+      "shutdown_http": true,
+      "exit_code": "killed_after_timeout",
+      "residual_alive": false,
+      "finished_at": "2026-09-14T16:33:55.677480"
+    },
+    {
+      "cycle": 8,
+      "started_at": "2026-09-14T16:33:55.678245",
+      "pid": 40216,
+      "health_ok": true,
+      "metrics_ready": {
+        "rss_mb": 5.05859375,
+        "handles": 1
+      },
+      "shutdown_http": true,
+      "exit_code": "killed_after_timeout",
+      "residual_alive": false,
+      "finished_at": "2026-09-14T16:34:18.743748"
+    },
+    {
+      "cycle": 9,
+      "started_at": "2026-09-14T16:34:18.754653",
+      "pid": 49088,
+      "health_ok": true,
+      "metrics_ready": {
+        "rss_mb": 5.05859375,
+        "handles": 1
+      },
+      "shutdown_http": true,
+      "exit_code": "killed_after_timeout",
+      "residual_alive": false,
+      "finished_at": "2026-09-14T16:34:42.836931"
+    },
+    {
+      "cycle": 10,
+      "started_at": "2026-09-14T16:34:42.838059",
+      "pid": 29996,
+      "health_ok": true,
+      "metrics_ready": {
+        "rss_mb": 5.05859375,
+        "handles": 1
+      },
+      "shutdown_http": true,
+      "exit_code": "killed_after_timeout",
+      "residual_alive": false,
+      "finished_at": "2026-09-14T16:35:07.007374"
+    }
+  ],
+  "endurance": null
+}

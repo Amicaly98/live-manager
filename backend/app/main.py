@@ -176,7 +176,11 @@ async def health_check():
 
 @app.post("/api/shutdown", tags=["系统"])
 async def shutdown():
-    """安全关闭（保存运行日期和状态）"""
+    """安全关闭（保存状态 + 触发 uvicorn 优雅退出）。
+
+    E2：优雅关闭路径——先落盘，再让 uvicorn 完成在途请求后退出；
+    Electron 的强杀进程树只是兜底（优雅路径正常时不会走到）。
+    """
     logger.info("收到关闭请求，正在保存状态...")
     tm = get_task_manager()
     lc = get_live_controller()
@@ -184,4 +188,10 @@ async def shutdown():
         lc.shutdown()
     if tm:
         tm.shutdown()
+    server = getattr(app.state, "uvicorn_server", None)
+    if server is not None:
+        logger.info("通知 uvicorn 优雅退出...")
+        server.should_exit = True
+    else:
+        logger.warning("未找到 uvicorn server 句柄，进程将由调用方强杀兜底")
     return {"status": "ok", "message": "状态已保存"}

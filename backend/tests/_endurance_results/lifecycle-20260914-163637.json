@@ -1,0 +1,39 @@
+{
+  "started_at": "2026-09-14T16:36:37.899616",
+  "cycles": [
+    {
+      "cycle": 1,
+      "started_at": "2026-09-14T16:36:37.910854",
+      "pid": 31928,
+      "health_ok": false,
+      "shutdown_http": false,
+      "shutdown_err": "<urlopen error [WinError 10061] 由于目标计算机积极拒绝，无法连接。>",
+      "exit_code": 1,
+      "residual_alive": false,
+      "finished_at": "2026-09-14T16:37:21.102552"
+    },
+    {
+      "cycle": 2,
+      "started_at": "2026-09-14T16:37:21.142752",
+      "pid": 29464,
+      "health_ok": false,
+      "shutdown_http": false,
+      "shutdown_err": "<urlopen error [WinError 10061] 由于目标计算机积极拒绝，无法连接。>",
+      "exit_code": 1,
+      "residual_alive": false,
+      "finished_at": "2026-09-14T16:38:04.289225"
+    },
+    {
+      "cycle": 3,
+      "started_at": "2026-09-14T16:38:04.330468",
+      "pid": 35960,
+      "health_ok": false,
+      "shutdown_http": false,
+      "shutdown_err": "<urlopen error [WinError 10061] 由于目标计算机积极拒绝，无法连接。>",
+      "exit_code": 1,
+      "residual_alive": false,
+      "finished_at": "2026-09-14T16:38:47.544764"
+    }
+  ],
+  "endurance": null
+}

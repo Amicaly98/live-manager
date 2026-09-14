@@ -1,0 +1,116 @@
+{
+  "started_at": "2026-09-14T16:23:23.053550",
+  "cycles": [
+    {
+      "cycle": 1,
+      "started_at": "2026-09-14T16:23:23.054647",
+      "pid": 24400,
+      "health_ok": false,
+      "shutdown_http": false,
+      "shutdown_err": "<urlopen error [WinError 10061] 由于目标计算机积极拒绝，无法连接。>",
+      "exit_code": 1,
+      "residual_alive": false,
+      "finished_at": "2026-09-14T16:24:06.109383"
+    },
+    {
+      "cycle": 2,
+      "started_at": "2026-09-14T16:24:06.149592",
+      "pid": 46560,
+      "health_ok": false,
+      "shutdown_http": false,
+      "shutdown_err": "<urlopen error [WinError 10061] 由于目标计算机积极拒绝，无法连接。>",
+      "exit_code": 1,
+      "residual_alive": false,
+      "finished_at": "2026-09-14T16:24:49.172683"
+    },
+    {
+      "cycle": 3,
+      "started_at": "2026-09-14T16:24:49.213536",
+      "pid": 20268,
+      "health_ok": false,
+      "shutdown_http": false,
+      "shutdown_err": "<urlopen error [WinError 10061] 由于目标计算机积极拒绝，无法连接。>",
+      "exit_code": 1,
+      "residual_alive": false,
+      "finished_at": "2026-09-14T16:25:32.270217"
+    },
+    {
+      "cycle": 4,
+      "started_at": "2026-09-14T16:25:32.290112",
+      "pid": 37248,
+      "health_ok": false,
+      "shutdown_http": false,
+      "shutdown_err": "<urlopen error [WinError 10061] 由于目标计算机积极拒绝，无法连接。>",
+      "exit_code": 1,
+      "residual_alive": false,
+      "finished_at": "2026-09-14T16:26:15.307729"
+    },
+    {
+      "cycle": 5,
+      "started_at": "2026-09-14T16:26:15.328316",
+      "pid": 40260,
+      "health_ok": false,
+      "shutdown_http": false,
+      "shutdown_err": "<urlopen error [WinError 10061] 由于目标计算机积极拒绝，无法连接。>",
+      "exit_code": 1,
+      "residual_alive": false,
+      "finished_at": "2026-09-14T16:26:58.344780"
+    },
+    {
+      "cycle": 6,
+      "started_at": "2026-09-14T16:26:58.365034",
+      "pid": 48268,
+      "health_ok": false,
+      "shutdown_http": false,
+      "shutdown_err": "<urlopen error [WinError 10061] 由于目标计算机积极拒绝，无法连接。>",
+      "exit_code": 1,
+      "residual_alive": false,
+      "finished_at": "2026-09-14T16:27:41.336234"
+    },
+    {
+      "cycle": 7,
+      "started_at": "2026-09-14T16:27:41.356268",
+      "pid": 47492,
+      "health_ok": false,
+      "shutdown_http": false,
+      "shutdown_err": "<urlopen error [WinError 10061] 由于目标计算机积极拒绝，无法连接。>",
+      "exit_code": 1,
+      "residual_alive": false,
+      "finished_at": "2026-09-14T16:28:24.325316"
+    },
+    {
+      "cycle": 8,
+      "started_at": "2026-09-14T16:28:24.345976",
+      "pid": 3852,
+      "health_ok": false,
+      "shutdown_http": false,
+      "shutdown_err": "<urlopen error [WinError 10061] 由于目标计算机积极拒绝，无法连接。>",
+      "exit_code": 1,
+      "residual_alive": false,
+      "finished_at": "2026-09-14T16:29:07.322740"
+    },
+    {
+      "cycle": 9,
+      "started_at": "2026-09-14T16:29:07.343389",
+      "pid": 48928,
+      "health_ok": false,
+      "shutdown_http": false,
+      "shutdown_err": "<urlopen error [WinError 10061] 由于目标计算机积极拒绝，无法连接。>",
+      "exit_code": 1,
+      "residual_alive": false,
+      "finished_at": "2026-09-14T16:29:50.353778"
+    },
+    {
+      "cycle": 10,
+      "started_at": "2026-09-14T16:29:50.374082",
+      "pid": 24424,
+      "health_ok": false,
+      "shutdown_http": false,
+      "shutdown_err": "<urlopen error [WinError 10061] 由于目标计算机积极拒绝，无法连接。>",
+      "exit_code": 1,
+      "residual_alive": false,
+      "finished_at": "2026-09-14T16:30:33.484278"
+    }
+  ],
+  "endurance": null
+}
