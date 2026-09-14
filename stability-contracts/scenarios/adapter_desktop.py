@@ -352,3 +352,39 @@ class DesktopAdapter:
     def start_pusher(self, c, epoch=None):
         # 桌面 1.1.0 起 _start_ffmpeg_stream 也接收显式代际（入口捕获后不再重取）
         return bool(c._start_ffmpeg_stream(epoch))
+
+    # ---------- 停止清理的"完成"判定（失败分支） ----------
+    def stub_failed_reclaim(self, c):
+        """把回收边界替换为"失败且保留 owner"的替身，返回可读调用计数。
+
+        只替换**进程边界**（本机不能真的创建一个杀不掉的同房间推流子进程）；
+        停止入口、所有权登记、清理判定与被测状态机全部走真实实现。
+        """
+        def cannot_reclaim(*_args, **_kwargs):
+            c._ffmpeg_unrecycled = True
+            return False
+
+        spy = Spy(impl=cannot_reclaim)
+        c._kill_ffmpeg = spy
+        return spy
+
+    def stub_successful_reclaim(self, c):
+        """把回收边界替换为"本代进程确实退出"，随后走**真实所有权清理**路径。
+
+        只让替身进程"退出"（真实进程由 OS 确认），引用清理仍由产品自己的
+        _release_pusher 完成，不在适配器里重写所有权逻辑。
+        """
+        def reclaim(*_args, **_kwargs):
+            proc = c.video_process
+            if proc is not None:
+                proc._alive = False      # 只有替身进程能这样"退出"
+            c._release_pusher(c._pusher_owner_generation())
+            return True
+
+        spy = Spy(impl=reclaim)
+        c._kill_ffmpeg = spy
+        return spy
+
+    def cleanup_done(self, c):
+        """上一次停止是否被判定为"确认完成"（重复停止的短路判据）。"""
+        return bool(c._stop_cleanup_done)

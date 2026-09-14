@@ -483,6 +483,77 @@ def ctrl02d_stop_after_new_session_still_stops(a):
         a.dispose(c)
 
 
+@scenario('CTRL-02e', 'CTRL-02',
+          '回收失败不得记为"清理完成"：保留 owner，后续显式停止仍能重试回收')
+def ctrl02e_failed_reclaim_is_not_completion(a):
+    c = a.make('ffmpeg')
+    try:
+        a.set_streaming(c, True)
+        a.install_zone(c, ZONE)
+        proc = a.make_unkillable_process(c)
+        a.claim_pusher(c, a.new_pusher_generation(c), proc)
+        # 回收边界替换为"失败且保留 owner"的替身；停止入口/所有权登记/状态机
+        # 全部走真实实现（本机不能真的造一个杀不掉的子进程）。
+        failed = a.stub_failed_reclaim(c)
+
+        assert a.stop_user(c) is True, '停止必须被受理'
+        a.wait_idle(c)
+        assert a.video_process(c) is proc, '回收失败必须保留 owned 进程引用'
+        assert a.unrecycled(c) is True, '回收失败必须标记未回收'
+        assert a.cleanup_done(c) is False, (
+            '回收失败不得被记为"清理完成"：否则重复停止会被短路，连重试都没有')
+        first_calls = failed.count
+        assert first_calls > 0, '首次停止必须真实尝试回收'
+
+        assert a.stop_user(c) is True, '重复的停止必须被受理'
+        a.wait_idle(c)
+        assert failed.count > first_calls, (
+            '未确认回收时，重复停止必须允许受控重试'
+            '（不得只把标记改成 False 却实际禁止再次回收）')
+        assert a.cleanup_done(c) is False, '仍未回收 → 仍不得标记清理完成'
+        assert a.video_process(c) is proc, '重试失败不得清除 owner 引用'
+        assert a.unrecycled(c) is True, '重试失败必须保留未回收标记'
+    finally:
+        a.dispose(c)
+
+
+@scenario('CTRL-02f', 'CTRL-02',
+          '恢复闭环：重试回收成功后，后续重复停止只确认（不再重复回收/下播）')
+def ctrl02f_successful_retry_then_confirm_only(a):
+    c = a.make('ffmpeg')
+    try:
+        a.set_streaming(c, True)
+        a.install_zone(c, ZONE)
+        proc = a.make_unkillable_process(c)
+        a.claim_pusher(c, a.new_pusher_generation(c), proc)
+
+        a.stub_failed_reclaim(c)
+        assert a.stop_user(c) is True, '停止必须被受理'
+        a.wait_idle(c)
+        assert a.cleanup_done(c) is False, '前置条件：首次回收失败 → 不得标记完成'
+        assert a.video_process(c) is proc, '前置条件：owner 引用仍保留'
+
+        # 第二次停止：回收边界换成"本代进程确实退出"，走真实所有权清理路径
+        ok_boundary = a.stub_successful_reclaim(c)
+        assert a.stop_user(c) is True, '重复的停止必须被受理'
+        a.wait_idle(c)
+        assert ok_boundary.count > 0, '恢复阶段必须真的尝试回收'
+        assert a.video_process(c) is None, '回收成功后必须清除引用'
+        assert a.unrecycled(c) is False, '回收成功后必须清除未回收标记'
+        assert a.cleanup_done(c) is True, '只有确认回收后才允许记为清理完成'
+
+        calls_after_success = ok_boundary.count
+        stops_after_success = a.platform_call_count(c, 'stop_live')
+        assert a.stop_user(c) is True, '再次重复的停止必须成功返回（幂等）'
+        a.wait_idle(c)
+        assert ok_boundary.count == calls_after_success, (
+            '清理已确认完成且无新会话：重复停止只确认，不得再次回收')
+        assert a.platform_call_count(c, 'stop_live') == stops_after_success, (
+            '清理已确认完成且无新会话：重复停止不得再提交一次平台下播')
+    finally:
+        a.dispose(c)
+
+
 # ==================== PUSH-01：推流进程所有权 ====================
 
 @scenario('PUSH-01a', 'PUSH-01',

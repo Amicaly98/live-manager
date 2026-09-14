@@ -38,9 +38,12 @@ $env:PYTHONIOENCODING='utf-8'; $env:BILIBILI_SKIP_MIGRATION='1'
 & <python> <repo>/stability-contracts/scenarios/tool_selfcheck.py --product server
 ```
 
-退出码：**0** 全部通过；**1** 至少一个场景失败；**2** 工具/选择错误
-（未知场景 ID、0 场景选择、适配器构造失败）。`--only` 的未知 ID 与空选择一律
-非零退出——不会把拼错的验收项悄悄丢掉，也不会把"跑了 0 个场景"当成通过。
+退出码：**0** 全部通过**且**被测快照有效；**1** 至少一个场景失败；
+**2** 工具/选择错误（未知场景 ID、0 场景选择、适配器构造失败）；
+**3** 场景通过但被测快照无效，且本次运行要求有效快照（`--require-valid-snapshot`，
+**发布验收必须带这个开关**——行为结果不能替代来源证据）。
+`--only` 的未知 ID 与空选择一律非零退出——不会把拼错的验收项悄悄丢掉，
+也不会把"跑了 0 个场景"当成通过。
 
 **没有"环境跳过"档位**：控制器构造失败也按失败记录，环境问题与断言失败在 JSON
 里分开呈现（`error` 字段带异常类型）。结果 JSON **总是**写出（含失败运行与工具
@@ -48,13 +51,22 @@ $env:PYTHONIOENCODING='utf-8'; $env:BILIBILI_SKIP_MIGRATION='1'
 
 ```json
 "source_snapshot": {
-  "repo": "...", "branch": "...", "head_commit": "...",
+  "repo": "...", "branch": "...",
+  "head_commit": "...",            // 仅当格式为 40 位 hex 时才有值
+  "head_commit_valid": true,
   "worktree_diff_sha256": "...", "worktree_dirty": true,
-  "files": {"stability-contracts/scenarios/adapter_*.py": "...", "...": "..."}
+  "files": {"stability-contracts/scenarios/adapter_<product>.py": "...", "...": "..."},
+  "snapshot_valid": true,
+  "snapshot_error": ""             // Git 失败时是唯一的错误落点
 }
 ```
 
 因此**旧结果不会被误配给新 HEAD**；台账里写当前 HEAD 不能替代这份内嵌快照。
+
+**行为结果与来源证据分开标记**：Git 查询失败时 `snapshot_valid=False`、
+`head_commit` 与 `worktree_diff_sha256` **留空**，原始错误只进 `snapshot_error`——
+错误文本（及其哈希）绝不冒充提交或工作区差异。`safe.directory` 只对本仓使用
+`Path.as_posix()` 形式（不使用 `*` 通配，也不修改全局/用户级 git 配置）。
 
 ## 规则（避免这类机制退化成形式）
 
@@ -81,13 +93,18 @@ $env:PYTHONIOENCODING='utf-8'; $env:BILIBILI_SKIP_MIGRATION='1'
    （共享场景覆盖什么、端内有哪几条补充用例 ID、明确未覆盖什么）；
    组级标题不得代替实际覆盖范围。
 8. 本目录**不是 CI、也不是行为正确性证明**。HEAD 一致不等于测试通过；
-   `check_alignment.py` 只做台账新鲜度、镜像哈希与状态汇总。
+   `check_alignment.py` 只做台账新鲜度、镜像哈希与状态汇总。行为通过也不能替代
+   来源证据：发布验收必须带 `--require-valid-snapshot`，快照无效即不可验收。
+9. **"函数返回了"不等于"资源已回收"**：停止/清理类判定必须以实际状态
+   （owned 进程是否仍存活、`_ffmpeg_unrecycled`）为准；失败必须保留失败状态，
+   让后续显式操作能重试，而不是用"已完成"标记把重试短路（CTRL-02e/02f）。
 
-## 当前落地范围（契约版本 2026-09-14.2）
+## 当前落地范围（契约版本 2026-09-14.3）
 
-- 已落地共享场景 **18 个**：`CTRL-01a..h`（含"旧重连等待→停止→新意图→旧响应
+- 已落地共享场景 **20 个**：`CTRL-01a..h`（含"旧重连等待→停止→新意图→旧响应
   返回"的交错，以及直接调用真实 `_start_ffmpeg_stream` 的三个等待边界场景）、
-  `CTRL-02a..d`、`PUSH-01a/b`、`MODE-01a/b`、`INTENT-01a/b`。
+  `CTRL-02a..f`（含"回收失败不得记为清理完成"与"重试成功→后续重复只确认"的
+  恢复闭环）、`PUSH-01a/b`、`MODE-01a/b`、`INTENT-01a/b`。
 - 未纳入共同场景、只在各仓测试覆盖：`FFMPEG-01`、`LOG-01`。
 - **延期（deferred）**：`RETRY-01`（>30 秒异常退出的 5 秒退避）、`MEDIA-01`
   （concat 抽检范围）——两端共有，本轮不改数值/不加入全量探测，附有界方案。

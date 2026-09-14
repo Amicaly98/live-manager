@@ -944,6 +944,9 @@ class LiveController:
         # 用于让"清理已完成、无新会话"的重复停止只确认既有结果，而不是再走一次
         # 平台下播与进程回收（重复回收会在新会话刚建立时把它误清理掉）。
         self._stop_cleanup_done = False
+        # 平台下播与"本地 owned 进程回收"分开记录：确认下发后不再重复下播，
+        # 未下发/失败则保留待办，允许后续显式停止重试（见 _cleanup_confirmed）。
+        self._platform_stop_done = False
         # D1：每次被接受的开播意图分配唯一 id；停止在登记时快照目标意图，
         # 执行器队列中迟到的停止不再停掉"之后新接受"的开播意图。
         self._start_intent_id = 0
@@ -1253,6 +1256,7 @@ class LiveController:
             # 新意图接管后，上一次停止的"清理已完成"不再适用于本会话：
             # 之后到来的停止必须真正执行一次回收与下播。
             self._stop_cleanup_done = False
+            self._platform_stop_done = False
             self._recovery_blocked = ''
             self._pending_face_verify = False
             self.current_instruction = instruction
@@ -2339,6 +2343,32 @@ class LiveController:
                         logger.warning(" 自动切换任务遇到人脸验证，等待前端确认")
         logger.info(" 直播监控线程已退出")
 
+    @staticmethod
+    def _platform_stop_ok(result) -> bool:
+        """平台下播结果归一化：容错 (ok, payload) 元组与裸布尔。
+
+        None 表示实现没有返回值——请求未抛异常，视为已下发（与旧行为一致，
+        不把"没有返回值"当成失败而反复重试平台下播）。
+        """
+        if isinstance(result, tuple):
+            return bool(result[0]) if result else False
+        if result is None:
+            return True
+        return bool(result)
+
+    def _cleanup_confirmed(self) -> bool:
+        """本次停止是否**确认**完成：owned 进程已回收、平台下播已下发。
+
+        必须基于实际状态判定，不能因为清理函数"返回了"就当作完成：回收失败时
+        引用仍在且 _ffmpeg_unrecycled 为真，此时若标记完成，重复停止会被
+        "已完成"分支短路，连一次回收重试都没有机会。
+        """
+        if self._process_alive(self.video_process):
+            return False
+        if self._ffmpeg_unrecycled:
+            return False
+        return bool(self._platform_stop_done)
+
     def _stop_live_process(self, preserve_state: bool = False):
         """停止直播进程（不 join 线程）
         preserve_state=True: 保留 live_state 以便恢复（任务模式手动停播时使用）
@@ -2351,11 +2381,17 @@ class LiveController:
         if self._ffmpeg_loop_thread and self._ffmpeg_loop_thread.is_alive():
             self._ffmpeg_loop_thread.join(timeout=3.0)
         self._ffmpeg_stop_event.clear()
-        if self.current_room_id:
+        # 平台下播与本地进程回收分开记录：已确认下发的房间不再重复下播
+        # （重试"本地回收"时不得顺手把已被新意图接管的房间再下一次播）；
+        # 未下发/失败则保留待办，允许后续显式停止重试。
+        if not self.current_room_id:
+            self._platform_stop_done = True
+        elif not self._platform_stop_done:
             csrf = self.api.get_csrf()
             if csrf:
                 try:
-                    self.api.stop_live(self.current_room_id, csrf)
+                    self._platform_stop_done = self._platform_stop_ok(
+                        self.api.stop_live(self.current_room_id, csrf))
                 except Exception as e:
                     logger.warning(f" 平台下播请求异常（本地进程仍会停止）：{e}")
         # 保留实际已播时长（在清除 stream_start_time 之前计算）
@@ -2404,7 +2440,10 @@ class LiveController:
             logger.info("重复的停止请求：清理已完成且无新的在播会话，只确认结果")
         else:
             self._stop_live_process(preserve_state=preserve)
-            self._stop_cleanup_done = True
+            # 只有确认回收（owned 进程已退出、平台下播已下发）才记"清理完成"。
+            # 回收失败时引用仍在、_ffmpeg_unrecycled 为真 → 保留失败状态，
+            # 让用户再次停止时还能真正重试回收，而不是被"已完成"分支短路。
+            self._stop_cleanup_done = self._cleanup_confirmed()
         self.current_instruction = None
         logger.info(" 直播已完全停止")
         return True

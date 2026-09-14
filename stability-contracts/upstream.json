@@ -1,9 +1,9 @@
 {
   "schema_version": 2,
-  "contract_set_version": "2026-09-14.2",
+  "contract_set_version": "2026-09-14.3",
   "source_repository": "bilibili-live-server",
   "source_branch": "stability/local-validated-20260913",
-  "contract_commit": "e31d13dabbe811da5853c8f261c69cf41880459a",
+  "contract_commit": "9d008c04c37fcc4b2007d556d962b3cbeeb91dfc",
   "mirror_targets": [
     "bilibili-live-manager"
   ],
@@ -11,11 +11,11 @@
   "mirrored_files": [
     {
       "path": "stability-contracts/README.md",
-      "sha256": "f043f47d8a664a828bf5ad87b03ae5e79f274d67141dae9642ed524bc66beecd"
+      "sha256": "6ecefdda60fc316ecce7f5364322629c169e06beda7fd2fffb14534ac8ac1b01"
     },
     {
       "path": "stability-contracts/contracts.json",
-      "sha256": "3eccba6d7b29e3a7a9e773a525ea1dee1b4e1f25ac9ca80b112bb8f6ef896f9a"
+      "sha256": "1141fdac73a53d2adf9a1fe9fb08b095ba7bfbe3f791eb4801ecd2fca29cc5bd"
     },
     {
       "path": "stability-contracts/scenarios/__init__.py",
@@ -23,15 +23,15 @@
     },
     {
       "path": "stability-contracts/scenarios/contract_core.py",
-      "sha256": "c2ce5ae7322ef76a2e642369be316c874430c1f50d66bed3e3bb70ceb756408b"
+      "sha256": "4b7f2bb964da62f095f1a458caeceb070849fcd1907651c868b06378a455c9d4"
     },
     {
       "path": "stability-contracts/scenarios/run_contracts.py",
-      "sha256": "48b81360bed1fa5de2bac0904c06e049cbbc4e911756ece4739ab2bf974b1bba"
+      "sha256": "6278a1bea5f910f96ab41302720e86d1e617f4fb249e286dbf21c3747bd9ed70"
     },
     {
       "path": "stability-contracts/scenarios/tool_selfcheck.py",
-      "sha256": "8d147f5aab8c6af34eacddc75ffe1266db0445edf92089bd309563643940070b"
+      "sha256": "835d3f4ec5e812afa64a89f83e415c3a0535aeccdaf6e168fe1d44d7a0fc6d6c"
     },
     {
       "path": "stability-contracts/scenarios/sync_mirror.py",
@@ -50,5 +50,5 @@
     "stability-contracts/upstream.json"
   ],
   "sync_rule": "只同步 mirrored_files；先 dry-run 列差异再复制；禁止盲删目录；两端按 sha256 逐文件校验（行尾归一化）；adapter_* 为端内自持，不参与镜像。",
-  "generated_at": "2026-09-14T22:14:42"
+  "generated_at": "2026-09-14T23:53:55"
 }

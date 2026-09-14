@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "contract_set_version": "2026-09-14.2",
+  "contract_set_version": "2026-09-14.3",
   "maintenance_location": "bilibili-live-server/stability-contracts",
   "note": "本文件放在服务器仓库只表示维护位置，不代表服务器实现是标准答案。桌面仓库保留同内容镜像，一致性由 upstream.json 的逐文件 SHA256 校验（行尾归一化；来源提交核验由 sync_mirror.py --verify-source-commit 完成，未核验时只能称“工作区镜像一致”）。",
   "products": {
@@ -84,15 +84,15 @@
     },
     {
       "id": "CTRL-02",
-      "title": "旧停止重放不得停止后来新直播；新意图有新票；清理完成后的重复停止只确认",
+      "title": "旧停止重放不得停止后来新直播；新意图有新票；只有确认回收后重复停止才只确认",
       "status": {"server": "verified", "desktop": "verified"},
-      "scenarios": ["CTRL-02a", "CTRL-02b", "CTRL-02c", "CTRL-02d"],
+      "scenarios": ["CTRL-02a", "CTRL-02b", "CTRL-02c", "CTRL-02d", "CTRL-02e", "CTRL-02f"],
       "evidence": {
         "runner": "stability-contracts/scenarios/run_contracts.py",
         "repo_tests": "server: backend/tests/test_u1_ticket_protocol.py, backend/tests/test_control_safety.py::IdempotencyTests; desktop: backend/tests/test_a2_control_epoch.py, backend/tests/test_stop_idempotency.py"
       },
       "coverage": {
-        "shared_scenarios": "CTRL-02a 旧停止重放只确认；CTRL-02b 停止使旧票据失效、新票据有效；CTRL-02c 清理已完成且无新会话时的重复停止只确认（不重复下播）；CTRL-02d 新会话之后的新停止仍然有效。",
+        "shared_scenarios": "CTRL-02a 旧停止重放只确认；CTRL-02b 停止使旧票据失效、新票据有效；CTRL-02c 清理已完成且无新会话时的重复停止只确认（不重复下播）；CTRL-02d 新会话之后的新停止仍然有效；CTRL-02e 回收失败不得被记为「清理完成」——保留 owner（引用 + _ffmpeg_unrecycled）、不标记完成，且后续显式停止必须真的再次尝试回收；CTRL-02f 恢复闭环——重试回收成功后引用与未回收标记被清除、此时才允许标记完成，再重复停止只确认（不再重复回收/下播）。",
         "in_repo_supplements": {
           "server": [
             "backend/tests/test_control_safety.py::IdempotencyTests::test_repeated_stop_while_cleanup_still_running_dispatches_once（Event 受控：清理进行中的并发重复停止）",
@@ -111,7 +111,7 @@
           "带相同票据的 HTTP 重放误停新直播：现有证据是**内部无票据入口**的行为判定，不冒充 HTTP 层已复现。"
         ]
       },
-      "negative_control": "两端分别去掉“清理完成后的重复停止只确认”判定后：CTRL-02c 与 CTRL-02d 在两端均转红；服务器仓库内 3 个幂等用例同时转红。"
+      "negative_control": "两端分别去掉“清理完成后的重复停止只确认”判定后：CTRL-02c 与 CTRL-02d 在两端均转红；服务器仓库内 3 个幂等用例同时转红。本轮新增：把“只有确认回收才算完成”改回“清理函数返回即完成”后，CTRL-02e/02f 在两端均转红，且监督反例 supervision_failed_cleanup.py 在两端同时转红（原始输出见 deliveries/cross-repo-alignment/negctl-server-failedcleanup.log 与 negctl-desktop-failedcleanup.log）。"
     },
     {
       "id": "CTRL-03",
@@ -258,6 +258,20 @@
       "note": "服务器数据库同样启用 WAL：若将来新增在线备份流程，必须遵守同一一致性原则（backup API 或离线 checkpoint）。"
     }
   ],
+  "tooling": {
+    "runner": "stability-contracts/scenarios/run_contracts.py",
+    "selfcheck": "stability-contracts/scenarios/tool_selfcheck.py",
+    "mirror": "stability-contracts/scenarios/sync_mirror.py",
+    "exit_codes": {
+      "0": "所选场景全部通过且被测快照有效",
+      "1": "至少一个场景失败（断言失败或环境错误，逐条记录）",
+      "2": "工具/选择错误（未知场景 ID、空选择、适配器构造失败）",
+      "3": "场景通过但被测快照无效，且本次运行要求有效快照（--require-valid-snapshot；发布验收必须带该开关）"
+    },
+    "snapshot_validity": "行为结果与来源证据分开标记：snapshot_valid / head_commit_valid / snapshot_error 是独立字段；Git 查询失败时 head_commit 与 worktree_diff_sha256 留空，原始错误只进 snapshot_error——错误文本（及其哈希）不得冒充提交或工作区证据。safe.directory 只对本仓使用 Path.as_posix() 形式（不使用 '*' 通配，不修改全局/用户级配置）。",
+    "selfcheck_coverage": "8 项：worker 异常回传主线程；未知/混合/空 ID 非零退出；失败运行仍保存有效快照；有效运行的真实提交格式（40 位 hex）与现算哈希归属；safe.directory 规范化；受控 Git 失败必须判无效且不冒充来源；发布验收在快照无效时 rc=3 且同时保留行为结果与原始错误；CLI 开关在有效快照下不阻断。",
+    "negative_control": "把 runner 还原为旧 _git（失败仍返回错误文本、无提交格式校验、snapshot_valid 恒 True）后，工具自测有 2 项转红（受控 Git 失败项、发布验收项），见 deliveries/cross-repo-alignment/negctl-server-snapshot-validity.log。"
+  },
   "known_open_failures": [
     {
       "id": "SERVER-M11-HANDLE-DRIFT",
