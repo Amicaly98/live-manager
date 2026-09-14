@@ -12,6 +12,7 @@
 - 断言失败即失败；没有"环境跳过"这一档（环境不可用应如实报错）。
 """
 
+import contextlib
 import threading
 import time
 
@@ -36,6 +37,89 @@ class Spy:
     @property
     def count(self):
         return len(self.calls)
+
+
+class FakeLoop:
+    """受控旧推流循环替身（**不创建真实线程**）。
+
+    ``alive_sequence`` 依次返回，最后一个值保持；``on_join`` 在 ``join()``
+    内执行，用于把"用户停止 / 新意图接管"精确插入到等待期间。
+    """
+
+    def __init__(self, alive_sequence=(True, False), on_join=None):
+        self._alive = list(alive_sequence)
+        self.on_join = on_join
+        self.join_calls = 0
+
+    def is_alive(self):
+        if len(self._alive) > 1:
+            return bool(self._alive.pop(0))
+        return bool(self._alive[0])
+
+    def join(self, timeout=None):
+        self.join_calls += 1
+        if self.on_join is not None:
+            self.on_join(timeout)
+
+
+class PusherLoopCounter:
+    """统计"新建推流循环线程"的请求数。
+
+    只按线程名 ``FFmpegLoop`` 计数，并且**真实创建仍然发生**（不改变被测
+    行为、也不影响停止/开播线程）。用于验证"停止后不得另建循环"。
+    """
+
+    def __init__(self):
+        self.count = 0
+
+    def __enter__(self):
+        outer = self
+        real = threading.Thread
+
+        class _CountingThread(real):
+            def __init__(self, *args, **kwargs):
+                if kwargs.get('name') == 'FFmpegLoop':
+                    outer.count += 1
+                super().__init__(*args, **kwargs)
+
+        self._real = real
+        threading.Thread = _CountingThread
+        return self
+
+    def __exit__(self, *exc):
+        threading.Thread = self._real
+        return False
+
+
+@contextlib.contextmanager
+def interleaved_worker(target, args, entered, release, timeout=15.0):
+    """启动受控交错 worker，并保证失败路径也不会留下悬挂线程。
+
+    - worker 进入等待点（``entered``）后把控制权交给场景主体；
+    - 无论主体成功、断言失败还是抛异常，finally 都放行（``release``）并 join；
+    - worker 内部异常（含断言）**回传到主线程**并让场景失败 —— 只看到"线程
+      结束"不足以证明它正常跑完。
+    """
+    carrier = {}
+
+    def _run():
+        try:
+            target(*args)
+        except BaseException as exc:  # 断言失败也要在主线程复现
+            carrier['error'] = exc
+
+    worker = threading.Thread(target=_run, name='InterleavedWorker', daemon=True)
+    worker.start()
+    try:
+        yield worker
+    finally:
+        release.set()
+        worker.join(timeout)
+    if carrier.get('error') is not None:
+        raise AssertionError(
+            f'worker 异常未回传（不得只凭线程结束判通过）：{carrier["error"]!r}'
+        ) from carrier['error']
+    assert not worker.is_alive(), 'worker 未在超时内结束'
 
 
 class Scenario:
@@ -176,32 +260,27 @@ def ctrl01_interleaved_stop_then_new_intent(a):
         a.stub_cached_push_url(c, 'rtmp://127.0.0.1/test')
         epoch_at_entry = a.epoch(c)
 
-        worker = threading.Thread(target=a.reconnect, args=(c, epoch_at_entry),
-                                  name='OldReconnect', daemon=True)
-        worker.start()
-        assert entered.wait(15), '旧重连未进入平台等待'
+        # worker 异常必须回传主线程；finally 无条件放行并回收线程
+        with interleaved_worker(a.reconnect, (c, epoch_at_entry), entered, release):
+            assert entered.wait(15), '旧重连未进入平台等待'
 
-        # 1) 用户停止（真实停止入口，跑完清理）
-        a.stop_user(c)
-        a.wait_idle(c)
-        intent_before_new = a.intent_id(c)
+            # 1) 用户停止（真实停止入口，跑完清理）
+            a.stop_user(c)
+            a.wait_idle(c)
+            intent_before_new = a.intent_id(c)
 
-        # 2) 用户新开播（真实开播入口）——新意图接管
-        assert a.start(c, ZONE) is True, '停止后用户发起的开播必须被受理'
-        a.wait_idle(c)
-        intent_after_new = a.intent_id(c)
-        assert intent_after_new > intent_before_new, (
-            '新开播必须登记新的开播意图序号（用于区分旧响应）')
+            # 2) 用户新开播（真实开播入口）——新意图接管
+            assert a.start(c, ZONE) is True, '停止后用户发起的开播必须被受理'
+            a.wait_idle(c)
+            intent_after_new = a.intent_id(c)
+            assert intent_after_new > intent_before_new, (
+                '新开播必须登记新的开播意图序号（用于区分旧响应）')
 
-        # 3) 记录旧响应到达前的基线
-        cache_before = cache.count
-        push_before = pusher.count
-        stops_before = a.platform_call_count(c, 'stop_live')
-        epoch_before = a.epoch(c)
-
-        release.set()
-        worker.join(15)
-        assert not worker.is_alive(), '旧重连线程未结束'
+            # 3) 记录旧响应到达前的基线
+            cache_before = cache.count
+            push_before = pusher.count
+            stops_before = a.platform_call_count(c, 'stop_live')
+            epoch_before = a.epoch(c)
 
         assert cache.count == cache_before, '旧响应不得提交推流码缓存'
         assert pusher.count == push_before, '旧响应不得新增本地推流启动'
@@ -217,6 +296,104 @@ def ctrl01_interleaved_stop_then_new_intent(a):
             c._start_cancel.set()
         except Exception:
             pass
+        a.dispose(c)
+
+
+# ---------- CTRL-01f..i：推流启动内部的等待边界（真实启动方法，不整体替换） ----------
+# 说明：CTRL-01a..e 从上位入口验证"停止后旧请求不得提交副作用"；下面四项直接
+# 调用两端真实的 _start_ffmpeg_stream，只把"旧循环/杀进程/推流地址获取/新线程
+# 创建"作为可控边界。停止一律走适配器的真实停止受理路径（不再在适配器里补
+# 安全保护）。
+
+@scenario('CTRL-01f', 'CTRL-01',
+          '推流启动：等待旧循环期间 停止→新意图接管；旧等待返回后不得清理/覆盖新 owner')
+def ctrl01f_stop_then_new_intent_during_old_loop_join(a):
+    c = a.make('ffmpeg')
+    try:
+        a.set_streaming(c, True)
+        a.install_zone(c, ZONE)
+        a.stop_is_acceptance_only(c)
+        kill = a.spy(c, '_kill_ffmpeg', impl=lambda *args, **kw: True)
+        holder = {}
+
+        def during_join(_timeout):
+            # 用户停止（真实停止受理路径）
+            a.stop_user(c)
+            # 新意图接管：可复用事件被清除、在播标记复位（等价于用户随即重新开播）
+            a.model_taken_over_generation(c)
+            a.install_zone(c, ZONE)
+            # 新会话已经登记的推流进程：旧请求绝不允许清理或替换它
+            gen = a.new_pusher_generation(c)
+            proc = a.make_unkillable_process(c)
+            a.claim_pusher(c, gen, proc)
+            holder['proc'] = proc
+
+        old_loop = FakeLoop(alive_sequence=(True, False), on_join=during_join)
+        a.set_old_loop(c, old_loop)
+        with PusherLoopCounter() as create:
+            result = a.start_pusher(c)
+
+        assert result is False, '停止/新意图已接管：旧的推流启动请求必须作废'
+        assert kill.count == 0, (
+            f'失去所有权的旧请求不得清理推流进程：_kill_ffmpeg 被调用 {kill.count} 次')
+        assert create.count == 0, '失去所有权的旧请求不得新建推流循环'
+        assert a.pusher_loop(c) is old_loop, '旧请求不得覆盖/替换循环引用'
+        assert a.stop_signal_set(c) is True, (
+            '停止发生后旧请求不得清除停止信号（否则旧循环会被"复活"）')
+        assert a.video_process(c) is holder['proc'], (
+            '新 owner 已登记的推流进程不得被旧请求清理或替换')
+    finally:
+        a.dispose(c)
+
+
+@scenario('CTRL-01g', 'CTRL-01',
+          '推流启动：等待旧循环后仍未退出 → 保留引用与停止信号，不得另建循环')
+def ctrl01g_unfinished_old_loop_keeps_reference(a):
+    c = a.make('ffmpeg')
+    try:
+        a.set_streaming(c, True)
+        a.install_zone(c, ZONE)
+        kill = a.spy(c, '_kill_ffmpeg', impl=lambda *args, **kw: True)
+        old_loop = FakeLoop(alive_sequence=(True,))
+        a.set_old_loop(c, old_loop)
+        with PusherLoopCounter() as create:
+            result = a.start_pusher(c)
+
+        assert result is False, '旧循环仍在运行：不得启动新的推流循环'
+        assert create.count == 0, '不得另建推流循环（否则同房间双推流）'
+        assert kill.count == 0, '旧循环未退出时不得清理进程'
+        assert a.pusher_loop(c) is old_loop, (
+            '必须保留旧循环引用，交由正常恢复处理（不得先覆盖引用）')
+        assert a.stop_signal_set(c) is True, '必须保留停止信号以便旧循环退出'
+    finally:
+        a.dispose(c)
+
+
+@scenario('CTRL-01h', 'CTRL-01',
+          '推流启动：网络获取推流地址期间 停止→新意图接管 → 返回后不得创建新循环')
+def ctrl01h_stop_during_push_url_fetch(a):
+    c = a.make('ffmpeg')
+    try:
+        a.set_streaming(c, True)
+        a.install_zone(c, ZONE)
+        a.stop_is_acceptance_only(c)
+        a.spy(c, '_kill_ffmpeg', impl=lambda *args, **kw: True)
+        a.stub_cached_push_url(c, None)  # 强制走网络获取分支
+
+        def fetch(*_args):
+            a.stop_user(c)                    # 网络等待期间受理停止
+            # 新意图接管：可复用的停止事件被清除 —— 之后只有"原代际"这一判据
+            # 能识别出本次启动请求已经过期（这正是本场景要验证的）。
+            a.model_taken_over_generation(c)
+            return True, {'push_url': 'rtmp://127.0.0.1/test'}
+
+        a.set_push_url(c, fetch)
+        with PusherLoopCounter() as create:
+            result = a.start_pusher(c)
+
+        assert result is False, '推流地址返回时本请求已过期：不得创建新的推流循环'
+        assert create.count == 0, '过期请求不得创建新的推流循环'
+    finally:
         a.dispose(c)
 
 
@@ -250,6 +427,59 @@ def ctrl02_tickets_follow_generation(a):
         t2 = a.issue_ticket(c)
         assert a.begin_operation(c, t2) is not None, '停止后新签发的票据必须有效'
     finally:
+        a.dispose(c)
+
+
+@scenario('CTRL-02c', 'CTRL-02',
+          '重复停止：清理已完成且无新会话时，重复请求只确认既有结果（不重复下播）')
+def ctrl02c_repeated_stop_after_completion_only_confirms(a):
+    c = a.make('ffmpeg')
+    try:
+        a.set_streaming(c, True)
+        a.install_zone(c, ZONE)
+        a.stop_user(c)
+        a.wait_idle(c)
+        stops_after_first = a.platform_call_count(c, 'stop_live')
+        assert stops_after_first >= 1, '第一次停止必须真正执行一次平台下播'
+
+        assert a.stop_user(c) is True, '重复的停止必须成功返回（幂等）'
+        a.wait_idle(c)
+        assert a.platform_call_count(c, 'stop_live') == stops_after_first, (
+            '清理已完成且无新意图：重复停止不得再提交一次平台下播')
+    finally:
+        a.dispose(c)
+
+
+@scenario('CTRL-02d', 'CTRL-02',
+          '新直播之后的新停止仍然有效（幂等判据不得吃掉新会话的停止）')
+def ctrl02d_stop_after_new_session_still_stops(a):
+    c = a.make('ffmpeg')
+    try:
+        a.set_streaming(c, True)
+        a.install_zone(c, ZONE)
+        a.stop_user(c)
+        a.wait_idle(c)
+        stops_after_first = a.platform_call_count(c, 'stop_live')
+        assert stops_after_first >= 1, '第一次停止必须真正执行一次平台下播'
+
+        a.stop_user(c)                 # 重复停止：只确认
+        a.wait_idle(c)
+
+        assert a.start(c, ZONE) is True, '停止后用户开播必须被受理'
+        a.wait_idle(c)
+        assert a.is_streaming(c) is True, '新会话必须在播'
+
+        assert a.stop_user(c) is True
+        a.wait_idle(c)
+        assert a.is_streaming(c) is False, '新会话的停止必须生效'
+        assert a.platform_call_count(c, 'stop_live') == stops_after_first + 1, (
+            '新会话的停止必须真正执行一次平台下播')
+    finally:
+        try:
+            c.stop_monitor.set()
+            c._start_cancel.set()
+        except Exception:
+            pass
         a.dispose(c)
 
 

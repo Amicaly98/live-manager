@@ -8,13 +8,16 @@
 
 | 文件 | 作用 | 是否双仓镜像 |
 |---|---|---|
-| `contracts.json` | 契约台账：稳定编号、要求、适用产品、有意差异、覆盖边界 | 是（逐字节一致） |
+| `contracts.json` | 契约台账：稳定编号、要求、有意差异、**覆盖范围与未覆盖项** | 是（逐字节一致） |
 | `scenarios/contract_core.py` | 与产品无关的时序与断言（不 import 任何产品 app 包） | 是（逐字节一致） |
-| `scenarios/run_contracts.py` | 单产品运行器（CLI） | 是（逐字节一致） |
+| `scenarios/run_contracts.py` | 单产品运行器（CLI，内嵌被测快照） | 是（逐字节一致） |
+| `scenarios/tool_selfcheck.py` | 工具负向自测（证明工具不会假 PASS） | 是（逐字节一致） |
+| `scenarios/sync_mirror.py` | 镜像清单/哈希/干运行/来源提交核验 | 是（逐字节一致） |
 | `scenarios/__init__.py` | 包标记 | 是（逐字节一致） |
 | `scenarios/adapter_server.py` | 服务器端薄适配器：把场景接到本仓真实入口 | 否（端内自持） |
 | `scenarios/adapter_desktop.py` | 桌面端薄适配器：把场景接到本仓真实入口 | 否（端内自持） |
 | `upstream.json` | 镜像来源仓库、契约提交、镜像文件 SHA256 | 是（各自记录同一来源提交） |
+| `backend/tests/test_cross_repo_contracts.py` | 本仓常规回归的薄包装 | 是（逐字节一致） |
 
 ## 怎么跑（两端必须分别起独立进程）
 
@@ -30,35 +33,64 @@ $env:PYTHONIOENCODING='utf-8'
 $env:PYTHONIOENCODING='utf-8'; $env:BILIBILI_SKIP_MIGRATION='1'
 & <python> <desktop>/stability-contracts/scenarios/run_contracts.py `
     --product desktop --data-dir <tmp> --json <out>/contract-results-desktop.json
+
+# 工具负向自测（每端各跑一次）
+& <python> <repo>/stability-contracts/scenarios/tool_selfcheck.py --product server
 ```
 
-退出码 0 = 全部通过；1 = 存在失败。**没有"环境跳过"档位**：控制器构造失败也按
-失败记录，环境问题与断言失败在 JSON 里分开呈现（`error` 字段带异常类型）。
+退出码：**0** 全部通过；**1** 至少一个场景失败；**2** 工具/选择错误
+（未知场景 ID、0 场景选择、适配器构造失败）。`--only` 的未知 ID 与空选择一律
+非零退出——不会把拼错的验收项悄悄丢掉，也不会把"跑了 0 个场景"当成通过。
 
-各仓也提供一个薄 pytest 包装：`backend/tests/test_cross_repo_contracts.py`，
-使共同契约进入该仓的常规回归。
+**没有"环境跳过"档位**：控制器构造失败也按失败记录，环境问题与断言失败在 JSON
+里分开呈现（`error` 字段带异常类型）。结果 JSON **总是**写出（含失败运行与工具
+错误），并内嵌被测快照：
+
+```json
+"source_snapshot": {
+  "repo": "...", "branch": "...", "head_commit": "...",
+  "worktree_diff_sha256": "...", "worktree_dirty": true,
+  "files": {"stability-contracts/scenarios/adapter_*.py": "...", "...": "..."}
+}
+```
+
+因此**旧结果不会被误配给新 HEAD**；台账里写当前 HEAD 不能替代这份内嵌快照。
 
 ## 规则（避免这类机制退化成形式）
 
 1. **同一场景、同一断言描述在两端都执行**。产品差异必须写进
    `contracts.json` 的 `intentional_differences` 并由适配器显式处理，不能靠 skip 隐藏失败。
 2. **适配器只允许**：构造真实控制器、调用真实入口、观察（替换平台/进程边界、
-   安装观察点、把某产品的单体入口收窄到受理阶段）。不得在适配器里重写被测状态机。
-3. **镜像只针对上面列明的文件**。对镜像逐文件计算 SHA256 记入 `upstream.json`；
-   同步前先干运行列出文件差异，禁止盲删目录，也禁止整文件复制 `live_controller.py`。
-4. **每个修复都要回答"影响另一端吗"**。台账状态取 `verified` / `failed` /
-   `pending` / `not_applicable` / `deferred` / `accepted_risk`；`accepted_risk` 必须
-   写明用户接受的范围。对端无影响要写原因，不能留空当默认。
-5. **证据绑定提交与源码快照**。工作区有改动时必须记录差异哈希，不能只贴 HEAD。
-6. 本目录**不是 CI、也不是行为正确性证明**。HEAD 一致不等于测试通过；
-   `check_alignment.py` 只做台账新鲜度核对。
+   安装观察点、把某产品的单体入口收窄到受理阶段）。不得在适配器里重写被测状态机，
+   **也不得在适配器里补安全保护**（那会把"修复缺失"掩盖成"场景通过"）。
+3. **受控交错必须让 worker 异常回传主线程**：`contract_core.interleaved_worker`
+   在 finally 放行并 join，worker 内部异常（含断言）会在主线程复现；只凭"线程已
+   结束"不构成通过。工具自测对此有专门反例。
+4. **镜像只针对上面列明的文件**。哈希口径为**行尾归一化（CRLF→LF）后的文本**，
+   避免 autocrlf 检出造成假差异；来源提交是否真的包含这些内容由
+   `sync_mirror.py --verify-source-commit` 逐文件比对 git blob 来回答——**做不到时
+   只能描述为"工作区镜像一致"**。同步前先干运行列出文件差异，禁止盲删目录，也禁止
+   整文件复制 `live_controller.py`。
+5. **每个修复都要回答"影响另一端吗"**。台账状态取 `verified` / `failed` /
+   `pending` / `deferred` / `not_applicable`；`deferred` 表示**明确延期**，
+   不等于风险已获批；若要写风险已接受，必须写明用户接受的范围。
+6. **已登记的失败不得消失**：`check_alignment.py` 会汇总台账的
+   `discovered_pre_existing`（既有失败）与 `contracts` 里的 failed/pending，
+   两类都进"需要关注"与退出状态。
+7. **覆盖范围要写清**：`contracts.json` 每个契约都带 `coverage`
+   （共享场景覆盖什么、端内有哪几条补充用例 ID、明确未覆盖什么）；
+   组级标题不得代替实际覆盖范围。
+8. 本目录**不是 CI、也不是行为正确性证明**。HEAD 一致不等于测试通过；
+   `check_alignment.py` 只做台账新鲜度、镜像哈希与状态汇总。
 
-## 本轮（2026-09-14）落地范围
+## 当前落地范围（契约版本 2026-09-14.2）
 
-- 已落地场景组：`CTRL-01`（5 个场景，含"旧重连等待→停止→新意图→旧响应返回"的
-  Event 精确交错）、`CTRL-02`、`PUSH-01`、`MODE-01`、`INTENT-01`。
-- 未纳入共同场景、只在各自仓库测试里覆盖：`FFMPEG-01`、`LOG-01`。
-- 登记为共同后续风险（不改阈值/不加全量探测）：`RETRY-01`、`MEDIA-01`。
-- 登记为待对齐：`CTRL-03`；`DATA-01` 桌面已验证、服务器 `not_applicable`。
+- 已落地共享场景 **18 个**：`CTRL-01a..h`（含"旧重连等待→停止→新意图→旧响应
+  返回"的交错，以及直接调用真实 `_start_ffmpeg_stream` 的三个等待边界场景）、
+  `CTRL-02a..d`、`PUSH-01a/b`、`MODE-01a/b`、`INTENT-01a/b`。
+- 未纳入共同场景、只在各仓测试覆盖：`FFMPEG-01`、`LOG-01`。
+- **延期（deferred）**：`RETRY-01`（>30 秒异常退出的 5 秒退避）、`MEDIA-01`
+  （concat 抽检范围）——两端共有，本轮不改数值/不加入全量探测，附有界方案。
+- 待对齐：`CTRL-03`；`DATA-01` 桌面已验证、服务器 `not_applicable`。
 
-各项的状态、证据路径与覆盖边界见 `contracts.json`。
+各项的状态、证据路径、覆盖范围与未覆盖项见 `contracts.json`。

@@ -71,6 +71,9 @@ class _FakePlatform:
         self.calls = []
         self.stop_calls = []
         self._real = real_api
+        # 平台侧"房间是否在播"：与服务器端测试底座一致地随 start/stop 变化，
+        # 否则开播前的残留清理会误认"房间仍在播"而多发一次下播。
+        self.live_on = False
 
     def retry_network_until_cancelled(self, cancel):
         if self._real is not None:
@@ -87,17 +90,20 @@ class _FakePlatform:
 
     def start_live(self, room_id, area_id, csrf):
         self.calls.append(('start_live', room_id, area_id))
+        self.live_on = True
         return True, {'code': 0, 'data': {'rtmp': {
             'addr': 'rtmp://127.0.0.1:1935/live-bvc', 'code': '?k=1'}}}
 
     def stop_live(self, room_id, csrf):
         self.stop_calls.append((room_id, csrf))
         self.calls.append(('stop_live', room_id))
+        self.live_on = False
         return True, {'code': 0}
 
     def get_live_status(self, room_id):
         self.calls.append(('get_live_status', room_id))
-        return True, {'code': 0, 'data': {'live_status': 1}}
+        return True, {'code': 0, 'data': {
+            'live_status': 1 if self.live_on else 0}}
 
     def get_push_url(self, room_id):
         self.calls.append(('get_push_url', room_id))
@@ -207,6 +213,21 @@ class DesktopAdapter:
 
     def stub_cached_push_url(self, c, url):
         c._get_cached_push_url = lambda: url
+
+    def set_push_url(self, c, fn):
+        """替换平台侧"获取推流地址"这一网络边界（用于在等待期间插入停止）。"""
+        c.api.get_push_url = fn
+
+    def set_old_loop(self, c, loop):
+        """换入受控旧循环替身（不创建真实线程）。"""
+        c._ffmpeg_loop_thread = loop
+
+    def pusher_loop(self, c):
+        return c._ffmpeg_loop_thread
+
+    def stop_signal_set(self, c):
+        """内部的"停止推流循环"信号是否置位（停止后不得被旧请求清除）。"""
+        return bool(c._ffmpeg_stop_event.is_set())
 
     def set_start_live(self, c, fn):
         c.api.start_live = fn
@@ -328,5 +349,6 @@ class DesktopAdapter:
     def unrecycled(self, c):
         return bool(c._ffmpeg_unrecycled)
 
-    def start_pusher(self, c):
-        return bool(c._start_ffmpeg_stream())
+    def start_pusher(self, c, epoch=None):
+        # 桌面 1.1.0 起 _start_ffmpeg_stream 也接收显式代际（入口捕获后不再重取）
+        return bool(c._start_ffmpeg_stream(epoch))

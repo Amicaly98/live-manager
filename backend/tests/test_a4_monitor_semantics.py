@@ -101,13 +101,22 @@ def test_retry_restores_ffmpeg_for_manual_partition(controller, fake_api, monkey
 
     monkeypatch.setattr(controller, '_get_stream_settings', lambda: ('ffmpeg', True))
     started = []
-    monkeypatch.setattr(controller, '_start_ffmpeg_stream', lambda: started.append(1) or True)
+    # CTRL-01：重连把入口捕获的代际传给推流启动（等待边界后不再重取当前代）
+    epochs_passed = []
+    def _fake_start(epoch=None):
+        epochs_passed.append(epoch)
+        started.append(1)
+        return True
+    monkeypatch.setattr(controller, '_start_ffmpeg_stream', _fake_start)
     monkeypatch.setattr(controller.area_loader, 'get_area_id', lambda z, auto_update=False: 101)
     fake_api.start_live_result = (True, {"code": 0, "data": {"rtmp": {"addr": "rtmp://a", "code": "?k=1"}}})
+    epoch_at_entry = controller._control_epoch
 
     controller._retry_start_live()
 
     assert started == [1], "手动分区的 FFmpeg 推流必须恢复（旧版被 _stream_mode != 'manual' 挡住）"
+    assert epochs_passed == [epoch_at_entry], (
+        "推流启动必须收到重连入口捕获的代际（不得在迟到后重取当前代）")
 
 
 def test_retry_does_not_touch_obs_stream(controller, fake_api, monkeypatch):
@@ -118,7 +127,8 @@ def test_retry_does_not_touch_obs_stream(controller, fake_api, monkeypatch):
 
     monkeypatch.setattr(controller, '_get_stream_settings', lambda: ('manual', True))
     started = []
-    monkeypatch.setattr(controller, '_start_ffmpeg_stream', lambda: started.append(1) or True)
+    monkeypatch.setattr(controller, '_start_ffmpeg_stream',
+                        lambda epoch=None, *a, **kw: started.append(1) or True)
     monkeypatch.setattr(controller.area_loader, 'get_area_id', lambda z, auto_update=False: 102)
     fake_api.start_live_result = (True, {"code": 0, "data": {}})
 

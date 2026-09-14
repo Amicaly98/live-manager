@@ -940,6 +940,10 @@ class LiveController:
         self._is_starting = False
         self._recovery_blocked = ''
         self._control_epoch = 0
+        # 上一次停止的清理是否已经跑完（且此后没有新的开播意图被受理）。
+        # 用于让"清理已完成、无新会话"的重复停止只确认既有结果，而不是再走一次
+        # 平台下播与进程回收（重复回收会在新会话刚建立时把它误清理掉）。
+        self._stop_cleanup_done = False
         # D1：每次被接受的开播意图分配唯一 id；停止在登记时快照目标意图，
         # 执行器队列中迟到的停止不再停掉"之后新接受"的开播意图。
         self._start_intent_id = 0
@@ -1246,6 +1250,9 @@ class LiveController:
             self._start_cancel = cancel
             self._is_starting = True
             self._start_intent_id += 1  # D1：新接受的开播意图（停止执行时核对）
+            # 新意图接管后，上一次停止的"清理已完成"不再适用于本会话：
+            # 之后到来的停止必须真正执行一次回收与下播。
+            self._stop_cleanup_done = False
             self._recovery_blocked = ''
             self._pending_face_verify = False
             self.current_instruction = instruction
@@ -1397,19 +1404,6 @@ class LiveController:
             saved_label = f'（恢复，已播{saved_elapsed // 60}分钟）' if saved_elapsed > 0 else ''
             self._push_backend_event('开播', 'success', f'{mode_label}开播{saved_label} - {instruction.zone_name}，时长{dur_label}')
 
-            # 启动视频/FFmpeg（在 start_live 之后，因为 FFmpeg 需要推流码）。
-            # D1：仍在同一锁内复核后启动，杜绝"提交与推流启动之间"的停止窗口
-            # 造成复活；_start_ffmpeg_stream 只做本地进程管理，不取 _start_lock。
-            stream_mode, auto_open = self._get_stream_settings()
-            local_push_started = True
-            if stream_mode == 'ffmpeg':
-                local_push_started = self._start_ffmpeg_stream()
-                if not local_push_started:
-                    logger.error(" FFmpeg 推流启动失败")
-            elif auto_open and video_path:
-                if not self.play_video(video_path):
-                    logger.warning(" 视频播放失败，但直播已开始")
-
             # 启动监控线程
             self.monitor_thread = threading.Thread(
                 target=self._monitor_streaming,
@@ -1417,6 +1411,21 @@ class LiveController:
                 daemon=True
             )
             self.monitor_thread.start()
+
+        # 启动视频/FFmpeg（在 start_live 之后，因为 FFmpeg 需要推流码）。
+        # CTRL-01：这里**不持 _start_lock**——推流启动内部有 join 与可能的
+        # 网络获取推流地址（持锁做等待会拖住停止入口）。安全性由
+        # _start_ffmpeg_stream 在每个等待边界复核本代代际保证：若停止在上方
+        # 提交之后到达，代际已推进，本次启动随即作废且不会创建循环。
+        stream_mode, auto_open = self._get_stream_settings()
+        local_push_started = True
+        if stream_mode == 'ffmpeg':
+            local_push_started = self._start_ffmpeg_stream(epoch)
+            if not local_push_started:
+                logger.error(" FFmpeg 推流启动失败")
+        elif auto_open and video_path:
+            if not self.play_video(video_path):
+                logger.warning(" 视频播放失败，但直播已开始")
 
         if not local_push_started:
             return False
@@ -1525,34 +1534,60 @@ class LiveController:
             else:
                 return f"{addr}/{code}"      # rtmp://host/app/key
 
-    def _start_ffmpeg_stream(self) -> bool:
+    def _start_ffmpeg_stream(self, epoch: int = None) -> bool:
         """启动 FFmpeg 推流循环线程（使用缓存的推流码，播放完一个视频自动换下一个）
 
-        CTRL-01：停止/代际复核必须位于**任何进程或线程副作用之前**。旧实现
-        先 `_kill_ffmpeg` 再检查停止，会让停止之后迟到的旧请求（重连/恢复）
-        把新代的推流进程当成"残留"清理掉。本函数不接收 epoch 参数（由调用方
-        `_retry_start_live` 负责代际复核），这里以"未在播/停止已置位/恢复被
-        阻断"作为最后一道闸门。
+        epoch：本次启动归属的控制代际。调用方（首次开播 / 自动重连）在进入
+        可能长时间等待的操作**之前**捕获代际并传入；None 表示在入口处取当前
+        代际，取到之后**不再重取**——迟到的请求不能借"当前代际"把自己变成
+        新代的所有者。
+
+        CTRL-01：本函数内部有多处等待（等待旧循环 join、网络获取推流地址、
+        准备返回），**每个等待之后都必须复核同一代际与停止状态**，而不是只
+        看可被下一次开播清除的 stop_monitor：
+
+        - 等待期间受理停止（或新意图接管）→ 保留旧循环引用与停止信号，
+          既不清理进程也不启动新循环；
+        - 旧循环仍未退出 → 保留其引用，交由正常恢复处理，绝不覆盖引用另建；
+        - 只有仍持有本代所有权时，才允许清除停止信号、登记新代并创建循环。
         """
+        if epoch is None:
+            epoch = self._control_epoch
+
+        def _stale() -> bool:
+            """本请求是否已失去所有权；代际是主判据（停止信号会被新代清除）。"""
+            return (not self._is_epoch_current(epoch)
+                    or self.stop_monitor.is_set()
+                    or bool(self._recovery_blocked))
+
         # A5：上一路推流进程未确认回收时，禁止再创建新的同房间推流
         if self._ffmpeg_unrecycled:
             logger.error(" 上一路推流进程未确认回收，禁止重复创建 FFmpeg 推流")
             self._push_backend_event('推流', 'danger', '上一路推流进程未回收，已阻止重复开播（请重启应用或手动处理后重试）')
             return False
-        if not self.is_streaming or self.stop_monitor.is_set() or self._recovery_blocked:
-            logger.info("停止/未在播/恢复被阻断：不启动 FFmpeg 推流")
+        if _stale():
+            logger.info("停止或控制代际已推进：不启动 FFmpeg 推流")
             return False
         # 先停止旧循环（防止双线程同时运行，导致 poll() 竞态和文件冲突）
         if self._ffmpeg_loop_thread and self._ffmpeg_loop_thread.is_alive():
             logger.info(" 等待旧的 FFmpeg 循环线程退出...")
             self._ffmpeg_stop_event.set()
             self._ffmpeg_loop_thread.join(timeout=5.0)
-            self._ffmpeg_stop_event.clear()
+            if _stale():
+                logger.info(" 等待旧循环期间停止已生效：保留引用与停止信号，不清理、不启动")
+                return False
+            if self._ffmpeg_loop_thread.is_alive():
+                logger.warning(" 旧推流线程仍在退出：保留其引用与停止信号，交由正常恢复处理")
+                return False
+        if _stale():
+            return False
+        # 只有确认仍是本代所有者，才允许清除停止信号
+        self._ffmpeg_stop_event.clear()
         self._kill_ffmpeg()
         # 从缓存获取推流地址
         push_url = self._get_cached_push_url()
         if not push_url:
-            # 缓存没有则尝试 API 获取
+            # 缓存没有则尝试 API 获取（网络等待：返回后必须复核代际）
             success, data = self.api.get_push_url(self.current_room_id) if self.current_room_id else (False, {})
             if success and data.get('push_url'):
                 push_url = data['push_url']
@@ -1562,6 +1597,9 @@ class LiveController:
                 return False
         else:
             logger.info(f" 使用缓存推流地址：{push_url[:50]}...")
+        if _stale():
+            logger.info(" 推流地址准备期间停止已生效：不创建新的推流循环")
+            return False
 
         # 读取 ffmpeg 路径
         ffmpeg_exe = 'ffmpeg'
@@ -1574,6 +1612,11 @@ class LiveController:
             pass
 
         zone_name = self.current_instruction.zone_name if self.current_instruction else ''
+
+        # 最终副作用（登记新代 + 创建循环）前最后一次复核
+        if _stale() or not self.is_streaming:
+            logger.info(" 最终提交前停止已生效：不登记新代、不创建推流循环")
+            return False
 
         # A5：登记新一代推流代际（所有权起点）
         generation = self._new_pusher_generation()
@@ -2144,11 +2187,12 @@ class LiveController:
                 return
             self.reconnect_attempts = 0
             self._retry_cooldown_until = None
-            # 按实际推流方式恢复（A4：手动分区 + FFmpeg 同样需要恢复推流）
+            # 按实际推流方式恢复（A4：手动分区 + FFmpeg 同样需要恢复推流）。
+            # CTRL-01：把入口捕获的代际传下去，推流启动在每个等待边界复核它。
             stream_mode, _ = self._get_stream_settings()
             if stream_mode == 'ffmpeg':
                 logger.info(" 重启 FFmpeg 推流循环...")
-                self._start_ffmpeg_stream()
+                self._start_ffmpeg_stream(epoch)
         else:
             code = resp.get('code', -1)
             if code in (60024, 60043):
@@ -2351,9 +2395,16 @@ class LiveController:
                 pass
         # 3) 持久化停止意图（在动 state 之前记录原始分区名）
         self._persist_stop_intent()
-        # 4) 停进程与平台侧
+        # 4) 停进程与平台侧。
+        # 重复停止的判据必须明确：清理已经完成、且此后没有新的在播会话时，
+        # 重复请求只确认既有结果——不再重复回收进程/重复下播（否则新会话
+        # 刚建立时会被旧停止请求误清理）。新会话会重置该标记（见 start_streaming）。
         preserve = (self._stream_mode == 'task')
-        self._stop_live_process(preserve_state=preserve)
+        if self._stop_cleanup_done and not self.is_streaming:
+            logger.info("重复的停止请求：清理已完成且无新的在播会话，只确认结果")
+        else:
+            self._stop_live_process(preserve_state=preserve)
+            self._stop_cleanup_done = True
         self.current_instruction = None
         logger.info(" 直播已完全停止")
         return True
