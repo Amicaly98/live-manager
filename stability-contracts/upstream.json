@@ -1,20 +1,21 @@
 {
-  "schema_version": 1,
-  "contract_set_version": "2026-09-14.1",
+  "schema_version": 2,
+  "contract_set_version": "2026-09-14.2",
   "source_repository": "bilibili-live-server",
   "source_branch": "stability/local-validated-20260913",
-  "contract_commit": "6fc7d54f2eaa7575201f7dc48ee23058f8b4ab77",
+  "contract_commit": "e31d13dabbe811da5853c8f261c69cf41880459a",
   "mirror_targets": [
     "bilibili-live-manager"
   ],
+  "hash_mode": "text-lf-normalized",
   "mirrored_files": [
     {
       "path": "stability-contracts/README.md",
-      "sha256": "8c9b123582c0b07740fe1863ede1a8889689313bff5bd84f4e397ce2ccb7b559"
+      "sha256": "f043f47d8a664a828bf5ad87b03ae5e79f274d67141dae9642ed524bc66beecd"
     },
     {
       "path": "stability-contracts/contracts.json",
-      "sha256": "6247e769d17065ebbb461420054010bca92aad276d4355136d318a7573c8419a"
+      "sha256": "3eccba6d7b29e3a7a9e773a525ea1dee1b4e1f25ac9ca80b112bb8f6ef896f9a"
     },
     {
       "path": "stability-contracts/scenarios/__init__.py",
@@ -22,15 +23,19 @@
     },
     {
       "path": "stability-contracts/scenarios/contract_core.py",
-      "sha256": "d581a57479a8a600841ec563394ef3d85d29ae6fa597b89d52d40e626a8f42eb"
+      "sha256": "c2ce5ae7322ef76a2e642369be316c874430c1f50d66bed3e3bb70ceb756408b"
     },
     {
       "path": "stability-contracts/scenarios/run_contracts.py",
-      "sha256": "00667515236ef685db015672ab064c1357146395e95ba8850cadc996210ccbf5"
+      "sha256": "48b81360bed1fa5de2bac0904c06e049cbbc4e911756ece4739ab2bf974b1bba"
+    },
+    {
+      "path": "stability-contracts/scenarios/tool_selfcheck.py",
+      "sha256": "8d147f5aab8c6af34eacddc75ffe1266db0445edf92089bd309563643940070b"
     },
     {
       "path": "stability-contracts/scenarios/sync_mirror.py",
-      "sha256": "3b6244709b82e5153d2247ec9774352d17b83bd69bea62419b296538cf4a559d"
+      "sha256": "0d848697949432e813a8c9f0a5e3c1afaa8ea4adfd02b7341233c7ef224ef5d3"
     },
     {
       "path": "backend/tests/test_cross_repo_contracts.py",
@@ -41,6 +46,9 @@
     "stability-contracts/scenarios/adapter_server.py",
     "stability-contracts/scenarios/adapter_desktop.py"
   ],
-  "sync_rule": "只同步 mirrored_files；先 dry-run 列差异再复制；禁止盲删目录；两端按 sha256 逐文件校验；adapter_* 为端内自持，不参与镜像。",
-  "generated_at": "2026-09-14T20:29:33"
+  "manifest_files": [
+    "stability-contracts/upstream.json"
+  ],
+  "sync_rule": "只同步 mirrored_files；先 dry-run 列差异再复制；禁止盲删目录；两端按 sha256 逐文件校验（行尾归一化）；adapter_* 为端内自持，不参与镜像。",
+  "generated_at": "2026-09-14T22:14:42"
 }
