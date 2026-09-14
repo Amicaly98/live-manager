@@ -41,6 +41,13 @@
         "children": []
       },
       {
+        "id": "1085",
+        "name": "仙境传说3",
+        "parent_id": 2,
+        "parent_name": "网游",
+        "children": []
+      },
+      {
         "id": "240",
         "name": "APEX英雄",
         "parent_id": 2,
@@ -218,6 +225,13 @@
       {
         "id": "975",
         "name": "遗忘之海",
+        "parent_id": 2,
+        "parent_name": "网游",
+        "children": []
+      },
+      {
+        "id": "1088",
+        "name": "无限大",
         "parent_id": 2,
         "parent_name": "网游",
         "children": []
@@ -644,7 +658,7 @@
       },
       {
         "id": "1023",
-        "name": "ARC Raiders",
+        "name": "弧光猎人(ARC Raiders)",
         "parent_id": 2,
         "parent_name": "网游",
         "children": []
@@ -781,6 +795,20 @@
         "parent_id": 2,
         "parent_name": "网游",
         "children": []
+      },
+      {
+        "id": "1081",
+        "name": "激战：大牌英雄",
+        "parent_id": 2,
+        "parent_name": "网游",
+        "children": []
+      },
+      {
+        "id": "1086",
+        "name": "战争警戒",
+        "parent_id": 2,
+        "parent_name": "网游",
+        "children": []
       }
     ]
   },
@@ -798,8 +826,8 @@
         "children": []
       },
       {
-        "id": "1033",
-        "name": "王者荣耀世界",
+        "id": "292",
+        "name": "火影忍者手游",
         "parent_id": 3,
         "parent_name": "手游",
         "children": []
@@ -807,6 +835,13 @@
       {
         "id": "958",
         "name": "洛克王国：世界",
+        "parent_id": 3,
+        "parent_name": "手游",
+        "children": []
+      },
+      {
+        "id": "1084",
+        "name": "游戏之星",
         "parent_id": 3,
         "parent_name": "手游",
         "children": []
@@ -828,6 +863,13 @@
       {
         "id": "256",
         "name": "和平精英",
+        "parent_id": 3,
+        "parent_name": "手游",
+        "children": []
+      },
+      {
+        "id": "1087",
+        "name": "闪耀吧！噜咪",
         "parent_id": 3,
         "parent_name": "手游",
         "children": []
@@ -875,8 +917,8 @@
         "children": []
       },
       {
-        "id": "292",
-        "name": "火影忍者手游",
+        "id": "1033",
+        "name": "王者荣耀世界",
         "parent_id": 3,
         "parent_name": "手游",
         "children": []
@@ -954,6 +996,13 @@
       {
         "id": "1034",
         "name": "王者万象棋",
+        "parent_id": 3,
+        "parent_name": "手游",
+        "children": []
+      },
+      {
+        "id": "189",
+        "name": "明日之后",
         "parent_id": 3,
         "parent_name": "手游",
         "children": []
@@ -1064,6 +1113,13 @@
         "children": []
       },
       {
+        "id": "1074",
+        "name": "星际猎人",
+        "parent_id": 3,
+        "parent_name": "手游",
+        "children": []
+      },
+      {
         "id": "993",
         "name": "鹅鸭杀手游",
         "parent_id": 3,
@@ -1071,8 +1127,22 @@
         "children": []
       },
       {
+        "id": "1068",
+        "name": "时空猎人：觉醒",
+        "parent_id": 3,
+        "parent_name": "手游",
+        "children": []
+      },
+      {
         "id": "1051",
         "name": "粒粒的小人国",
+        "parent_id": 3,
+        "parent_name": "手游",
+        "children": []
+      },
+      {
+        "id": "1083",
+        "name": "诡秘之主",
         "parent_id": 3,
         "parent_name": "手游",
         "children": []
@@ -1129,6 +1199,13 @@
       {
         "id": "1003",
         "name": "虚环",
+        "parent_id": 3,
+        "parent_name": "手游",
+        "children": []
+      },
+      {
+        "id": "1072",
+        "name": "白银之城",
         "parent_id": 3,
         "parent_name": "手游",
         "children": []
@@ -1274,6 +1351,20 @@
         "children": []
       },
       {
+        "id": "1076",
+        "name": "漫画群星：大集结",
+        "parent_id": 3,
+        "parent_name": "手游",
+        "children": []
+      },
+      {
+        "id": "1082",
+        "name": "我要当老祖",
+        "parent_id": 3,
+        "parent_name": "手游",
+        "children": []
+      },
+      {
         "id": "972",
         "name": "潮汐守望者",
         "parent_id": 3,
@@ -1351,6 +1442,13 @@
         "children": []
       },
       {
+        "id": "1073",
+        "name": "王国大作战：前线",
+        "parent_id": 3,
+        "parent_name": "手游",
+        "children": []
+      },
+      {
         "id": "1039",
         "name": "吉星派对",
         "parent_id": 3,
@@ -1379,6 +1477,13 @@
         "children": []
       },
       {
+        "id": "141",
+        "name": "荒野行动",
+        "parent_id": 3,
+        "parent_name": "手游",
+        "children": []
+      },
+      {
         "id": "890",
         "name": "物华弥新",
         "parent_id": 3,
@@ -1402,6 +1507,20 @@
       {
         "id": "899",
         "name": "咏月风雅",
+        "parent_id": 3,
+        "parent_name": "手游",
+        "children": []
+      },
+      {
+        "id": "1063",
+        "name": "绿梦：时空之声",
+        "parent_id": 3,
+        "parent_name": "手游",
+        "children": []
+      },
+      {
+        "id": "1065",
+        "name": "植物大战僵尸2",
         "parent_id": 3,
         "parent_name": "手游",
         "children": []
@@ -1436,7 +1555,7 @@
       },
       {
         "id": "1047",
-        "name": "战争警戒",
+        "name": "战争警戒手游",
         "parent_id": 3,
         "parent_name": "手游",
         "children": []
@@ -1472,6 +1591,13 @@
       {
         "id": "1038",
         "name": "仙遇手游",
+        "parent_id": 3,
+        "parent_name": "手游",
+        "children": []
+      },
+      {
+        "id": "1066",
+        "name": "真・三国无双 天下",
         "parent_id": 3,
         "parent_name": "手游",
         "children": []
@@ -1514,6 +1640,13 @@
       {
         "id": "970",
         "name": "星痕共鸣",
+        "parent_id": 3,
+        "parent_name": "手游",
+        "children": []
+      },
+      {
+        "id": "1067",
+        "name": "光与夜之恋",
         "parent_id": 3,
         "parent_name": "手游",
         "children": []
@@ -1729,13 +1862,6 @@
         "children": []
       },
       {
-        "id": "189",
-        "name": "明日之后",
-        "parent_id": 3,
-        "parent_name": "手游",
-        "children": []
-      },
-      {
         "id": "761",
         "name": "重返未来：1999",
         "parent_id": 3,
@@ -1787,6 +1913,13 @@
       {
         "id": "258",
         "name": "BanG Dream",
+        "parent_id": 3,
+        "parent_name": "手游",
+        "children": []
+      },
+      {
+        "id": "1080",
+        "name": "交织的乐章",
         "parent_id": 3,
         "parent_name": "手游",
         "children": []
@@ -2028,6 +2161,13 @@
         "parent_id": 3,
         "parent_name": "手游",
         "children": []
+      },
+      {
+        "id": "1071",
+        "name": "造梦西游之黎尤浩劫篇",
+        "parent_id": 3,
+        "parent_name": "手游",
+        "children": []
       }
     ]
   },
@@ -2087,6 +2227,13 @@
         "children": []
       },
       {
+        "id": "1079",
+        "name": "轮回之兽",
+        "parent_id": 6,
+        "parent_name": "单机游戏",
+        "children": []
+      },
+      {
         "id": "721",
         "name": "生化危机",
         "parent_id": 6,
@@ -2103,6 +2250,13 @@
       {
         "id": "1057",
         "name": "Subnautica 2：异星水域",
+        "parent_id": 6,
+        "parent_name": "单机游戏",
+        "children": []
+      },
+      {
+        "id": "1061",
+        "name": "竞拍之王",
         "parent_id": 6,
         "parent_name": "单机游戏",
         "children": []
@@ -2129,6 +2283,20 @@
         "children": []
       },
       {
+        "id": "1070",
+        "name": "超级变色龙",
+        "parent_id": 6,
+        "parent_name": "单机游戏",
+        "children": []
+      },
+      {
+        "id": "224",
+        "name": "太吾绘卷",
+        "parent_id": 6,
+        "parent_name": "单机游戏",
+        "children": []
+      },
+      {
         "id": "977",
         "name": "逃离鸭科夫",
         "parent_id": 6,
@@ -2137,7 +2305,7 @@
       },
       {
         "id": "282",
-        "name": "使命召唤22",
+        "name": "使命召唤23",
         "parent_id": 6,
         "parent_name": "单机游戏",
         "children": []
@@ -2248,6 +2416,13 @@
         "children": []
       },
       {
+        "id": "1077",
+        "name": "雾影猎人",
+        "parent_id": 6,
+        "parent_name": "单机游戏",
+        "children": []
+      },
+      {
         "id": "962",
         "name": "暗黑破坏神3",
         "parent_id": 6,
@@ -2346,6 +2521,13 @@
         "children": []
       },
       {
+        "id": "1075",
+        "name": "风暴怕死队",
+        "parent_id": 6,
+        "parent_name": "单机游戏",
+        "children": []
+      },
+      {
         "id": "433",
         "name": "格斗游戏",
         "parent_id": 6,
@@ -2360,8 +2542,15 @@
         "children": []
       },
       {
+        "id": "1064",
+        "name": "符文世界：龙之荒野",
+        "parent_id": 6,
+        "parent_name": "单机游戏",
+        "children": []
+      },
+      {
         "id": "859",
-        "name": "碧蓝幻想GBR",
+        "name": "碧蓝幻想Relink",
         "parent_id": 6,
         "parent_name": "单机游戏",
         "children": []
@@ -2494,7 +2683,7 @@
       },
       {
         "id": "362",
-        "name": "NBA2K",
+        "name": "NBA2K27",
         "parent_id": 6,
         "parent_name": "单机游戏",
         "children": []
@@ -2614,13 +2803,6 @@
       {
         "id": "858",
         "name": "致命公司",
-        "parent_id": 6,
-        "parent_name": "单机游戏",
-        "children": []
-      },
-      {
-        "id": "936",
-        "name": "魔法工艺",
         "parent_id": 6,
         "parent_name": "单机游戏",
         "children": []
@@ -2884,6 +3066,13 @@
     "parent_name": "知识",
     "children": [
       {
+        "id": "1062",
+        "name": "AI应用·机器人",
+        "parent_id": 11,
+        "parent_name": "知识",
+        "children": []
+      },
+      {
         "id": "945",
         "name": "社会观察·财经",
         "parent_id": 11,
@@ -2995,6 +3184,21 @@
         "name": "搞笑整蛊",
         "parent_id": 15,
         "parent_name": "互动玩法",
+        "children": []
+      }
+    ]
+  },
+  {
+    "id": 16,
+    "name": "购物",
+    "parent_id": 0,
+    "parent_name": "购物",
+    "children": [
+      {
+        "id": "1078",
+        "name": "购物",
+        "parent_id": 16,
+        "parent_name": "购物",
         "children": []
       }
     ]
