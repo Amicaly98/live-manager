@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "contract_set_version": "2026-09-14.3",
+  "contract_set_version": "2026-09-15.1",
   "maintenance_location": "bilibili-live-server/stability-contracts",
   "note": "本文件放在服务器仓库只表示维护位置，不代表服务器实现是标准答案。桌面仓库保留同内容镜像，一致性由 upstream.json 的逐文件 SHA256 校验（行尾归一化；来源提交核验由 sync_mirror.py --verify-source-commit 完成，未核验时只能称“工作区镜像一致”）。",
   "products": {
@@ -256,7 +256,37 @@
         ]
       },
       "note": "服务器数据库同样启用 WAL：若将来新增在线备份流程，必须遵守同一一致性原则（backup API 或离线 checkpoint）。"
-    }
+    },
+  {
+    "id": "AREA-01",
+    "title": "分区数据属运行时数据：每实例缓存优先，刷新/种子/迁移一律不得覆盖已有分区数据",
+    "status": {
+      "server": "verified",
+      "desktop": "verified"
+    },
+    "scenarios": [],
+    "evidence": {
+      "server_tests": "backend/tests/test_area_cache_runtime.py（17 项：已有缓存离线加载、缺/坏缓存状态、刷新落盘+重启可读+搜索失效、空/坏响应保留旧数据、写失败无半截、受控并发无坏文件、双实例隔离、旧位置迁移幂等）",
+      "desktop_tests": "backend/tests/test_area_cache_runtime.py（20 项：同上 + 打包种子三种边界 + run.spec 显式输入规则与来源记录）",
+      "runtime_rules": "backend/app/core/area_data.py（两端同构：结构校验 → 同目录临时文件 → fsync → 读回校验 → os.replace 原子替换；IO 锁只覆盖本地读写，网络请求在锁外）"
+    },
+    "coverage": {
+      "agreed_behaviour": [
+        "运行时缓存位于各实例数据目录（server：--data-dir；desktop：userData/data 或 --data-dir），互不影响；仓库/发布目录不再保存分区表。",
+        "已有缓存永远优先：升级、回退、重装、打包种子、旧位置一次性导入都不得覆盖它。",
+        "刷新失败（请求失败/空数据/结构非法/磁盘写失败）返回明确失败并保留最后可用数据，不假成功；成功才切换内存数据并清搜索缓存。",
+        "缺缓存时面板与其余功能照常可用，可用性通过 GET /api/areas（及 /search）的 available/status 字段暴露；刷新网络往返放线程池，不占事件循环。",
+        "分区 ID/名称变化不触发任务名称/历史进度/结算公式的改写（本轮明确不做任务迁移，沿用既有失效分区处理）。"
+      ],
+      "not_covered": [
+        "磁盘写满/断电级故障只以“父路径不可写”近似，未做电源故障或磁盘配额演练。",
+        "同目录多进程并发刷新未压测（本轮为同进程多线程；跨进程依赖原子替换语义）。",
+        "手机/桌面 UI 对 available=False 的专门横幅提示未实现（接口已暴露，刷新失败有 toast）。"
+      ]
+    },
+    "negative_control": "把两端 AreaLoader 临时还原为旧行为（不校验结构、直接覆盖写、无原子替换、损坏缓存按 warning 吞掉）后重跑同一测试文件：server 17 项中 8 失败 + 1 错误；desktop 20 项中 9 失败（含“坏响应保留旧数据”全组与“写失败报告”）。恢复新实现后全部转绿。日志：deliveries/area-git-exit-20260915/logs/{server,desktop}-area-negative-control.log",
+    "note": "分区列表是频繁变化的外部业务数据：两端对齐的是上述行为约定，不再是分区内容本身，因此不再对各仓分区表文件做逐字节镜像校验。真实分区表已从两仓 Git 跟踪移除（取消跟踪提交见台账）。"
+  }
   ],
   "tooling": {
     "runner": "stability-contracts/scenarios/run_contracts.py",

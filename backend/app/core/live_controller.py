@@ -420,30 +420,37 @@ class BilibiliApi:
 
 # ==================== AreaLoader（分区加载器） ====================
 class AreaLoader:
-    """直播分区动态加载器"""
+    """直播分区动态加载器
+
+    缓存位置：数据目录内 bili_areas_full.json；打包种子只在缓存缺失时复制一次。
+    没有缓存时分区功能暂不可用（areas 为空 + status 说明），面板照常启动。
+    """
 
     def __init__(self, area_file: str = None):
         self.area_file = Path(area_file) if area_file else area_file_path()
         self.areas: List[dict] = []
         self._search_cache: dict = {}
+        # loaded / cache_missing / cache_corrupt / cache_invalid / empty_response /
+        # invalid_payload / persist_failed / request_failed
+        self.status: str = "unloaded"
+        self.last_error: str = ""
         self._load_areas()
 
     def _load_areas(self):
-        if self.area_file.exists():
-            try:
-                with open(self.area_file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                self.areas = data if isinstance(data, list) else []
-                if self.areas:
-                    logger.info(f" 加载分区数据：{len(self.areas)} 项")
-                else:
-                    logger.warning(f" 分区文件为空，将尝试在线获取")
-            except Exception as e:
-                logger.warning(f" 加载分区文件失败：{e}")
-                self.areas = []
+        from app.core.area_data import read_cache
+        areas, reason = read_cache(self.area_file)
+        self.areas = areas if isinstance(areas, list) else []
+        self.status = reason
+        if self.areas:
+            self.last_error = ""
+            logger.info(f" 加载分区数据：{len(self.areas)} 项（{self.area_file}）")
         else:
-            logger.info(" 分区文件不存在，将在启动时从 API 获取")
-            self.areas = []
+            self.last_error = reason
+            logger.info(f" 分区数据暂不可用（{reason}）：{self.area_file}")
+
+    @property
+    def available(self) -> bool:
+        return bool(self.areas)
 
     def fuzzy_search(self, keyword: str) -> List[dict]:
         """模糊搜索分区 — 子分区优先，支持拼音首字母检索"""
@@ -500,34 +507,63 @@ class AreaLoader:
         return None
 
     def fetch_and_save_areas(self, api: BilibiliApi) -> bool:
-        """从 B 站 API 获取最新分区并保存"""
+        """从 B 站 API 获取最新分区并写入本实例缓存。
+
+        顺序：网络请求（不持 IO 锁）→ 结构校验 → 原子落盘 → 落盘成功后才切换
+        内存数据并清搜索缓存。失败保留当前可用数据并返回 False。
+        """
+        from app.core.area_data import validate_areas, write_cache
+
         success, resp = api.get_areas()
-        if success and resp.get('code') == 0:
-            data = resp.get('data', [])
-            if data:
-                def flatten(areas, parent_id=0, parent_name=''):
-                    result = []
-                    for area in areas:
-                        item = {
-                            "id": area.get("id"),
-                            "name": area.get("name"),
-                            "parent_id": parent_id,
-                            "parent_name": parent_name if parent_name else area.get("name", ""),
-                            "children": []
-                        }
-                        children = area.get("list", [])
-                        if children:
-                            item["children"] = flatten(children, area.get("id"), area.get("name"))
-                        result.append(item)
-                    return result
-                self.areas = flatten(data)
-                self._search_cache.clear()  # 清空旧缓存
-                with open(self.area_file, 'w', encoding='utf-8') as f:
-                    json.dump(self.areas, f, ensure_ascii=False, indent=2)
-                logger.info(f" 成功获取并保存 {len(self.areas)} 个分区")
-                return True
-        logger.error(" 获取分区列表失败")
-        return False
+        if not success or resp.get('code') != 0:
+            self.status = "request_failed"
+            self.last_error = str(resp.get('msg', '')) if isinstance(resp, dict) else ""
+            logger.error(" 获取分区列表失败")
+            return False
+        data = resp.get('data', [])
+        if not data:
+            self.status = "empty_response"
+            self.last_error = "empty_response"
+            logger.error(" 获取的分区列表为空，保留当前缓存")
+            return False
+
+        def flatten(areas, parent_id=0, parent_name=''):
+            result = []
+            for area in areas:
+                item = {
+                    "id": area.get("id"),
+                    "name": area.get("name"),
+                    "parent_id": parent_id,
+                    "parent_name": parent_name if parent_name else area.get("name", ""),
+                    "children": []
+                }
+                children = area.get("list", [])
+                if children:
+                    item["children"] = flatten(children, area.get("id"), area.get("name"))
+                result.append(item)
+            return result
+
+        flat = flatten(data)
+        ok, reason = validate_areas(flat)
+        if not ok:
+            self.status = "invalid_payload"
+            self.last_error = reason
+            logger.error(f" 获取的分区结构不合法（{reason}），保留当前缓存")
+            return False
+
+        written, err = write_cache(self.area_file, flat)
+        if not written:
+            self.status = "persist_failed"
+            self.last_error = err
+            logger.error(f" 分区缓存写入失败（{err}），内存数据保持不变")
+            return False
+
+        self.areas = flat
+        self._search_cache.clear()  # 清空旧缓存
+        self.status = "loaded"
+        self.last_error = ""
+        logger.info(f" 成功获取并保存 {len(self.areas)} 个分区 → {self.area_file}")
+        return True
 
 
 # ==================== 拼音首字母工具 ====================
@@ -982,9 +1018,16 @@ class LiveController:
     # ---------------- 后台引导（A1：构造器不再同步刷网络） ----------------
 
     def _bootstrap(self):
+        # 分区是运行时数据（不再随代码分发）：先做一次"有上限"的补齐尝试，
+        # 失败也不影响登录/恢复；之后还能从面板「刷新分区」人工补齐。
+        # 刻意放在 retry_network_until_cancelled 之外——那个上下文会一直重试到
+        # 网络恢复，离线时会把登录永久挡在后面。
+        try:
+            self._ensure_areas_loaded()
+        except Exception:
+            logger.exception("启动时的分区加载失败（不影响其它功能）")
         try:
             with self.api.retry_network_until_cancelled(self._startup_cancel):
-                self._ensure_areas_loaded()
                 if self.api.is_logged_in() and not self._startup_cancel.is_set():
                     self.login()
         except Exception as e:

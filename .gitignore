@@ -45,6 +45,13 @@ live_tasks.xlsx
 rtmp_cache.json
 task_manager_last_run.json
 
+# ==== 动态分区数据（B 站分区表，频繁变化；不是代码契约）====
+# 运行时缓存 = 数据目录 bili_areas_full.json（已被 data/ 覆盖）
+# 根目录同名文件只是"打包种子输入/本地旧副本"，取消跟踪、不再随代码变化
+/bili_areas_full.json
+# 构建种子输入目录（打包时由环境变量指向仓库外的文件）
+backend/build-inputs/
+
 # FFmpeg 临时文件
 _ffmpeg_concat_*.txt
 _temp_*
@@ -65,6 +72,9 @@ release-1.1.0-rc2/
 backend/build-r3/
 backend/dist-r3/
 release-1.1.0-rc3/
+backend/build-r4/
+backend/dist-r4/
+release-1.1.0-rc4/
 
 # 契约/测试运行时数据（本项目数据目录）
 data/

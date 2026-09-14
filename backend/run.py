@@ -80,16 +80,17 @@ def main():
                 except Exception as e:
                     print(f"[data-migration] 迁移检查失败（忽略）：{e}")
         # E5：打包种子分区表（PyInstaller _MEIPASS 内）→ 数据目录首启复制，
-        # 不覆盖已有分区数据
+        # 不覆盖已有分区数据；种子缺失只是没有初始分区，面板仍可启动
         try:
+            from app.core.area_data import copy_seed_if_missing
             meipass = getattr(sys, "_MEIPASS", None)
+            target = area_file_path()
             if meipass:
                 seed = Path(meipass) / "bili_areas_full.json"
-                target = area_file_path()
-                if seed.exists() and not target.exists():
-                    import shutil
-                    shutil.copy2(seed, target)
-                    print(f"[seed] 分区表已初始化：{target}")
+                action = copy_seed_if_missing(target, seed)
+                print(f"[seed] 分区种子：{action}（目标 {target}）")
+            elif target.exists():
+                print(f"[seed] 数据目录已有分区缓存，未使用任何种子：{target}")
         except Exception as e:
             print(f"[seed] 分区表初始化失败（运行时会尝试在线获取）：{e}")
     except Exception as e:
