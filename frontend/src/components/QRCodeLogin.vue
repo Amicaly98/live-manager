@@ -48,7 +48,7 @@
  *   expired        二维码过期
  *   error          获取/轮询异常，payload: string
  */
-import { ref, computed, watch, onMounted } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import QRCode from 'qrcode'
 import { useAuthStore } from '@/stores/auth'
 import { usePolling } from '@/composables/usePolling'

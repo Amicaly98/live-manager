@@ -380,7 +380,7 @@ const isCheckingVerify = ref(false)
 let pendingStartZone: string | undefined = undefined
 let pendingStartDuration: number | undefined = undefined
 let pendingRetryResume = false  // true=重试恢复，false=重试开播
-let _closeGuard = false        // 防止退出弹窗重复
+// 托盘退出弹窗防重复守卫已随 onTrayQuit 注册一起移至 App.vue
 const lastManualZone = ref(sessionStorage.getItem('lastManualZone') || '')
 const lastManualDuration = ref(Number(sessionStorage.getItem('lastManualDuration')) || 120)
 
@@ -467,40 +467,8 @@ onMounted(async () => {
     scrollEventsToBottom()
     setupEventListAutoScroll()
   }, 100)
-  // Electron 托盘退出确认
-  if (window.electronAPI) {
-    window.electronAPI.onTrayQuit(() => {
-      if (_closeGuard) return
-      _closeGuard = true
-      if (liveStore.status.is_streaming) {
-        ElMessageBox.confirm(
-          '正在直播中，关闭应用将同时停止直播。\n\n是否停止直播并退出？',
-          '确认退出',
-          {
-            confirmButtonText: '停止并退出',
-            cancelButtonText: '不停止并退出',
-            distinguishCancelAndClose: true,
-            type: 'warning',
-          },
-        ).then(() => {
-          window.electronAPI?.confirmQuit(true)
-        }).catch((action: string) => {
-          _closeGuard = false
-          if (action === 'cancel') {
-            window.electronAPI?.forceQuit()
-          }
-        })
-      } else {
-        ElMessageBox.confirm(
-          '确定要退出应用吗？',
-          '确认退出',
-          { confirmButtonText: '退出', cancelButtonText: '取消', type: 'info' },
-        ).then(() => {
-          window.electronAPI?.confirmQuit(false)
-        }).catch(() => { _closeGuard = false })
-      }
-    })
-  }
+  // Electron 托盘退出确认已移至 App.vue（A7：应用级 IPC 不由本页面独占，
+  // 切换到任务页/设置页后退出功能同样可用）
 })
 
 onUnmounted(() => {

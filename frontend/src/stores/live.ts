@@ -22,6 +22,9 @@ export const useLiveStore = defineStore('live', () => {
   const isStarting = ref(false)
   const isStopping = ref(false)
 
+  // A3/A7：在途开播的取消通道——用户停止时立即打断挂起中的开播请求
+  let startAbortController: AbortController | null = null
+
   // 本地计时器状态（跨页面持久）
   const localElapsed = ref(0)
   const fixedTotal = ref(0)
@@ -82,11 +85,13 @@ export const useLiveStore = defineStore('live', () => {
   // 开始直播（zoneName 非空=手动模式，空=任务模式）
   async function startLive(zoneName?: string, durationSeconds?: number) {
     isStarting.value = true
+    startAbortController = new AbortController()
+    const signal = startAbortController.signal
     try {
       const body: StartLiveRequest = zoneName
         ? { zone_name: zoneName, duration_seconds: durationSeconds }
         : {}
-      const res = await request.post<StartLiveResponse>('/api/live/start', body)
+      const res = await request.post<StartLiveResponse>('/api/live/start', body, { signal })
       console.log('[startLive] API response:', { success: res.success, need_face_verification: res.need_face_verification, qr_data: res.qr_data, msg: res.message })
       if (res.success) {
         await fetchStatus()
@@ -99,17 +104,25 @@ export const useLiveStore = defineStore('live', () => {
         qrData: res.qr_data || '',
       }
     } catch (error: unknown) {
+      if ((error as { code?: string })?.code === 'ERR_CANCELED') {
+        return { success: false, message: '已取消开播', needFaceVerify: false, qrData: '' }
+      }
       const msg = error instanceof Error ? error.message : '开播失败'
       return { success: false, message: msg, needFaceVerify: false, qrData: '' }
     } finally {
       isStarting.value = false
+      if (startAbortController?.signal === signal) startAbortController = null
     }
   }
 
-  // 停止直播
+  // 停止直播（A7：先取消在途开播——停止优先于挂起中的启动）
   async function stopLive() {
     isStopping.value = true
     try {
+      if (startAbortController) {
+        startAbortController.abort()
+        startAbortController = null
+      }
       const res = await request.post<StopLiveResponse>('/api/live/stop')
       if (res.success) {
         status.value.is_streaming = false
