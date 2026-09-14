@@ -62,6 +62,9 @@ frontend/.test-build/
 backend/build-r2/
 backend/dist-r2/
 release-1.1.0-rc2/
+backend/build-r3/
+backend/dist-r3/
+release-1.1.0-rc3/
 
 # 契约/测试运行时数据（本项目数据目录）
 data/
