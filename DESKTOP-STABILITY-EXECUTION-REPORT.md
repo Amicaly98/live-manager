@@ -94,5 +94,5 @@ Electron 三反例：spawn 期间停止→迟到子进程回收且 started=false
 
 ## 提交与回滚
 
-- 分支 `stability-desktop-port-20260914`：`48e52f1 → … → b5dbbc0（第一轮候选）→ 0900698（本轮 D1-D6）→ 本报告提交`，未改写历史。
+- 分支 `stability-desktop-port-20260914`：`48e52f1 → … → b5dbbc0（第一轮候选）→ 0900698（本轮 D1-D6）→ c1b830f（报告+前端链测试+产物核对）→ 6a8927e（D1 补充：迟到重连回滚不误关新意图房间）`，未改写历史。
 - 旧候选 exe（release-1.1.0/）未删除；rc2 为独立目录。回滚即检出 `b5dbbc0`。
