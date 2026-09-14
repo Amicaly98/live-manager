@@ -1,0 +1,2 @@
+83914c28df0cccc64b5a09a8a82c4cbb351cf4d1495bdab3ab84a264efc08185 *直播控制系统 1.1.0.exe
+73b28ed0edbf6070f69f2ac1a11c785212dd39ccdf5683d0efc5d38cc9131ca0 *直播控制系统 Setup 1.1.0.exe

@@ -154,13 +154,17 @@ def run_one_cycle(cycle: int, port: int, data_dir: Path, backend_cmd: list) -> d
     return record
 
 
-def run_cycles(cycles: int, base_port: int, backend_cmd: list) -> dict:
+def run_cycles(cycles: int, base_port: int, backend_cmd: list,
+               data_root: Path = None) -> dict:
     results = {"backend_cmd": ' '.join(str(c) for c in backend_cmd),
                "cycles": [], "started_at": datetime.now().isoformat()}
     for i in range(cycles):
         port = base_port + i
-        data_dir = RESULTS_DIR / f"cycle-{results['started_at'].replace(':', '')[:17]}" / f"data-{i + 1}"
-        rec = run_one_cycle(i + 1, port, data_dir, backend_cmd)
+        data_dir = (data_root or RESULTS_DIR / f"cycle-{results['started_at'].replace(':', '')[:17]}") / f"data-{i + 1}"
+        # --port/--data-dir 按轮次追加（run.py 与打包 exe 都必须显式传入：
+        # 冻结版 BASE_DIR 指向临时解包目录，绝不回退默认）
+        cmd = list(backend_cmd) + ["--port", str(port), "--data-dir", str(data_dir)]
+        rec = run_one_cycle(i + 1, port, data_dir, cmd)
         results["cycles"].append(rec)
         print(f"cycle {rec['cycle']}: health={rec['health_ok']} "
               f"shutdown={rec.get('shutdown_http')} exit={rec.get('exit_code')} "
@@ -549,11 +553,12 @@ def main():
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
 
     if not args.skip_cycles:
+        data_root = RESULTS_DIR / f"cycle-{stamp}"
         if args.backend_exe:
-            cmd = [args.backend_exe, "--port", str(args.port)]
+            cmd = [args.backend_exe]
         else:
-            cmd = [PYTHON, str(BACKEND_DIR / "run.py"), "--port", str(args.port)]
-        cyc = run_cycles(args.cycles, args.port, cmd)
+            cmd = [PYTHON, str(BACKEND_DIR / "run.py")]
+        cyc = run_cycles(args.cycles, args.port, cmd, data_root)
         (RESULTS_DIR / f"lifecycle-{stamp}.json").write_text(
             json.dumps(cyc, indent=2, ensure_ascii=False), encoding='utf-8')
 

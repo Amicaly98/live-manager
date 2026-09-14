@@ -1,0 +1,54 @@
+{
+  "generated_at": "2026-09-14T11:39:33.778Z",
+  "releaseDir": "F:\\livestream\\bilibili-live-manager\\release-1.1.0-rc2",
+  "checks": [
+    {
+      "kind": "electron-js",
+      "file": "dist-electron/main.js",
+      "source": "electron/main.ts",
+      "match": true,
+      "built_at": "2026-09-14T11:38:04.930Z"
+    },
+    {
+      "kind": "electron-js",
+      "file": "dist-electron/preload.js",
+      "source": "electron/preload.ts",
+      "match": true,
+      "built_at": "2026-09-14T11:38:05.013Z"
+    },
+    {
+      "kind": "electron-js",
+      "file": "dist-electron/backendManager.js",
+      "source": "electron/backendManager.ts",
+      "match": true,
+      "built_at": "2026-09-14T11:38:04.842Z"
+    },
+    {
+      "kind": "bundled-backend-exe",
+      "file": "resources/backend/run.exe",
+      "sha256": "4c91b72c40f10a163a4e0ae8a45b1d695711ac831d96087086c96384ac6cc3e2",
+      "matchesDist": true
+    },
+    {
+      "kind": "bundled-run-py",
+      "file": "resources/backend/run.py",
+      "matchesHead": true,
+      "note": "包内未内置 Python 源码（E5：仅 run.exe，免装 Python）"
+    },
+    {
+      "kind": "asar",
+      "file": "resources/app.asar",
+      "bytes": 3358138
+    },
+    {
+      "kind": "installer",
+      "file": "直播控制系统 1.1.0.exe",
+      "sha256": "83914c28df0cccc64b5a09a8a82c4cbb351cf4d1495bdab3ab84a264efc08185"
+    },
+    {
+      "kind": "installer",
+      "file": "直播控制系统 Setup 1.1.0.exe",
+      "sha256": "73b28ed0edbf6070f69f2ac1a11c785212dd39ccdf5683d0efc5d38cc9131ca0"
+    }
+  ]
+}

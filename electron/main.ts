@@ -19,9 +19,10 @@ import { spawn, ChildProcess, execFile } from 'child_process';
 import * as path from 'path';
 import * as fs from 'fs';
 import {
-  BackendLifecycle, OwnedProcess, OwnedPidRecord,
+  BackendLifecycle, OwnedProcess,
   parseNetstatListeners, classifyPortConflict,
 } from './backendManager';
+import type { OwnedPidRecord } from './backendManager';
 
 // 开发/生产环境判断
 const isDev = process.env.NODE_ENV === 'development' || process.argv.includes('--dev');
