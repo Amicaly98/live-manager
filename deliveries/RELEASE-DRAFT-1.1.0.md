@@ -41,7 +41,8 @@
   **“全覆盖→二次确认→取消”** 四条路径复跑，**均未能复现**（每次都只有 1 次
   `mode=merge` 导入；“取消”路径发出 0 次导入请求且任务集合与进度一字节不变）。
   → 判为当时那次运行的自动化/环境侧偶发，**非产品缺陷**，本版沿用 rc5、未改代码。
-  详见 `../rc5-import-recheck-20260915/RECHECK-REPORT.md`。
+  详见 `F:/livestream/deliveries/rc5-import-recheck-20260915/RECHECK-REPORT.md`
+  （仓库外交付目录）。
 
 证据目录：
 `F:/livestream/deliveries/rc5-acceptance-20260915/`
