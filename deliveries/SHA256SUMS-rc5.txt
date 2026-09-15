@@ -1,0 +1,13 @@
+# 直播控制系统 1.1.0 —— 发布资产 SHA256（候选 rc5）
+# 源码: bilibili-live-manager main 077a22702c428ab186d66d840df11eb89fa00d41
+# 生成: 2026-09-15 21:33:31 +0800
+# 说明: 早期候选 rc2/rc3/rc4 及其 dist-r*/run.exe 均已失效，请勿分发
+
+f888228dac3715180d3915f1688c4a292cccd8c69473170dc0390b6f56e0945e *直播控制系统 Setup 1.1.0.exe
+651b7b02081de375598274be4ccb9f6c2a7eb37e52517e60fcb670959bef07b1 *直播控制系统 1.1.0.exe
+
+# 包内后端（与上面两个安装包内含的为同一文件）
+add557ebd4366bdf0dbdc7a74edebc0c0914546d4dfef11ce4f3c98b395cab54 *win-unpacked/resources/backend/run.exe
+
+# 包内后端内置分区种子（从归档提取，非独立文件）
+648ac56d76938bde5601e6c3e1b912affc7aed5862ac586de4229d79be94c768  <inside exe> bili_areas_full.json (72654 字节, 12 大区 / 444 叶子)
