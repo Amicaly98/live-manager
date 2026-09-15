@@ -75,6 +75,9 @@ release-1.1.0-rc3/
 backend/build-r4/
 backend/dist-r4/
 release-1.1.0-rc4/
+backend/build-r5/
+backend/dist-r5/
+release-1.1.0-rc5/
 
 # 契约/测试运行时数据（本项目数据目录）
 data/

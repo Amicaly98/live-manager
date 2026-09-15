@@ -148,6 +148,64 @@ def test_bad_responses_keep_last_good_data(workspace, payload):
     assert [a['name'] for a in loader.areas] == ['网游'], '内存数据保持最后可用值'
 
 
+def test_child_missing_id_rejected_and_keeps_last_good_data(workspace):
+    """大区合法但子分区缺 id：递归校验必须拒绝，旧缓存/内存原样保留。"""
+    cache = _write(workspace / AREA_CACHE_FILENAME, SEED_AREAS)
+    before = cache.read_bytes()
+    loader = AreaLoader(area_file=str(cache))
+    api = InjectableAreas([(True, {'code': 0, 'data': [
+        {'id': 1, 'name': '大区', 'list': [{'name': '缺id'}]}]})])
+    assert loader.fetch_and_save_areas(api) is False
+    assert loader.status == 'invalid_payload'
+    assert cache.read_bytes() == before, '子分区非法不得覆盖旧缓存'
+    assert [a['name'] for a in loader.areas] == ['网游'], '内存保持最后可用数据'
+
+
+def test_non_object_payload_returns_failure_not_exception(workspace):
+    """data 含非对象元素：返回明确失败，不得让 flatten 抛 AttributeError。"""
+    cache = _write(workspace / AREA_CACHE_FILENAME, SEED_AREAS)
+    before = cache.read_bytes()
+    loader = AreaLoader(area_file=str(cache))
+    api = InjectableAreas([(True, {'code': 0, 'data': ['invalid item']})])
+    assert loader.fetch_and_save_areas(api) is False  # 不抛异常即通过
+    assert loader.status == 'invalid_payload'
+    assert cache.read_bytes() == before
+
+
+def test_child_children_not_list_rejected(workspace):
+    cache = _write(workspace / AREA_CACHE_FILENAME, SEED_AREAS)
+    before = cache.read_bytes()
+    loader = AreaLoader(area_file=str(cache))
+    api = InjectableAreas([(True, {'code': 0, 'data': [
+        {'id': 1, 'name': '大区', 'list': {'a': 1}}]})])
+    assert loader.fetch_and_save_areas(api) is False
+    assert cache.read_bytes() == before
+
+
+def test_digit_string_ids_accepted_and_normalized_to_int(workspace):
+    """既有实际使用的整数字符串 id 必须放行，入库时规整为整数。"""
+    cache = workspace / AREA_CACHE_FILENAME
+    loader = AreaLoader(area_file=str(cache))
+    api = InjectableAreas([(True, {'code': 0, 'data': [
+        {'id': '6', 'name': '大区', 'list': [{'id': '601', 'name': '子区'}]}]})])
+    assert loader.fetch_and_save_areas(api) is True
+    stored = json.loads(cache.read_text(encoding='utf-8'))
+    assert stored[0]['id'] == 6
+    assert stored[0]['children'][0]['id'] == 601
+
+
+def test_invalid_cache_file_preserved_but_unavailable(workspace):
+    """缓存里子分区缺 name：读出为不可用（不 available），文件保留现场。"""
+    bad = [{'id': 1, 'name': '大区', 'children': [{'id': 11}]}]
+    cache = _write(workspace / AREA_CACHE_FILENAME, bad)
+    before = cache.read_bytes()
+    loader = AreaLoader(area_file=str(cache))
+    assert loader.areas == []
+    assert loader.available is False
+    assert loader.status.startswith('cache_invalid')
+    assert cache.read_bytes() == before, '无效缓存保留现场不删除'
+
+
 # ---------------- 5) 写入失败不半截；并发不产出坏文件 ----------------
 
 def test_write_failure_reports_and_leaves_nothing(workspace):
@@ -266,6 +324,41 @@ def test_spec_requires_explicit_seed_and_fails_loud(workspace, tmp_path):
     with pytest.raises(SystemExit):
         _spec_seed_resolver({'BILIBILI_AREA_SEED_FILE': str(_write(
             workspace / 'bad.json', {'not': 'a list'}))})
+
+
+def test_spec_maps_any_seed_name_to_fixed_package_name(workspace):
+    """任意合法文件名（含空格）的种子必须进入包内固定名 bili_areas_full.json。
+
+    用真实 PyInstaller 的 format_binaries_and_datas 解析 datas 映射，
+    模拟解包后贯通到真实 copy_seed_if_missing——只断言 _resolve_seed
+    非空是不够的。
+    """
+    from PyInstaller.building.utils import format_binaries_and_datas
+    import shutil
+
+    source = workspace / 'area snapshot 2026-09-15.json'  # 非默认名 + 空格
+    source.write_text(json.dumps(SEED_AREAS, ensure_ascii=False), encoding='utf-8')
+    before_bytes = source.read_bytes()
+
+    inputs = _spec_seed_resolver({'BILIBILI_AREA_SEED_FILE': str(source)})
+    assert inputs, '应产出 datas 输入'
+    entries = format_binaries_and_datas(inputs)
+    pkg_names = [dest for dest, _src in entries]
+    assert 'bili_areas_full.json' in pkg_names, \
+        f'包内必须出现固定名，实际 {pkg_names}'
+
+    # 模拟 _MEIPASS 解包 → 真实 copy_seed_if_missing
+    extracted = workspace / 'meipass'
+    for dest, src in entries:
+        target = extracted / dest
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, target)
+    cache = workspace / 'data' / AREA_CACHE_FILENAME
+    assert copy_seed_if_missing(cache, extracted / 'bili_areas_full.json') == 'seeded'
+    assert read_cache(cache)[0][0]['name'] == '网游'
+
+    # 用户源文件不改写（字节不变），溯源指向原始输入
+    assert source.read_bytes() == before_bytes
 
 
 def test_spec_records_provenance(workspace):

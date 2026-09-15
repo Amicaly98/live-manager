@@ -512,7 +512,8 @@ class AreaLoader:
         顺序：网络请求（不持 IO 锁）→ 结构校验 → 原子落盘 → 落盘成功后才切换
         内存数据并清搜索缓存。失败保留当前可用数据并返回 False。
         """
-        from app.core.area_data import validate_areas, write_cache
+        from app.core.area_data import (
+            validate_api_payload, validate_areas, write_cache)
 
         success, resp = api.get_areas()
         if not success or resp.get('code') != 0:
@@ -527,11 +528,15 @@ class AreaLoader:
             logger.error(" 获取的分区列表为空，保留当前缓存")
             return False
 
+        def _as_id(v):
+            """平台响应允许整数字符串 id；入库/内存统一规整为整数。"""
+            return int(v) if isinstance(v, str) else v
+
         def flatten(areas, parent_id=0, parent_name=''):
             result = []
             for area in areas:
                 item = {
-                    "id": area.get("id"),
+                    "id": _as_id(area.get("id")),
                     "name": area.get("name"),
                     "parent_id": parent_id,
                     "parent_name": parent_name if parent_name else area.get("name", ""),
@@ -539,11 +544,21 @@ class AreaLoader:
                 }
                 children = area.get("list", [])
                 if children:
-                    item["children"] = flatten(children, area.get("id"), area.get("name"))
+                    item["children"] = flatten(children, _as_id(area.get("id")), area.get("name"))
                 result.append(item)
             return result
 
+        # 先按平台原始形状（list 嵌套）递归校验每一级节点；非法（含子分区缺
+        # id/name、非对象元素）在这里就明确失败，不会让 flatten 抛异常。
+        ok, reason = validate_api_payload(data)
+        if not ok:
+            self.status = "invalid_payload"
+            self.last_error = reason
+            logger.error(f" 获取的分区结构不合法（{reason}），保留当前缓存")
+            return False
+
         flat = flatten(data)
+        # 展平后（children 形状）再过一次同一约定，作为双保险。
         ok, reason = validate_areas(flat)
         if not ok:
             self.status = "invalid_payload"

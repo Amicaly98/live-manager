@@ -36,26 +36,74 @@ def area_cache_path() -> Path:
     return Path(area_file_path())
 
 
-def validate_areas(data) -> Tuple[bool, str]:
-    """结构校验：非空 list，元素为含 id/name 的 dict；children 若是必须是 list。"""
-    if not isinstance(data, list):
-        return False, "分区数据不是列表"
-    if not data:
-        return False, "分区数据为空"
-    for item in data:
+def _is_valid_area_id(value) -> bool:
+    """分区 id：整数或整数字符串（既有实际使用形态），不接受 bool/浮点/其他。"""
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return True
+    if isinstance(value, str):
+        s = value.strip()
+        return s.isdigit() or (len(s) > 1 and s[0] == '-' and s[1:].isdigit())
+    return False
+
+
+# 嵌套深度上限：真实分区表只有两级；超过视为结构不合法（也防恶意深嵌套
+# 把校验/展平变成递归异常逃出去）。
+_MAX_AREA_DEPTH = 16
+
+
+def _validate_nodes(nodes, child_key: str, depth: int = 0) -> str:
+    """递归校验每级节点；child_key 为该形状下的子分区键。
+
+    缓存/种子/导入形状用 ``children``；平台原始响应用 ``list``。
+    返回空串表示合法，否则返回失败原因（调用方转为明确失败）。
+    """
+    if depth > _MAX_AREA_DEPTH:
+        return "分区嵌套超过最大深度"
+    if not isinstance(nodes, list):
+        return "分区数据不是列表"
+    if not nodes and depth == 0:
+        return "分区数据为空"
+    for item in nodes:
         if not isinstance(item, dict):
-            return False, "分区元素不是对象"
+            return "分区元素不是对象"
         name = item.get("name")
         if not isinstance(name, str) or not name.strip():
-            return False, "分区缺少 name"
-        try:
-            int(item.get("id"))
-        except (TypeError, ValueError):
-            return False, "分区 id 不是整数"
-        children = item.get("children")
-        if children is not None and not isinstance(children, list):
-            return False, "children 不是列表"
-    return True, ""
+            return "分区缺少 name"
+        if not _is_valid_area_id(item.get("id")):
+            return "分区 id 不是合法整数（允许整数字符串）"
+        children = item.get(child_key)
+        if children is None:
+            continue
+        if not isinstance(children, list):
+            return f"{child_key} 不是列表"
+        if children:
+            err = _validate_nodes(children, child_key, depth + 1)
+            if err:
+                return err
+    return ""
+
+
+def validate_areas(data) -> Tuple[bool, str]:
+    """结构校验（缓存/种子/导入形状：子分区在 ``children`` 里）。
+
+    **递归**校验每一级节点：元素必须是对象、name 为非空字符串、id 为整数
+    或整数字符串（既有实际使用形态）、children 若存在必须是列表且同样合法。
+    返回 (是否可用, 原因)；原因在可用时为空串。
+    """
+    err = _validate_nodes(data, "children")
+    return (not err, err)
+
+
+def validate_api_payload(data) -> Tuple[bool, str]:
+    """结构校验（平台原始响应形状：子分区在 ``list`` 里）。
+
+    与 validate_areas 同一约定、同一实现入口，只是子分区键不同；
+    在展平（flatten）**之前**调用，保证非法响应不会让转换过程抛异常。
+    """
+    err = _validate_nodes(data, "list")
+    return (not err, err)
 
 
 def read_cache(path: Path) -> Tuple[List[dict], str]:
