@@ -12,7 +12,7 @@ const source = fs.readFileSync(path.join(root, 'index.html'), 'utf8')
 const builtPath = path.join(root, 'dist', 'index.html')
 const html = fs.existsSync(builtPath) ? fs.readFileSync(builtPath, 'utf8') : source
 
-assert.match(source, /connect-src[^>]*http:\/\/127\.0\.0\.1:\*/) 
+assert.match(source, /connect-src[^>]*http:\/\/127\.0\.0\.1:\*/)
 assert.match(source, /script-src\s+'self'/)
 assert.match(source, /正在连接/)
 assert.match(source, /href="\.\/index\.html"/)
