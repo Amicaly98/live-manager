@@ -12,9 +12,20 @@ from datetime import datetime
 
 # ==================== 原有核心模型（适配 Pydantic） ====================
 class LiveInstruction(BaseModel):
-    """直播控制指令（与旧版兼容，用于内部逻辑）"""
+    """直播控制指令（与旧版兼容，用于内部逻辑）
+
+    task_id / run_id / execution_date 是**可选的执行身份**：
+    - task_id：开播时选定的那条任务记录的数据库主键。分区名可被删除重建，
+      id 才是稳定身份——结算与"运行中任务保护"都以它为准；
+    - run_id：本场直播的唯一标识，用于区分"同一场的不同阶段"与"另一场"；
+    - execution_date：开播时捕获的业务日，跨日之后到达的旧结算不会记到新的一天。
+    旧调用方不传这些字段时行为完全不变。
+    """
     zone_name: str
     duration_seconds: int = 7200
+    task_id: Optional[int] = None
+    run_id: Optional[str] = None
+    execution_date: Optional[str] = None
 
     class Config:
         # 允许使用原有 dataclass 属性
@@ -33,6 +44,7 @@ class Task(BaseModel):
     category: 0=已完成, >0=每日基准小时数（如2=每天2小时）
     priority: 由 a_val 计算的优先度（越小越优先），加载时从 DB 取
     """
+    id: Optional[int] = None                    # 数据库主键（稳定身份，可为空）
     priority: int = 9999                        # 计算优先度（来自 DB a_val）
     zone_name: str
     category: int = 1                           # 0=已完成, >0=时/天
@@ -51,6 +63,25 @@ class Task(BaseModel):
     def actual_days(self) -> int:
         """实际需要执行的天数 = total_days（不额外增加）"""
         return self.total_days
+
+    def remaining_exec_days(self) -> int:
+        """剩余待执行天数（权威派生口径，与 DB 计算列 I 同一含义）。
+
+        历史缺陷（2026-09-21 DS1）：旧 ``remaining_days`` 列默认 1 且静态重算
+        从不更新它，邮件/接口读到的是这个陈旧列，于是进度 2/10 的任务显示
+        "剩余 1 天"。这里统一为唯一权威口径：
+
+        - 已完成任务（category<=0）为 0；
+        - 其余为 ``actual_days() - days_done``；
+        - 进度异常超过计划（days_done > total）时按 0 展示——"已超过计划
+          天数"比负数天数可读；调度与统计的既有公式不受影响（不偷改）。
+
+        旧列仅作兼容保留（回退到旧版本时仍有合理数据），任何展示/导出
+        路径都不得再直接读它。
+        """
+        if self.category <= 0:
+            return 0
+        return max(0, self.actual_days() - self.days_done)
 
     def to_instruction(self) -> LiveInstruction:
         """生成直播指令：时长 = 基础 × 下限 + 基础 × (上限-下限) × 随机因子(0~1)"""
@@ -76,7 +107,8 @@ class Task(BaseModel):
         duration = int(base * lo + base * (hi - lo) * factor)
         return LiveInstruction(
             zone_name=self.zone_name,
-            duration_seconds=duration
+            duration_seconds=duration,
+            task_id=self.id,
         )
 
 
@@ -118,7 +150,6 @@ class StopLiveResponse(BaseModel):
     success: bool
     message: str = ""
 
-
 class TaskListResponse(BaseModel):
     """任务列表响应"""
     tasks: List[Task] = []
@@ -154,7 +185,22 @@ class UserInfo(BaseModel):
 # ==================== 任务 CRUD 模型 ====================
 
 class TaskCreate(BaseModel):
-    """创建任务请求（category: 0=已完成, >0=时/天）"""
+    """创建任务请求（category: 0=已完成, >0=时/天）
+
+    ``id`` 只有 ``overwrite=true`` 时才需要：它是**被覆盖那一条记录**的稳定
+    身份（用户在确认框里看到的那一条）。旧模型没有这个字段，Pydantic 会把
+    客户端发来的 id 直接丢掉，服务端只能退回按分区名匹配——删除重建同名任务
+    之后，旧覆盖就落到了新记录上。
+
+    ``expected_revision`` / ``business_date`` 是覆盖请求的**前置条件**：用户在
+    确认框里看到的那份列表的版本与业务日。只有 id 还不够——同一条记录在确认
+    之后可能已经被结算/编辑过（别的面板或后台任务），此时旧载荷仍然是"同一个
+    id"，照写就会抹掉刚提交的完成进度。旧模型同样会丢弃这两个字段，服务端只
+    能无保护地照写，因此这里显式建模并交给事务内的条件检查。
+    """
+    id: Optional[int] = None
+    expected_revision: Optional[int] = None      # 确认时的 tasks_revision
+    business_date: Optional[str] = None          # 确认时的业务日（YYYY-MM-DD）
     zone_name: str
     category: int = 1                           # 0=已完成, >0=时/天
     total_days: int = 1
@@ -165,7 +211,12 @@ class TaskCreate(BaseModel):
 
 
 class TaskUpdate(BaseModel):
-    """更新任务请求（所有字段可选）"""
+    """更新任务请求（所有字段可选）
+
+    ``id`` 是记录的稳定身份；带 id 时按 id 定位、body 的 ``zone_name`` 只作
+    **重命名目标**（原子改本行）。不带 id 时退回按路径上的分区名定位。
+    """
+    id: Optional[int] = None
     zone_name: Optional[str] = None
     category: Optional[int] = None
     total_days: Optional[int] = None
@@ -196,13 +247,22 @@ class TaskDetail(BaseModel):
 
 
 class ImportResult(BaseModel):
-    """导入结果"""
+    """导入结果
+
+    ``rejected=True`` 表示**未提交**（没有有效行 / 正在直播 / 事务回滚），
+    此时旧数据保持不变；调用方不得把它当成成功。
+    """
     success: bool = True
     imported_count: int = 0
     message: str = ""
     errors: List[str] = []
     needs_confirmation: bool = False          # 是否需要用户确认
     invalid_zones: List[str] = []             # 不存在的分区名列表
+    imported: int = 0
+    updated: int = 0
+    skipped: int = 0
+    rejected: bool = False
+    revision: Optional[int] = None
 
 
 class ExportResult(BaseModel):

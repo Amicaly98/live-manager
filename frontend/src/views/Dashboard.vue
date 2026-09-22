@@ -10,19 +10,35 @@
       <el-main class="main-content">
         <!-- 直播控制卡片 -->
         <el-row :gutter="20" class="top-cards">
-          <el-col :span="12">
+          <el-col :span="12" :xs="24">
             <el-card shadow="never" class="status-card">
               <template #header>
                 <div class="card-header">
                   <span>直播状态</span>
                   <el-tag :type="liveStore.status.is_streaming ? 'success' : 'info'" size="small">
-                    {{ liveStore.status.is_streaming ? '直播中' : '已停止' }}
+                    {{ liveStore.status.is_starting ? '后台处理中' : liveStore.status.recovery_blocked ? '恢复已暂停' : liveStore.status.is_streaming ? '直播中' : '已停止' }}
                   </el-tag>
                 </div>
               </template>
 
+              <el-alert
+                v-if="liveStore.status.recovery_blocked"
+                :title="'自动恢复暂停：' + liveStore.status.recovery_blocked"
+                type="error" :closable="false" style="margin-bottom:12px"
+              />
+              <div v-if="liveStore.status.is_starting" class="idle-info">
+                <el-alert
+                  :title="liveStore.status.is_cancelling ? '正在停止直播并清理' : '正在后台开播，网络中断时会持续重试'"
+                  description="可以关闭应用，后台会继续处理。"
+                  type="info" :closable="false" style="margin-bottom:12px"
+                />
+                <el-button type="danger" :loading="liveStore.isStopping"
+                  :disabled="liveStore.status.is_cancelling" @click="handleStopLive">
+                  取消开播
+                </el-button>
+              </div>
               <!-- 直播中 -->
-              <div v-if="liveStore.status.is_streaming" class="streaming-info">
+              <div v-else-if="liveStore.status.is_streaming" class="streaming-info">
                 <div class="info-row">
                   <span class="label">直播模式</span>
                   <span class="value">
@@ -58,33 +74,38 @@
                 </div>
                 <div class="progress-section">
                   <div class="progress-header">
-                    <span :class="liveStore.status.is_anomaly ? 'anomaly-text' : ''">
-                      {{ liveStore.status.is_anomaly ? '⚠ 异常' : '直播进度' }}
+                    <span :class="(liveStore.status.is_anomaly || liveStore.timerHint) ? 'anomaly-text' : ''">
+                      {{ liveStore.timerHint || (liveStore.status.is_anomaly ? '⚠ 异常' : '直播进度') }}
                     </span>
+                    <!-- 时长标签与进度条宽度解耦：0%/不限时/未知都能完整显示 -->
                     <span class="progress-time">
                       {{ formatDuration(liveStore.localElapsed) }}
                       <template v-if="liveStore.fixedTotal > 0"> / {{ formatDuration(liveStore.fixedTotal) }}</template>
-                      <template v-else> / 不限时</template>
+                      <template v-else-if="liveStore.durationKnown"> / 不限时</template>
+                      <template v-else> / 正在获取时长…</template>
+                      <span v-if="overtime" class="overtime-tag">收尾中</span>
                     </span>
                   </div>
-                  <el-progress
-                    v-if="liveStore.fixedTotal > 0"
-                    :percentage="progressPercent"
-                    :stroke-width="18"
-                    :status="liveStore.status.is_anomaly ? 'exception' : ''"
-                    :text-inside="true"
-                  >
-                    {{ progressPercent }}%
-                  </el-progress>
-                  <el-progress
-                    v-else
-                    :percentage="0"
-                    :stroke-width="18"
-                    :text-inside="true"
-                    color="#909399"
-                  >
-                    不限时
-                  </el-progress>
+                  <div v-if="liveStore.fixedTotal > 0" class="progress-bar-wrap">
+                    <el-progress
+                      :percentage="progressPercent"
+                      :stroke-width="18"
+                      :status="liveStore.status.is_anomaly ? 'exception' : (overtime ? 'warning' : '')"
+                      :text-inside="true"
+                    >
+                      {{ progressPercent }}%
+                    </el-progress>
+                  </div>
+                  <div v-else class="progress-bar-wrap">
+                    <el-progress
+                      :percentage="0"
+                      :stroke-width="18"
+                      :text-inside="true"
+                      color="#909399"
+                    >
+                      {{ liveStore.durationKnown ? '不限时' : '准备中' }}
+                    </el-progress>
+                  </div>
                 </div>
                 <div class="stream-actions">
                   <el-button
@@ -193,7 +214,7 @@
             </el-card>
           </el-col>
 
-          <el-col :span="12">
+          <el-col :span="12" :xs="24">
             <el-card shadow="never" class="stats-card">
               <template #header>
                 <div class="card-header"><span>任务统计</span></div>
@@ -237,9 +258,11 @@
             <div v-if="events.length === 0" class="empty-event">
               <el-text type="info">暂无操作记录</el-text>
             </div>
-            <div v-for="(evt, idx) in events" :key="idx" class="event-item">
+            <div v-for="evt in events" :key="evt.id" class="event-item">
               <el-tag :type="evt.type" size="small">{{ evt.tag }}</el-tag>
               <span class="event-msg">{{ evt.message }}</span>
+              <el-tag v-if="evt.source === 'local'" size="small" type="info"
+                      effect="plain" class="event-src">本地</el-tag>
               <span class="event-time">{{ evt.time }}</span>
             </div>
           </div>
@@ -297,6 +320,7 @@ import { useAuthStore } from '@/stores/auth'
 import { useTaskStore } from '@/stores/tasks'
 import { useLiveStore } from '@/stores/live'
 import { useSettingsStore } from '@/stores/settings'
+import { operationEvents } from '@/stores/operationEvents'
 import { usePolling } from '@/composables/usePolling'
 import { useNotification } from '@/composables/useNotification'
 import Sidebar from '@/components/Sidebar.vue'
@@ -338,12 +362,25 @@ watch(activeTaskState, (s) => {
 
 
 interface LiveEvent {
+  id: string
   tag: string
   type: 'success' | 'danger' | 'warning' | 'info'
   message: string
   time: string
+  source: 'server' | 'local' | 'legacy'
 }
-const events = ref<LiveEvent[]>([])
+// 近期操作日志统一走响应式事件 store（2026-09-21 工作包 A）：
+// 服务器事件由 live store 的受控状态应用路径直接摄取，本地操作意图走
+// addLocal（独立身份/来源），页面不再经过"定时器→localStorage→定时器"中转。
+const events = computed<LiveEvent[]>(() =>
+  operationEvents.events.value.map((e) => ({
+    id: e.id,
+    tag: e.tag,
+    type: (e.type as LiveEvent['type']) || 'info',
+    message: e.message,
+    time: e.time,
+    source: e.source,
+  })) as LiveEvent[])
 
 // 事件日志容器引用（滚底用）
 const eventListRef = ref<HTMLElement | null>(null)
@@ -380,7 +417,6 @@ const isCheckingVerify = ref(false)
 let pendingStartZone: string | undefined = undefined
 let pendingStartDuration: number | undefined = undefined
 let pendingRetryResume = false  // true=重试恢复，false=重试开播
-// 托盘退出弹窗防重复守卫已随 onTrayQuit 注册一起移至 App.vue
 const lastManualZone = ref(sessionStorage.getItem('lastManualZone') || '')
 const lastManualDuration = ref(Number(sessionStorage.getItem('lastManualDuration')) || 120)
 
@@ -406,22 +442,45 @@ async function searchSwitchAreas(keyword: string) {
 }
 
 // ==================== 实时进度 ====================
+// 百分比永远落在 0..100（NaN/负数/未知都不传给进度组件），
+// 耗时超过目标时显示实际数值并标注"收尾中"，不让条宽超出容器。
+//
+// 计时语义（2026-09-20）：localElapsed = 服务端已确认有效时长 + 有界外推的
+// 待确认区间。待确认部分即使推到目标也**不显示已完成**（停在 99%），完成状态
+// 以服务端实际结算为准；只有服务端已确认值达到目标时才显示 100%。
+const confirmedElapsed = computed(() => {
+  const value = Number(liveStore.status.elapsed_seconds)
+  return Number.isFinite(value) && value > 0 ? value : 0
+})
+
 const progressPercent = computed(() => {
-  const total = liveStore.fixedTotal || 7200
-  if (total <= 0) return 0
-  return Math.min(100, Math.round((liveStore.localElapsed / total) * 100))
+  const total = Number(liveStore.fixedTotal)
+  if (!Number.isFinite(total) || total <= 0) return 0
+  if (confirmedElapsed.value >= total) return 100
+  const elapsed = Number(liveStore.localElapsed)
+  if (!Number.isFinite(elapsed) || elapsed <= 0) return 0
+  return Math.max(0, Math.min(99, Math.round((elapsed / total) * 100)))
+})
+
+const overtime = computed(() => {
+  const total = Number(liveStore.fixedTotal)
+  return Number.isFinite(total) && total > 0 && confirmedElapsed.value > total
 })
 
 // ==================== Polling ====================
 let _wasStreaming = false
+// 轮询不重复触发 success：retryStartLive 成功时置 true，轮询消费后复位
+let _faceVerifySuccessHandled = false
 const { start: startPoll } = usePolling(async () => {
-  await Promise.all([
-    liveStore.fetchStatus(),
+  // 直播状态与任务列表**并行但互不阻塞**：慢任务查询不会拖住状态应用，
+  // 状态一回来就更新计时显示。
+  // 状态走 store 的单飞入口：慢请求不会叠加，任务查询再慢也不拖住状态应用。
+  await Promise.allSettled([
+    liveStore.pollStatus(),
     taskStore.fetchTasks(),
   ])
   liveStore.syncFromServer()
-  // 从 localStorage 同步事件（liveStore 跨页面持续写入）
-  syncEventsFromStorage()
+  // 事件展示由响应式 store 驱动（服务器事件在状态应用路径上已直接摄取）。
   // 人脸验证弹窗感知
   if ((liveStore.status as any).pending_face_verify && !showVerifyModal.value) {
     showVerifyModal.value = true
@@ -432,10 +491,13 @@ const { start: startPoll } = usePolling(async () => {
   if (showVerifyModal.value && liveStore.status.is_streaming) {
     showVerifyModal.value = false
     pendingRetryResume = false
-    ElMessage.success('人脸验证已确认，直播已开始')
+    if (!_faceVerifySuccessHandled) {
+      ElMessage.success('人脸验证已确认，直播已开始')
+    }
+    _faceVerifySuccessHandled = false
   }
   if (liveStore.status.is_streaming) {
-    if (!liveStore.tickTimer) liveStore.startLocalTick()
+    if (!liveStore.tickActive) liveStore.startLocalTick()
     _wasStreaming = true
   } else {
     if (_wasStreaming) {
@@ -467,82 +529,33 @@ onMounted(async () => {
     scrollEventsToBottom()
     setupEventListAutoScroll()
   }, 100)
-  // Electron 托盘退出确认已移至 App.vue（A7：应用级 IPC 不由本页面独占，
-  // 切换到任务页/设置页后退出功能同样可用）
 })
 
 onUnmounted(() => {
   teardownEventListAutoScroll()
+  // 页面离开：取消在途状态读与启动观察，避免离开后仍有请求落地。
+  liveStore.stopStartWatch()
+  liveStore.stopStatusReads()
 })
 
-function formatTime(d?: Date) {
-  const t = d || new Date()
-  const pad = (n: number) => String(n).padStart(2, '0')
-  return `${t.getFullYear()}-${pad(t.getMonth()+1)}-${pad(t.getDate())} ${pad(t.getHours())}:${pad(t.getMinutes())}:${pad(t.getSeconds())}`
-}
-
 function addEvent(tag: string, type: LiveEvent['type'], message: string) {
-  events.value.push({ tag, type, message, time: formatTime() })
-  if (events.value.length > 50) events.value = events.value.slice(-50)
-  try { localStorage.setItem('app_events', JSON.stringify(events.value)) } catch { /* */ }
+  // 本地操作意图：独立身份与来源（与后台事实分阶段，不按文案猜同一事件）。
+  operationEvents.addLocal(tag, type, message)
   scrollEventsToBottom()
 }
 
-// 加载跨页面/跨启动事件
+// 加载跨页面/跨启动事件：由事件 store 的缓存装载完成（含旧格式迁移），
+// 页面挂载只需确保 store 已装载并滚动到底部。
 function loadCrossEvents() {
-  try {
-    const stored = localStorage.getItem('app_events')
-    if (stored) {
-      const cross = JSON.parse(stored)
-      const merged = [...events.value]
-      const today = new Date()
-      const pad = (n: number) => String(n).padStart(2, '0')
-      const todayPrefix = `${today.getFullYear()}-${pad(today.getMonth()+1)}-${pad(today.getDate())}`
-      for (const e of cross) {
-        // 兼容旧格式：只有 HH:MM:SS 的补上当天日期
-        let t = e.time || ''
-        if (t && /^\d{2}:\d{2}:\d{2}$/.test(t)) {
-          t = todayPrefix + ' ' + t
-        }
-        if (!merged.find(x => x.time === t && x.message === e.message)) {
-          merged.push({ ...e, time: t })
-        }
-      }
-      events.value = merged.slice(-50)
-      scrollEventsToBottom()
-    }
-  } catch { /* */ }
-}
-
-// 定期从 localStorage 增量同步新事件
-function syncEventsFromStorage() {
-  try {
-    const stored = localStorage.getItem('app_events')
-    if (!stored) return
-    const cross = JSON.parse(stored) as LiveEvent[]
-    const today = new Date()
-    const pad = (n: number) => String(n).padStart(2, '0')
-    const todayPrefix = `${today.getFullYear()}-${pad(today.getMonth()+1)}-${pad(today.getDate())}`
-    // 只追加 events 中还没有的事件
-    for (const e of cross) {
-      let t = e.time || ''
-      if (t && /^\d{2}:\d{2}:\d{2}$/.test(t)) {
-        t = todayPrefix + ' ' + t
-      }
-      if (!events.value.find(x => x.time === t && x.message === e.message)) {
-        events.value.push({ ...e, time: t })
-      }
-    }
-    if (events.value.length > 50) events.value = events.value.slice(-50)
-    scrollEventsToBottom()
-  } catch { /* */ }
+  operationEvents.ensureLoaded()
+  scrollEventsToBottom()
 }
 
 // ==================== Actions ====================
 async function fetchStatus() {
   try {
     await Promise.all([
-      liveStore.fetchStatus(),
+      liveStore.pollStatus(),
       taskStore.fetchTasks(),
       fetchActiveTaskState(),
     ])
@@ -581,15 +594,16 @@ async function updateTaskState() {
 
 async function resumeTask() {
   try {
-    const { useRequest } = await import('@/api/request')
-    const req = useRequest()
-    const res = await req.post<{ success: boolean; message: string; need_face_verification?: boolean; qr_data?: string }>('/api/live/resume')
+    // 走 store 的 resumeLive：与 start 共用同一套在途意图管理，
+    // 取票等待期间点停止能真正取消这次恢复（旧实现直接 req.post 不受控）。
+    const res = await liveStore.resumeLive()
     if (res.success) {
-      ElMessage.success('直播已恢复')
-      addEvent('恢复', 'success', `恢复直播：${activeTaskState.value.current_zone}`)
-    } else if (res.need_face_verification) {
+      // 后端只是“已接收”：开播在后台持续重试，只有状态轮询确认后才算真正在播。
+      ElMessage.success(res.message || '恢复请求已接收，后台正在开播')
+      addEvent('恢复', 'info', `恢复请求已接收：${activeTaskState.value.current_zone}`)
+    } else if (res.needFaceVerify) {
       showVerifyModal.value = true
-      verifyUrl.value = res.qr_data || ''
+      verifyUrl.value = res.qrData || ''
       pendingStartZone = activeTaskState.value.current_zone
       pendingStartDuration = undefined
       pendingRetryResume = true
@@ -645,7 +659,7 @@ function handleStartResult(
   console.log('[handleStartResult]', { success: result.success, needFaceVerify: result.needFaceVerify, qrData: result.qrData, message: result.message })
   if (result.success) {
     ElMessage.success(result.message)
-    notify('直播已开始', result.message, 'success')
+    notify('开播请求已接收', result.message, 'success')
     fetchStatus()
   } else if (result.needFaceVerify) {
     console.log('[handleStartResult] 显示人脸验证弹窗, qrData:', result.qrData)
@@ -673,13 +687,8 @@ async function retryStartLive() {
     // 根据原始操作选择重试方式
     let result: { success: boolean; message: string; needFaceVerify?: boolean; qrData?: string }
     if (pendingRetryResume) {
-      const res = await req.post<{ success: boolean; message: string; need_face_verification?: boolean; qr_data?: string }>('/api/live/resume')
-      result = {
-        success: res.success,
-        message: res.message,
-        needFaceVerify: res.need_face_verification,
-        qrData: res.qr_data,
-      }
+      // 验证后恢复同样走 store：受停止取消约束，且复用统一的响应形状
+      result = await liveStore.resumeLive()
     } else {
       result = await liveStore.startLive(pendingStartZone, pendingStartDuration)
     }
@@ -687,6 +696,7 @@ async function retryStartLive() {
     if (result.success) {
       showVerifyModal.value = false
       pendingRetryResume = false
+      _faceVerifySuccessHandled = true
       handleStartResult(result)
     } else if (result.needFaceVerify) {
       // 仍需验证，更新二维码
@@ -713,9 +723,10 @@ async function handleStopLive() {
   }
   const result = await liveStore.stopLive()
   if (result.success) {
-    ElMessage.success('直播已停止')
-    addEvent('停播', 'warning', '直播已停止')
-    notify('直播已停止', '当前直播已成功停止', 'warning')
+    ElMessage.success(result.message)
+    addEvent('停播', 'warning', result.message)
+    notify('停止直播', result.message, 'warning')
+    await fetchStatus()
   } else {
     ElMessage.error(result.message)
     addEvent('错误', 'danger', result.message)
@@ -749,9 +760,13 @@ async function handleSwitchArea() {
   }
 }
 
-function onLogout() {
-  authStore.logout()
-  router.push({ name: 'Login' })
+async function onLogout() {
+  const result = await authStore.logout()
+  // 业务拒绝（例如直播进行中）或已被新的登录意图取代时，留在当前页面。
+  // 网络失败仍保留本地退出语义，沿用原来的登录页落点。
+  if (!result.blocked && !result.superseded) {
+    router.push({ name: 'Login' })
+  }
 }
 
 function formatDuration(seconds: number): string {
@@ -877,4 +892,32 @@ function formatDuration(seconds: number): string {
 .event-item { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid #f5f5f5; }
 .event-msg { flex: 1; font-size: 13px; color: #606266; }
 .event-time { font-size: 12px; color: #c0c4cc; }
+/* ===== 手机端适配 ===== */
+@media (max-width: 768px) {
+  .dashboard { flex-direction: column; }
+  .main-content {
+    padding: 56px 12px 12px;
+    min-height: auto;
+    overflow: auto;
+  }
+  .top-cards { margin-bottom: 12px; }
+  .top-cards :deep(.el-card__body) { padding: 12px 14px !important; }
+  .top-cards :deep(.el-card__header) { padding-left: 14px; padding-right: 14px; }
+
+  /* 统计栏：3列2行紧凑排列 */
+  .stats-grid {
+    display: grid !important;
+    grid-template-columns: repeat(3, 1fr) !important;
+    grid-template-rows: repeat(2, 1fr) !important;
+    gap: 6px !important;
+    width: 100% !important;
+  }
+  .stat-item {
+    width: auto !important;
+    height: auto !important;
+    aspect-ratio: auto !important;
+    padding: 8px 4px;
+  }
+  .stat-value { font-size: 18px !important; }
+}
 </style>

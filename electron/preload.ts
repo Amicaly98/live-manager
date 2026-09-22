@@ -49,7 +49,7 @@ const electronAPI = {
     ipcRenderer.removeAllListeners('tray-quit')
     ipcRenderer.on('tray-quit', () => callback())
   },
-  confirmQuit: (stopLive: boolean): Promise<void> =>
+  confirmQuit: (stopLive: boolean): Promise<{ success: boolean }> =>
     ipcRenderer.invoke('confirm-quit', stopLive),
   forceQuit: (): void =>
     ipcRenderer.send('force-quit'),

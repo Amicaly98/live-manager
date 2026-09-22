@@ -54,6 +54,12 @@ export class BackendLifecycle {
   /** D2：停止请求标志——start() 在 spawn/waitReady 之后复核；
    *  spawn 尚未返回时的停止也能生效，迟到的子进程会被回收。 */
   private stopRequested = false;
+  /** spawn 尚未返回时也必须有一个可等待的 owner 收尾边界。 */
+  private pendingSpawn: {
+    generation: number;
+    settled: Promise<boolean>;
+    resolve: (reclaimed: boolean) => void;
+  } | null = null;
   private readonly deps: LifecycleDeps;
 
   constructor(deps: LifecycleDeps) {
@@ -78,6 +84,26 @@ export class BackendLifecycle {
     }
   }
 
+  private finishPendingSpawn(generation: number, reclaimed: boolean): void {
+    const pending = this.pendingSpawn;
+    if (!pending || pending.generation !== generation) return;
+    this.pendingSpawn = null;
+    pending.resolve(reclaimed);
+  }
+
+  /** Wait for a late spawn only within the caller's bounded stop budget. */
+  private async waitPendingSpawn(
+    pending: { settled: Promise<boolean> }, timeoutMs: number,
+  ): Promise<boolean | undefined> {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const timeout = new Promise<undefined>(resolve => {
+      timer = setTimeout(() => resolve(undefined), Math.max(0, timeoutMs));
+    });
+    const result = await Promise.race([pending.settled, timeout]);
+    if (timer !== null) clearTimeout(timer);
+    return result;
+  }
+
   /**
    * 拉起后端。仅在 idle/exited 状态允许；starting/ready/stopping 一律拒绝
    * （E2：旧进程确认回收前不启动新代）。
@@ -92,10 +118,21 @@ export class BackendLifecycle {
     this.generation += 1;
     const myGeneration = this.generation;
     this.state = 'starting';
+    let resolvePendingSpawn: ((reclaimed: boolean) => void) | null = null;
+    const pendingSettled = new Promise<boolean>(resolve => {
+      resolvePendingSpawn = resolve;
+    });
+    this.pendingSpawn = {
+      generation: myGeneration,
+      settled: pendingSettled,
+      // The resolver is assigned synchronously by the Promise constructor.
+      resolve: (reclaimed: boolean) => resolvePendingSpawn?.(reclaimed),
+    };
     let proc: OwnedProcess;
     try {
       proc = await this.deps.spawn();
     } catch (err) {
+      this.finishPendingSpawn(myGeneration, true);
       this.state = 'exited';
       this.current = null;
       this.deps.log('error', `[backend] 启动失败: ${err}`);
@@ -105,23 +142,51 @@ export class BackendLifecycle {
     // 不能成为存活后端，也不能报告 started=true。
     if (this.stopRequested || this.quitting || this.generation !== myGeneration) {
       this.deps.log('warn', `[backend] spawn 返回时代际已失效（停止/退出），回收迟到的子进程 PID=${proc.pid}`);
-      try { await proc.killTree(); } catch { /* 尽力回收 */ }
-      if (this.current === null || this.current === proc) this.current = null;
-      if (this.generation === myGeneration) this.state = 'exited';
+      let reclaimed = !proc.isAlive();
+      if (proc.isAlive()) {
+        try { await proc.killTree(); } catch { /* 尽力回收 */ }
+        reclaimed = !proc.isAlive();
+      }
+      if (this.generation === myGeneration) {
+        if (reclaimed) {
+          if (this.current === proc) this.current = null;
+          this.state = 'exited';
+        } else {
+          // stop() may have returned while spawn was pending.  The late child
+          // is now the owned process and must remain retryable until exit.
+          if (this.current === null) this.current = proc;
+          if (this.current === proc) this.state = 'stopping';
+        }
+      }
+      this.finishPendingSpawn(myGeneration, reclaimed);
       return { started: false, reason: 'stopped_during_spawn' };
     }
     this.current = proc;
+    this.finishPendingSpawn(myGeneration, true);
     this.deps.log('info', `[backend] 已启动 (PID=${proc.pid}, 代际=${myGeneration})`);
     const ready = await this.deps.waitReady(30000);
     // D2：waitReady 期间停止/换代 → 迟到的健康结果不能报告 ready
     if (this.stopRequested || this.quitting || this.generation !== myGeneration || this.current !== proc) {
       this.deps.log('warn', `[backend] 等待就绪期间发生停止/换代（代际=${myGeneration}），不进入 ready`);
+      let reclaimed = !proc.isAlive();
       if (proc.isAlive()) {
-        try { await proc.killTree(); } catch { /* 尽力回收 */ }
+        try {
+          const killIssued = await proc.killTree();
+          reclaimed = !proc.isAlive();
+          if (!killIssued && !reclaimed) {
+            this.deps.log('warn', '[backend] 迟到启动的进程树仍存活，保留 owner 引用');
+          }
+        } catch { /* 尽力回收 */ }
       }
       if (this.current === proc) {
-        this.current = null;
-        this.state = 'exited';
+        if (reclaimed) {
+          this.current = null;
+          this.state = 'exited';
+        } else {
+          // A late health result must not erase a still-live owner after a
+          // failed stop; keep the reference in stopping for a bounded retry.
+          this.state = 'stopping';
+        }
       }
       return { started: false, reason: 'stopped_during_start' };
     }
@@ -146,10 +211,29 @@ export class BackendLifecycle {
     this.stopRequested = true;
     const proc = this.current;
     if (proc === null) {
-      // spawn 可能仍在进行：stopRequested 已置位，start() 在 spawn 返回后
-      // 会回收迟到的子进程并报告未启动。此处只整理状态。
+      // spawn 可能仍在进行：不能把“尚未拿到句柄”当作已回收。等待迟到
+      // 子进程在本次有界预算内完成；超时则保持 stopping，禁止新一代覆盖它。
+      const pending = this.pendingSpawn;
+      if (pending !== null) {
+        this.state = 'stopping';
+        const lateResult = await this.waitPendingSpawn(pending, killTimeoutMs);
+        if (lateResult === undefined) {
+          this.deps.log('warn', '[backend] spawn 尚未返回，停止收尾超时；保留待决 owner');
+          return false;
+        }
+        if (!lateResult) {
+          this.deps.log('warn', '[backend] 迟到 spawn 未确认回收；保留 owner 供重试');
+          return false;
+        }
+        if (this.current === null) {
+          this.state = 'exited';
+          return true;
+        }
+        // 迟到 kill 已确认失败且 current 已被登记时，不能报告成功。
+        return false;
+      }
       if (this.state !== 'stopping') this.state = 'exited';
-      return true;
+      return this.state === 'exited';
     }
     const generationAtEntry = this.generation;
     const previous = this.state;

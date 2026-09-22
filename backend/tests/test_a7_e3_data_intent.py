@@ -4,6 +4,7 @@ import json
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -58,6 +59,56 @@ def test_late_face_verify_confirm_rejected_after_stop(controller):
     controller._advance_control_epoch()  # 用户停止
     assert controller.retry_after_face_verify_guarded(confirm_epoch) is False
     assert controller.retry_after_face_verify_guarded(controller._control_epoch) is True
+
+
+def test_resume_face_verify_retry_rechecks_current_task(controller):
+    """A frozen resume challenge cannot reopen a task completed while waiting."""
+    from datetime import date
+    from app.models.schemas import LiveInstruction
+
+    zone = "王者荣耀"
+    task_id = 41
+    execution_date = date.today().isoformat()
+    controller.state.current_zone = zone
+    controller.state.task_id = task_id
+    controller.state.execution_date = execution_date
+    controller.state.source_mode = 'resume'
+    controller.current_instruction = LiveInstruction(
+        zone_name=zone, duration_seconds=3600, task_id=task_id,
+        execution_date=execution_date)
+    controller._pending_source = 'resume'
+    controller._start_cancel.clear()
+    controller.stop_monitor.clear()
+
+    row = {'id': task_id, 'zone_name': zone, 'category': 1, 'today_done': None}
+    class FakeDB:
+        def get_task_by_id(self, value):
+            return dict(row) if value == task_id else None
+    controller.task_manager = SimpleNamespace(
+        _mutation_lock=threading.RLock(), db=FakeDB())
+    intent = {'source': 'resume', 'zone': zone, 'task_id': task_id,
+              'execution_date': execution_date}
+
+    assert controller.validate_face_verify_retry_intent(intent) is True
+    row['category'] = 0
+    assert controller.validate_face_verify_retry_intent(intent) is False
+
+
+def test_unknown_resume_duration_is_not_marked_resumable(tmp_path):
+    """Unknown target duration must be rejected instead of looking resumable."""
+    from app.core.live_controller import LiveState
+
+    path = tmp_path / 'live_state.json'
+    path.write_text(json.dumps({
+        'is_streaming': True,
+        'current_zone': '旧状态',
+        'duration_seconds': 0,
+        'duration_known': False,
+        'elapsed_seconds': 120,
+    }), encoding='utf-8')
+    state = LiveState(str(path))
+    assert state.resumable() is False
+    assert '时长未知' in state.resume_reason()
 
 
 def test_stale_epoch_start_rejected_synchronously(controller):

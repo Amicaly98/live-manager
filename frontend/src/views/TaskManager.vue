@@ -122,7 +122,7 @@
             <el-button
               size="small"
               :disabled="streamingZone === row.zone_name"
-              @click="openEditDialog(row)"
+              @click="openEditDialog(row as TaskItem)"
             >
               编辑
             </el-button>
@@ -217,14 +217,14 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, computed } from 'vue'
+import { ref, reactive, computed, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useTaskStore } from '@/stores/tasks'
 import { useLiveStore } from '@/stores/live'
 import { useAuthStore } from '@/stores/auth'
 import Sidebar from '@/components/Sidebar.vue'
-import type { TaskItem, TaskCreate, TaskUpdate } from '@/types/api'
+import type { TaskItem, TaskCreate, TaskUpdate, OverwriteTarget } from '@/types/api'
 
 const router = useRouter()
 const taskStore = useTaskStore()
@@ -260,9 +260,33 @@ const refreshingAreas = ref(false)
 const exporting = ref(false)
 const submitting = ref(false)
 
+// 版本驱动的列表刷新订阅。
+//
+// 任务页原先只在挂载/用户操作后刷新：用户一直停在这一页时，后台
+// 「任务完成 → 重算优先度 → 重排」不会反映到界面上。这里只轮询轻量统计，
+// revision 前进才重取完整列表（不把整个列表改成高频轮询）。
+let _revisionTimer: ReturnType<typeof setInterval> | null = null
+
+onMounted(async () => {
+  await taskStore.fetchTasks()
+  _revisionTimer = setInterval(() => { void taskStore.refreshTasksIfStale() }, 5000)
+})
+
+onUnmounted(() => {
+  if (_revisionTimer) { clearInterval(_revisionTimer); _revisionTimer = null }
+})
+
 // 对话框状态
 const showCreateDialog = ref(false)
 const editingZone = ref<string | null>(null)
+//: 打开编辑对话框时**冻结**的那条记录的稳定身份。名字会在改名/删除重建后指向
+//: 另一条记录，写请求必须按 id 定位（后端也按 id 校验）。
+const editingTaskId = ref<number | undefined>(undefined)
+
+/** 按分区名找当前列表里那条记录的稳定 id（找不到就返回 undefined）。 */
+function taskIdOf(zoneName: string): number | undefined {
+  return taskStore.tasks.find(t => t.zone_name === zoneName)?.id
+}
 const taskStatus = ref<'pending' | 'completed'>('pending')
 const taskHours = ref(2)
 const taskTodayDone = ref(false)  // 编辑时：今日是否已完成
@@ -282,6 +306,7 @@ const taskForm = reactive<TaskCreate>({
 
 function resetForm() {
   editingZone.value = null
+  editingTaskId.value = undefined
   taskForm.zone_name = ''
   taskStatus.value = 'pending'
   taskHours.value = 2
@@ -308,6 +333,7 @@ async function searchTaskAreas(keyword: string) {
 
 function openEditDialog(row: TaskItem) {
   editingZone.value = row.zone_name
+  editingTaskId.value = row.id
   taskForm.zone_name = row.zone_name
   if (row.category === 0) {
     taskStatus.value = 'completed'
@@ -384,7 +410,8 @@ async function submitTask() {
     if (editingZone.value) {
       const updateData: TaskUpdate = { ...data, today_done: taskTodayDone.value ? 1 : 0 }
       delete (updateData as any).zone_name
-      const success = await taskStore.updateTask(editingZone.value, updateData)
+      const success = await taskStore.updateTask(editingZone.value, updateData,
+                                                  editingTaskId.value)
       if (success) {
         ElMessage.success('任务已更新')
         showCreateDialog.value = false
@@ -399,24 +426,47 @@ async function submitTask() {
   }
 }
 
-async function doCreateTask(data: TaskCreate, overwrite: boolean = false) {
+/** 服务端"确认已过期"的三种明确冲突（见 _require_overwrite_preconditions）。 */
+function isStaleConfirmation(detail: string): boolean {
+  return detail.includes('overwrite_stale_revision')
+    || detail.includes('overwrite_stale_business_day')
+    || detail.includes('overwrite_requires_revision')
+}
+
+/**
+ * 覆盖确认框（只负责"问"，不改目标）。
+ *
+ * 目标的前置条件必须由调用方在**弹框之前**就冻结好：确认框弹出后任务列表
+ * 随时可能刷新（后台结算会推进版本），目标记录也可能被删除重建/改名——名字
+ * 不是身份，只有 id 才代表用户此刻看到的那一条；而当"那一条"在这段时间里
+ * 被结算/编辑过时，用户确认的是他当时看到的状态，不是最新状态，因此版本与
+ * 业务日也必须一起冻结。用户取消时抛出（调用方按取消处理，不发请求）。
+ */
+async function confirmOverwrite(zoneName: string) {
+  await ElMessageBox.confirm(
+    `任务「${zoneName}」已存在，是否覆盖原有任务？`,
+    '任务已存在',
+    {
+      confirmButtonText: '覆盖',
+      cancelButtonText: '取消',
+      type: 'warning',
+      distinguishCancelAndClose: true,
+    },
+  )
+}
+
+async function doCreateTask(data: TaskCreate, overwrite: boolean = false,
+                            target?: OverwriteTarget) {
   // 新建模式下先检查是否已存在同名任务（从已加载的任务列表中）
   if (!overwrite) {
-    const existing = taskStore.tasks.find(t => t.zone_name === data.zone_name)
-    if (existing) {
+    // 冻结"用户此刻看到的那一条"的**全部前置条件**：id + 版本 + 业务日。
+    // 三样必须在弹框之前一起取；确认框弹出后列表怎么刷新都不改它们。
+    const frozen = taskStore.freezeOverwriteTarget(data.zone_name)
+    if (frozen) {
       try {
-        await ElMessageBox.confirm(
-          `任务「${data.zone_name}」已存在，是否覆盖原有任务？`,
-          '任务已存在',
-          {
-            confirmButtonText: '覆盖',
-            cancelButtonText: '取消',
-            type: 'warning',
-            distinguishCancelAndClose: true,
-          },
-        )
-        // 用户选择覆盖
-        return await doCreateTask(data, true)
+        await confirmOverwrite(data.zone_name)
+        // 用户选择覆盖：带上确认时那一刻冻结的 id/版本/业务日
+        return await doCreateTask(data, true, frozen)
       } catch {
         // 用户取消或关闭
         ElMessage.info('已取消创建')
@@ -424,28 +474,44 @@ async function doCreateTask(data: TaskCreate, overwrite: boolean = false) {
       }
     }
   }
+  if (overwrite && !target) {
+    // 没有确定目标就不发请求：静默退回"按名字覆盖"正是会把旧覆盖作用到
+    // 重建出来的同名任务上的那条路径。
+    ElMessage.error('覆盖目标不明确：请刷新任务列表后重新确认要覆盖的任务')
+    return false
+  }
 
   try {
-    await taskStore.createTask(data, overwrite)
+    await taskStore.createTask(data, overwrite, target)
     ElMessage.success(overwrite ? '任务已覆盖' : '任务已创建')
     showCreateDialog.value = false
     return true
   } catch (error: any) {
     // 如果本地列表未及时同步导致后端仍报重名，兜底处理
     const detail = error?.response?.data?.detail || error?.message || ''
+    if (overwrite && isStaleConfirmation(detail)) {
+      // 服务端明确说"确认已过期"（确认之后记录被改动过/跨日）。刷新到最新
+      // 状态后由用户重新确认——**不**在这里用新版本自动重发：那等于把用户
+      // 确认的内容悄悄换掉。若本次是重试后拿到的 409，首次响应可能没回来，
+      // 所以要如实提示"可能已生效，请核对"。
+      await taskStore.fetchTasks()
+      const retried = Number(error?.config?._retryCount || 0) > 0
+      ElMessage.warning(retried
+        ? `${detail}。本次请求可能已经生效，请核对后再决定是否重新覆盖`
+        : detail)
+      return false
+    }
     if (!overwrite && (detail.includes('已存在同名') || detail.includes('UNIQUE constraint'))) {
+      // 先取到**确定目标**（刷新列表并重新解析 id），再让用户确认覆盖。
+      await taskStore.fetchTasks()
+      const frozen = taskStore.freezeOverwriteTarget(data.zone_name)
+      if (!frozen) {
+        ElMessage.error('该名称已被占用，但无法确定目标记录；请刷新任务列表后重试')
+        return false
+      }
       try {
-        await ElMessageBox.confirm(
-          `任务「${data.zone_name}」已存在，是否覆盖原有任务？`,
-          '任务已存在',
-          {
-            confirmButtonText: '覆盖',
-            cancelButtonText: '取消',
-            type: 'warning',
-            distinguishCancelAndClose: true,
-          },
-        )
-        return await doCreateTask(data, true)
+        await confirmOverwrite(data.zone_name)
+        return await doCreateTask(data, true, frozen)
       } catch {
         ElMessage.info('已取消创建')
         return false
@@ -464,7 +530,7 @@ async function confirmDelete(zoneName: string) {
       { confirmButtonText: '删除', cancelButtonText: '取消', type: 'warning', confirmButtonClass: 'el-button--danger' },
     )
   } catch { return }
-  const success = await taskStore.deleteTask(zoneName)
+  const success = await taskStore.deleteTask(zoneName, taskIdOf(zoneName))
   if (success) {
     ElMessage.success(`任务「${zoneName}」已删除`)
   } else {
@@ -583,9 +649,11 @@ function goBack() {
   router.push({ name: 'Dashboard' })
 }
 
-function onLogout() {
-  authStore.logout()
-  router.push({ name: 'Login' })
+async function onLogout() {
+  const result = await authStore.logout()
+  if (!result.blocked && !result.superseded) {
+    router.push({ name: 'Login' })
+  }
 }
 
 async function reloadTasks() {
@@ -671,7 +739,7 @@ async function confirmMarkAllDone(zoneName: string) {
       { confirmButtonText: '确认全部完成', cancelButtonText: '取消', type: 'warning', confirmButtonClass: 'el-button--danger' },
     )
   } catch { return }
-  const success = await taskStore.markTaskAllDone(zoneName)
+  const success = await taskStore.markTaskAllDone(zoneName, taskIdOf(zoneName))
   if (success) {
     ElMessage.success(`「${zoneName}」已标记为全部完成`)
   } else {
@@ -680,7 +748,7 @@ async function confirmMarkAllDone(zoneName: string) {
 }
 
 async function markDone(zoneName: string) {
-  const success = await taskStore.markTaskDone(zoneName)
+  const success = await taskStore.markTaskDone(zoneName, taskIdOf(zoneName))
   if (success) {
     ElMessage.success(`任务 ${zoneName} 已标记完成`)
   } else {
@@ -739,4 +807,22 @@ async function refreshAreas() {
 
 /* 优先度列紧凑 */
 :deep(.el-table__body-wrapper) { overflow-x: auto; }
+
+/* ===== 手机端适配 ===== */
+@media (max-width: 768px) {
+  .main-content {
+    padding: 56px 12px 12px;
+    height: auto;
+    min-height: 100vh;
+  }
+  .toolbar {
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .stats-info {
+    width: 100%;
+    margin-left: 0;
+    margin-top: 4px;
+  }
+}
 </style>

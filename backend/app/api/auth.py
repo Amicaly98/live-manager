@@ -3,7 +3,8 @@ auth.py - 认证相关 API（登录、登出、状态查询）
 """
 
 import logging
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Header, HTTPException
+from fastapi.responses import JSONResponse
 
 
 from app.dependencies import get_task_manager, get_live_controller
@@ -13,7 +14,7 @@ router = APIRouter()
 
 
 @router.get("/qrcode", summary="获取登录二维码")
-async def get_qrcode():
+def get_qrcode():
     """获取扫码登录二维码"""
     controller = get_live_controller()
     if not controller:
@@ -25,7 +26,7 @@ async def get_qrcode():
 
 
 @router.get("/status", summary="查询登录状态")
-async def get_login_status():
+def get_login_status():
     """查询当前登录状态"""
     controller = get_live_controller()
     if not controller:
@@ -49,7 +50,7 @@ async def get_login_status():
 
 
 @router.post("/poll/{qrcode_key}", summary="轮询二维码状态")
-async def poll_qrcode(qrcode_key: str):
+def poll_qrcode(qrcode_key: str):
     """轮询查看二维码是否已被扫码"""
     controller = get_live_controller()
     if not controller:
@@ -65,10 +66,29 @@ async def poll_qrcode(qrcode_key: str):
 
 
 @router.post("/logout", summary="登出")
-async def logout():
+def logout(x_operation_token: str = Header(default=None,
+                                            alias='X-Operation-Token')):
     """清除登录状态"""
     controller = get_live_controller()
     if not controller:
         raise HTTPException(status_code=500, detail="直播控制器未初始化")
-    controller.api.clear_cookies()
+    logout_fn = getattr(controller, 'logout', None)
+    if callable(logout_fn):
+        result = logout_fn(x_operation_token or '')
+        if not result.get('success'):
+            # ``detail`` 保持字符串，兼容现有前端错误提示；稳定 code 供
+            # 客户端区分“直播占用账号”与普通网络/落盘失败。
+            return JSONResponse(
+                status_code=int(result.get('status_code', 503)),
+                content={'detail': result.get('message', '登出失败'),
+                         'code': result.get('code', 'auth_logout_failed')},
+            )
+        return result
+    # 兼容最小测试替身；生产 LiveController 始终走上面的认证协议。
+    if controller.api.clear_cookies() is False:
+        return JSONResponse(
+            status_code=503,
+            content={'detail': '登出凭据撤销未落盘，未确认登出成功',
+                     'code': 'auth_logout_persistence_failed'},
+        )
     return {'success': True, 'message': '已登出'}

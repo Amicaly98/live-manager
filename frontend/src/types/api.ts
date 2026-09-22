@@ -40,7 +40,14 @@ export interface LogoutResponse {
 
 export interface LiveStatus {
   is_streaming: boolean
+  is_starting?: boolean
+  is_cancelling?: boolean
+  recovery_blocked?: string
   current_zone: string
+  /**
+   * **权威有效时长**：服务端已确认（平台连续回报在播）的累计秒数。
+   * 不含待确认区间；同一个字段不会有时代表已确认值、有时代表墙钟总时长。
+   */
   elapsed_seconds: number
   remaining_seconds: number
   room_id: number
@@ -51,6 +58,21 @@ export interface LiveStatus {
   ffmpeg_current_video?: string
   pending_face_verify?: boolean
   face_verify_url?: string
+  /** 最近一次可信观察之后的待确认区间（秒）：只可**有界**外推显示。 */
+  pending_seconds?: number
+  /** 还能继续外推多久（秒）；0 表示页面必须冻结在已确认值上。 */
+  pending_valid_seconds?: number
+  /** 单段待确认区间上限（页面外推的硬边界）。 */
+  pending_limit_seconds?: number
+  /** 服务端是否允许对这段待确认区间做显示外推。 */
+  pending_extrapolatable?: boolean
+  /** 'running' | 'paused_closed' | 'paused_unknown' | 'paused_blocked' */
+  timer_state?: string
+  phase?: string
+  run_id?: string
+  session_version?: number
+  boot_id?: string
+  duration_known?: boolean
   backend_events?: BackendEvent[]
 }
 
@@ -82,6 +104,8 @@ export interface RunNextResponse {
 // ==================== Tasks 任务 ====================
 
 export interface TaskItem {
+  /** 稳定身份：写请求（删除/修改/标记完成）按它定位，不按分区名。 */
+  id?: number
   priority: number
   zone_name: string
   category: number
@@ -146,7 +170,26 @@ export interface TaskDetail extends TaskItem {
   updated_at?: string
 }
 
+/** 覆盖确认时冻结的目标：稳定身份 + 当时看到的版本与业务日。
+ *
+ * 只冻结 id 不够：同一条记录在用户确认之后可能已经被结算/编辑（后台任务或
+ * 别的面板），旧载荷带着同一个 id 照写就会抹掉刚提交的完成进度。版本与业务日
+ * 必须在**弹框之前**与 id 一起取，不能在发请求时现取——现取等于把用户确认的
+ * 那份状态悄悄换成最新的。
+ */
+export interface OverwriteTarget {
+  id: number
+  expectedRevision: number
+  businessDate: string
+}
+
 export interface TaskCreate {
+  /** 覆盖（overwrite=true）时必填：被覆盖那一条记录的稳定身份。 */
+  id?: number
+  /** 覆盖请求的前置条件：确认时的 tasks_revision（界面渲染的那份快照）。 */
+  expected_revision?: number
+  /** 覆盖请求的前置条件：确认时的业务日（YYYY-MM-DD）。 */
+  business_date?: string
   zone_name: string
   category?: number
   total_days?: number
@@ -185,6 +228,11 @@ export interface ImportResult {
   errors?: string[]
   needs_confirmation?: boolean
   invalid_zones?: string[]
+  imported?: number
+  updated?: number
+  skipped?: number
+  rejected?: number
+  revision?: number
 }
 
 export interface ExportResult {
@@ -252,6 +300,8 @@ export interface AppSettings {
   ffmpeg_path: string
   ffmpeg_reencode: boolean
   // 邮箱推送
+  /** 推送总开关：关闭后所有渠道（邮箱/Server酱）都不再发送 */
+  notification_enabled?: boolean
   notification_channel: 'email' | 'serverchan' | 'both'
   email_enabled: boolean
   email_smtp_host: string
@@ -267,6 +317,7 @@ export interface AppSettings {
   email_face_verify_port: number
   // Server酱
   serverchan_sendkey: string
+  // 服务器公网地址（域名或IP），留空自动检测
   duration_distribution: 'uniform' | 'normal' | 'beta'
   duration_multiplier_min: number
   duration_multiplier_max: number

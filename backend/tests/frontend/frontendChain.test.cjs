@@ -237,9 +237,16 @@ async function main() {
       `应给出明确错误提示（实际 toasts=${JSON.stringify(toasts)}）`);
   });
 
-  server.close();
+  // Explicitly tear down keep-alive sockets and the delayed-start stub so the
+  // real-chain gate has a clean process exit on Node 24/Windows as well.
+  server.closeAllConnections?.();
+  await new Promise((resolve) => {
+    const timer = setTimeout(resolve, 250);
+    server.close(() => { clearTimeout(timer); resolve(); });
+  });
   if (failures > 0) process.exit(1);
   console.log(`frontend chain: 4/4 passed`);
+  process.exit(0);
 }
 
 main().catch((err) => {

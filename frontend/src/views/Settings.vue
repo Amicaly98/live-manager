@@ -13,6 +13,20 @@
       </el-page-header>
 
       <div class="settings-form">
+        <el-alert
+          v-if="settingsStore.saveBlocked"
+          type="error"
+          :closable="false"
+          show-icon
+          class="save-blocked-alert"
+        >
+          <template #title>
+            设置未保存：{{ settingsStore.lastSaveError || '服务端拒绝了本次保存' }}
+          </template>
+          <el-button size="small" type="primary" plain
+                     :loading="settingsStore.isSaving"
+                     @click="retrySaveSettings">重试保存</el-button>
+        </el-alert>
         <el-card shadow="never" v-loading="settingsStore.isLoading">
           <template #header><span>基本配置</span></template>
 
@@ -192,26 +206,44 @@
             <div class="form-header">
               <span>推送通知</span>
               <el-switch
-                :model-value="settingsStore.settings.email_enabled"
-                @update:model-value="(v: any) => settingsStore.updateField('email_enabled', v)"
+                :model-value="settingsStore.settings.notification_enabled !== false"
+                @update:model-value="(v: any) => settingsStore.updateField('notification_enabled', v)"
                 size="small"
               />
             </div>
           </template>
-          <template v-if="settingsStore.settings.email_enabled">
+          <template v-if="settingsStore.settings.notification_enabled !== false">
+            <el-form label-width="120px" label-position="right">
+              <el-form-item label="启用邮箱">
+                <el-switch
+                  :model-value="settingsStore.settings.email_enabled"
+                  @update:model-value="(v: any) => settingsStore.updateField('email_enabled', v)"
+                  size="small"
+                />
+              </el-form-item>
+            </el-form>
+          </template>
+          <template v-if="settingsStore.settings.notification_enabled !== false">
             <el-form label-width="120px" label-position="right">
               <el-form-item label="推送渠道">
-                <el-radio-group
-                  :model-value="settingsStore.settings.notification_channel"
-                  @update:model-value="(v: any) => settingsStore.updateField('notification_channel', v)"
-                >
-                  <el-radio value="email">📧 邮箱</el-radio>
-                  <el-radio value="serverchan">📡 Server酱（微信）</el-radio>
-                </el-radio-group>
+                <el-checkbox
+                  :model-value="settingsStore.settings.notification_channel === 'email' || settingsStore.settings.notification_channel === 'both'"
+                  @update:model-value="(v: string | number | boolean) => {
+                    const hasServerChan = settingsStore.settings.notification_channel === 'serverchan' || settingsStore.settings.notification_channel === 'both'
+                    settingsStore.updateField('notification_channel', v ? (hasServerChan ? 'both' : 'email') : (hasServerChan ? 'serverchan' : 'email'))
+                  }"
+                >📧 邮箱</el-checkbox>
+                <el-checkbox
+                  :model-value="settingsStore.settings.notification_channel === 'serverchan' || settingsStore.settings.notification_channel === 'both'"
+                  @update:model-value="(v: string | number | boolean) => {
+                    const hasEmail = settingsStore.settings.notification_channel === 'email' || settingsStore.settings.notification_channel === 'both'
+                    settingsStore.updateField('notification_channel', v ? (hasEmail ? 'both' : 'serverchan') : (hasEmail ? 'email' : 'serverchan'))
+                  }"
+                >📡 Server酱（微信）</el-checkbox>
               </el-form-item>
 
               <!-- 邮箱配置 -->
-              <template v-if="settingsStore.settings.notification_channel === 'email'">
+              <template v-if="settingsStore.settings.notification_channel === 'email' || settingsStore.settings.notification_channel === 'both'">
                 <el-form-item label="SMTP 服务器">
                   <el-input :model-value="settingsStore.settings.email_smtp_host"
                     @update:model-value="(v: any) => settingsStore.updateField('email_smtp_host', v)" />
@@ -240,7 +272,7 @@
               </template>
 
               <!-- Server酱 配置 -->
-              <template v-if="settingsStore.settings.notification_channel === 'serverchan'">
+              <template v-if="settingsStore.settings.notification_channel === 'serverchan' || settingsStore.settings.notification_channel === 'both'">
                 <el-form-item label="SendKey">
                   <el-input :model-value="settingsStore.settings.serverchan_sendkey"
                     @update:model-value="(v: any) => settingsStore.updateField('serverchan_sendkey', v)"
@@ -261,11 +293,8 @@
                 <el-checkbox :model-value="settingsStore.settings.email_daily_summary"
                   @update:model-value="(v: any) => settingsStore.updateField('email_daily_summary', v)">每日简报</el-checkbox>
               </el-form-item>
-              <el-form-item label="远程确认端口">
-                <el-input-number :model-value="settingsStore.settings.email_face_verify_port"
-                  @update:model-value="(v: any) => settingsStore.updateField('email_face_verify_port', v ?? 19080)"
-                  :min="1024" :max="65535" />
-                <div class="form-tip">人脸验证推送中的确认链接使用此端口，默认 19080</div>
+              <el-form-item label="人脸确认">
+                <div class="form-tip">请在运行本程序的电脑上确认，也可在面板确认。</div>
               </el-form-item>
               <el-form-item>
                 <el-button @click="sendTestEmail" :loading="sendingTestEmail" type="success" plain>
@@ -307,7 +336,7 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, ref, computed, watch } from 'vue'
+import { onMounted, onUnmounted, ref, computed, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { useAuthStore } from '@/stores/auth'
@@ -386,26 +415,46 @@ async function sendTestEmail() {
   }
 }
 
-// 自动保存：监听设置变更，debounce 1.5s（首次加载不触发，保存回写不触发）
+// 自动保存：监听设置变更，debounce 1.5s。
+// 页面卸载时会把尚未到 debounce 截止时间的编辑交给 store 串行保存，
+// 这样离开/重入不会丢掉首个编辑。
 let _saveTimer: ReturnType<typeof setTimeout> | null = null
-let _initialized = false
+let _mounted = false
 watch(() => settingsStore.settings, () => {
-  if (!_initialized) { _initialized = true; return }
   if (settingsStore.isSaveGate()) return
+  // fetchSettings 和保存响应可能替换/修正 settings 对象；这些变化没有用户
+  // 脏版本，不应启动一次空保存。真正的输入由 updateField 标记为 dirty。
+  if (!settingsStore.hasUnsavedChanges) return
   if (_saveTimer) clearTimeout(_saveTimer)
   _saveTimer = setTimeout(async () => {
+    _saveTimer = null
+    // The unmount hook flushes a pending edit; this guard keeps a timer that
+    // raced with route disposal from showing a success message on the old UI.
+    if (!_mounted || !settingsStore.hasUnsavedChanges) return
     const ok = await settingsStore.saveSettings()
-    if (ok) ElMessage.success('设置已自动保存')
+    if (!_mounted) return
+    if (ok && !settingsStore.hasUnsavedChanges) ElMessage.success('设置已自动保存')
+    else if (settingsStore.saveBlocked) {
+      ElMessage.error(settingsStore.lastSaveError || '设置未保存（编辑内容已保留），可点“重试保存”')
+    }
   }, 1500)
 }, { deep: true })
+
+async function retrySaveSettings() {
+  const ok = await settingsStore.retrySave()
+  if (ok && _mounted && !settingsStore.hasUnsavedChanges) ElMessage.success('设置已保存')
+  else if (!ok && _mounted) ElMessage.error(settingsStore.lastSaveError || '保存仍然失败，请检查网络')
+}
 
 function goBack() {
   router.push({ name: 'Dashboard' })
 }
 
-function onLogout() {
-  authStore.logout()
-  router.push({ name: 'Login' })
+async function onLogout() {
+  const result = await authStore.logout()
+  if (!result.blocked && !result.superseded) {
+    router.push({ name: 'Login' })
+  }
 }
 
 async function selectDirectory() {
@@ -442,12 +491,25 @@ async function checkUpdate() {
 }
 
 onMounted(async () => {
-  settingsStore.fetchSettings()
+  _mounted = true
+  void settingsStore.fetchSettings()
   if (window.electronAPI) {
     try {
       appVersion.value = await window.electronAPI.getAppVersion()
     } catch { /* ignore */ }
   }
+})
+
+onUnmounted(() => {
+  _mounted = false
+  if (_saveTimer) {
+    clearTimeout(_saveTimer)
+    _saveTimer = null
+  }
+  // 路由离开不能取消用户的编辑责任。saveSettings 在 store 内串行化，
+  // 因此正在途中的旧保存和本次离页 flush 会按 dirty revision 追平。
+  if (settingsStore.hasUnsavedChanges) void settingsStore.saveSettings()
+  settingsStore.stopSettingsReads()
 })
 </script>
 

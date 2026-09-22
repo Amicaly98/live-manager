@@ -28,14 +28,23 @@
 <script setup lang="ts">
 import { useRouter } from 'vue-router'
 import QRCodeLogin from '@/components/QRCodeLogin.vue'
+import { boot } from '@/boot'
 import type { UserInfo } from '@/types/api'
 
 const router = useRouter()
 
-function onLoginSuccess(_user: UserInfo) {
-  setTimeout(() => {
-    router.push({ name: 'Dashboard' })
-  }, 1000)
+/**
+ * 扫码登录成功。
+ *
+ * `authStore.pollLoginStatus()` 成功时已经作废了启动快照
+ * （`boot.invalidate('platform-login')`）。这里在导航前等一次新的启动读取，
+ * 让守卫拿到"平台已登录"的新结论，否则用户会被按回本页
+ * （监督复现的第二个失败）。保留 1 秒延迟只为让"登录成功！"提示可见。
+ */
+async function onLoginSuccess(_user: UserInfo) {
+  await new Promise(resolve => setTimeout(resolve, 1000))
+  await boot.ensure()
+  router.push({ name: 'Dashboard' })
 }
 
 function onExpired() {

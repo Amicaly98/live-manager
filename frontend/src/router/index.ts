@@ -1,5 +1,6 @@
 import { createRouter, createWebHashHistory } from 'vue-router'
 import type { RouteRecordRaw } from 'vue-router'
+import { boot } from '@/boot'
 
 const routes: RouteRecordRaw[] = [
   {
@@ -37,15 +38,17 @@ const router = createRouter({
 router.beforeEach(async (to, _from, next) => {
   document.title = to.meta.title ? `B站直播 - ${to.meta.title}` : '直播控制系统'
 
-  if (to.meta.requiresAuth) {
-    const { useAuthStore } = await import('@/stores/auth')
-    const authStore = useAuthStore()
-    // 未登录时先尝试从缓存恢复
-    await authStore.checkLoginStatus()
-    if (!authStore.isLoggedIn) {
-      next({ name: 'Login' })
-      return
-    }
+  const result = await boot.ensure()
+  if (!result.ok || !boot.isCurrent(result)) {
+    // App 的根层启动页会显示可恢复状态，并在下一代完成后恢复原导航。
+    boot.pendingPath = to.fullPath
+    next(false)
+    return
+  }
+
+  if (to.meta.requiresAuth && !result.loggedIn) {
+    next({ name: 'Login' })
+    return
   }
 
   next()

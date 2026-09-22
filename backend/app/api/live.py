@@ -21,6 +21,7 @@ from fastapi import APIRouter, Header, HTTPException
 
 from app.dependencies import get_live_controller, get_task_manager
 from app.models.schemas import StartLiveRequest, StartLiveResponse, LiveStatusResponse, LiveInstruction
+from app.core.live_controller import SOURCE_RESUME
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -66,6 +67,13 @@ def _epoch_current(controller, epoch: int) -> bool:
     if check is None:
         return True
     return check(epoch)
+
+
+async def _run_blocking(func, *args, **kwargs):
+    """Run a synchronous control boundary on the bounded blocking pool."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        _BLOCKING_POOL, functools.partial(func, *args, **kwargs))
 
 
 # ==================== 统一响应构建 ====================
@@ -150,7 +158,12 @@ async def start_live(request: StartLiveRequest = None,
     epoch = _begin_operation(controller, x_operation_token)
 
     if request and request.zone_name:
-        dur = getattr(request, 'duration_seconds', None) or 7200
+        requested_duration = getattr(request, 'duration_seconds', None)
+        dur = 7200 if requested_duration is None else requested_duration
+        if dur < 0:
+            return StartLiveResponse(
+                success=False,
+                message='duration_seconds 不能为负数')
         instruction = _make_instruction(request.zone_name, dur)
         video_path = controller.video_finder.find_video(request.zone_name)
         # OBS 模式无视频不阻断开播，FFmpeg 模式必须有视频
@@ -160,12 +173,17 @@ async def start_live(request: StartLiveRequest = None,
                 return StartLiveResponse(success=False, message=f"未找到分区 {request.zone_name} 的视频文件，FFmpeg 推流不可用")
             # OBS 模式：允许无视频开播
             video_path = ''
-        ok = controller.start_streaming(instruction, video_path, is_task_mode=False, epoch=epoch)
+        ok = await _run_blocking(
+            controller.start_streaming, instruction, video_path,
+            is_task_mode=False, epoch=epoch)
     else:
-        instruction, video_path, err = _get_next_task_instruction()
+        instruction, video_path, err = await _run_blocking(
+            _get_next_task_instruction)
         if err:
             return StartLiveResponse(success=False, message=err)
-        ok = controller.start_streaming(instruction, video_path, is_task_mode=True, epoch=epoch)
+        ok = await _run_blocking(
+            controller.start_streaming, instruction, video_path,
+            is_task_mode=True, epoch=epoch)
 
     return _build_stream_response(controller, ok)
 
@@ -178,24 +196,38 @@ async def resume_live(x_operation_token: str = Header(default=None, alias='X-Ope
         raise HTTPException(status_code=500, detail="直播控制器未初始化")
     epoch = _begin_operation(controller, x_operation_token)
 
-    state = controller.state
-    if not state.current_zone:
-        return StartLiveResponse(success=False, message="没有可恢复的直播任务")
+    resolver = getattr(controller, 'resolve_resume_target', None)
+    if callable(resolver):
+        instruction, reason = await _run_blocking(resolver)
+        if instruction is None:
+            return StartLiveResponse(success=False, message=reason or '没有可恢复的直播任务')
+    else:
+        # Compatibility for a minimal controller double; production desktop
+        # controllers always expose the identity checked resolver above.
+        state = controller.state
+        if not state.current_zone:
+            return StartLiveResponse(success=False, message="没有可恢复的直播任务")
+        instruction = _make_instruction(
+            state.current_zone, getattr(state, 'duration_seconds', 7200))
 
-    if controller.area_loader.get_area_id(state.current_zone, auto_update=False) is None:
-        return StartLiveResponse(success=False, message=f"分区 '{state.current_zone}' 不存在于分区列表中")
+    if controller.area_loader.get_area_id(instruction.zone_name, auto_update=False) is None:
+        return StartLiveResponse(success=False, message=f"分区 '{instruction.zone_name}' 不存在于分区列表中")
 
-    dur = getattr(state, 'duration_seconds', 7200)
-    instruction = _make_instruction(state.current_zone, dur)
-    video_path = controller.video_finder.find_video(state.current_zone)
+    video_path = controller.video_finder.find_video(instruction.zone_name)
     if not video_path:
         # D3：OBS 外部推流模式无本地视频不阻断恢复
         stream_mode, _ = controller._get_stream_settings()
         if stream_mode == 'ffmpeg':
-            return StartLiveResponse(success=False, message=f"未找到分区 {state.current_zone} 的视频文件，FFmpeg 推流不可用")
+            return StartLiveResponse(success=False, message=f"未找到分区 {instruction.zone_name} 的视频文件，FFmpeg 推流不可用")
         video_path = ''
 
-    ok = controller.start_streaming(instruction, video_path, is_task_mode=True, epoch=epoch)
+    state = controller.state
+    inherit_elapsed = int(getattr(state, 'effective_seconds', 0) or
+                           getattr(state, 'elapsed_seconds', 0) or 0)
+    ok = await _run_blocking(
+        controller.start_streaming,
+        instruction, video_path, is_task_mode=True, epoch=epoch,
+        source=SOURCE_RESUME, inherit_elapsed=inherit_elapsed)
     return _build_stream_response(controller, ok, success_msg="直播已恢复")
 
 
@@ -206,8 +238,17 @@ async def confirm_face_verify(x_operation_token: str = Header(default=None, alia
     if not controller:
         raise HTTPException(status_code=500, detail="直播控制器未初始化")
     _begin_operation(controller, x_operation_token)
-    controller.confirm_face_verify()
-    return {'success': True, 'message': '验证状态已确认'}
+    run_id = (getattr(controller, '_current_run_id', '')
+              or getattr(controller, '_pending_run_id', '')
+              or getattr(getattr(controller, 'state', None), 'run_id', '') or '')
+    confirmed = controller.confirm_face_verify(
+        run_id=run_id,
+        room_id=getattr(controller, 'current_room_id', None),
+        epoch=getattr(controller, '_control_epoch', None))
+    return {
+        'success': bool(confirmed),
+        'message': '验证状态已确认' if confirmed
+        else '确认链接已过期：该会话已结束或被新的会话取代'}
 
 
 def _stop_live_sync(x_operation_token: str = None, target_intent: Optional[int] = None):
@@ -280,11 +321,20 @@ async def clear_live_state():
     controller = get_live_controller()
     if not controller:
         raise HTTPException(status_code=500, detail="直播控制器未初始化")
-    controller.state.is_streaming = False
-    controller.state.current_zone = ''
-    controller.state.elapsed_seconds = 0
-    controller.state.duration_seconds = 0
-    controller.state.save()
+    def clear():
+        lock = getattr(controller, '_start_lock', None)
+        if lock is None:
+            if controller.is_streaming or getattr(controller, '_is_starting', False):
+                return False
+            controller.state.stop_streaming(preserve=False)
+            return True
+        with lock:
+            if controller.is_streaming or getattr(controller, '_is_starting', False):
+                return False
+            controller.state.stop_streaming(preserve=False)
+            return True
+    if not await _run_blocking(clear):
+        return {'success': False, 'message': '直播正在运行或启动中，不能清空状态'}
     return {'success': True, 'message': '任务状态已清空'}
 
 
@@ -311,7 +361,20 @@ async def reload_live_state():
     controller = get_live_controller()
     if not controller:
         raise HTTPException(status_code=500, detail="直播控制器未初始化")
-    controller.state.reload()
+    def reload_state():
+        lock = getattr(controller, '_start_lock', None)
+        if lock is None:
+            if controller.is_streaming or getattr(controller, '_is_starting', False):
+                return False
+            controller.state.reload()
+            return True
+        with lock:
+            if controller.is_streaming or getattr(controller, '_is_starting', False):
+                return False
+            controller.state.reload()
+            return True
+    if not await _run_blocking(reload_state):
+        return {'success': False, 'message': '直播正在运行或启动中，不能重新加载状态'}
     s = controller.state
     return {
         'success': True,
@@ -331,7 +394,23 @@ async def update_live_state(data: dict):
     controller = get_live_controller()
     if not controller:
         raise HTTPException(status_code=500, detail="直播控制器未初始化")
-    changed = controller.state.update_state(**data)
+    if data.get('is_streaming') is True:
+        return {'success': False, 'message': '不能通过状态编辑伪造在播会话'}
+
+    def update_state():
+        lock = getattr(controller, '_start_lock', None)
+        if lock is None:
+            if controller.is_streaming or getattr(controller, '_is_starting', False):
+                return None
+            return controller.state.update_state(**data)
+        with lock:
+            if controller.is_streaming or getattr(controller, '_is_starting', False):
+                return None
+            return controller.state.update_state(**data)
+
+    changed = await _run_blocking(update_state)
+    if changed is None:
+        return {'success': False, 'message': '直播正在运行或启动中，不能编辑恢复状态'}
     s = controller.state
     return {
         'success': True,

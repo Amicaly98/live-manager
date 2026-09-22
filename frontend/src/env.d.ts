@@ -22,7 +22,7 @@ declare global {
       isElectron: boolean
       onConfirmClose: (callback: () => void) => void
       onTrayQuit: (callback: () => void) => void
-      confirmQuit: (stopLive: boolean) => Promise<void>
+      confirmQuit: (stopLive: boolean) => Promise<{ success: boolean }>
       forceQuit: () => void
     }
   }

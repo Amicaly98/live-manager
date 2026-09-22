@@ -33,6 +33,9 @@ Menu.setApplicationMenu(null);
 let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
 let _forceQuit = false;
+let quitCleanup: Promise<boolean> | null = null;
+let quitCleanupComplete = false;
+let quitCleanupSucceeded = false;
 
 // 后端地址
 const BACKEND_HOST = '127.0.0.1';
@@ -306,6 +309,57 @@ const lifecycle = new BackendLifecycle({
   },
 });
 
+/**
+ * E2/D2：所有退出入口共用同一条本地 owner 收尾链。
+ *
+ * The first exit intent wins.  A later before-quit/force-quit event only waits
+ * for the already-running cleanup, so the owned backend is never left behind
+ * and a second stop request cannot race the first one.
+ */
+function requestManagedQuit(stopPlatform: boolean, timeoutMs: number): Promise<boolean> {
+  if (quitCleanup !== null) return quitCleanup;
+
+  _forceQuit = true;
+  (app as any).isQuitting = true;
+  lifecycle.setQuitting();
+  quitCleanupComplete = false;
+  quitCleanupSucceeded = false;
+
+  quitCleanup = (async () => {
+    if (stopPlatform) {
+      try {
+        await fetch(`http://${BACKEND_HOST}:${BACKEND_PORT}/api/live/stop`, {
+          method: 'POST', signal: AbortSignal.timeout(5000),
+        });
+      } catch { /* 平台停播失败仍继续回收本地 owner */ }
+    }
+    return lifecycle.stop(true, timeoutMs, stopPlatform);
+  })().catch(err => {
+    console.error('[Electron] 退出收尾失败:', err);
+    return false;
+  }).then(reclaimed => {
+    quitCleanupComplete = true;
+    quitCleanupSucceeded = reclaimed;
+    return reclaimed;
+  });
+  return quitCleanup;
+}
+
+function resetFailedQuitAttempt(): void {
+  quitCleanup = null;
+  quitCleanupComplete = false;
+  quitCleanupSucceeded = false;
+  _forceQuit = false;
+  (app as any).isQuitting = false;
+}
+
+function showQuitFailure(): void {
+  dialog.showErrorBox(
+    '无法退出',
+    '本应用后端进程尚未确认退出，应用保持运行。请稍后重试退出。',
+  );
+}
+
 // ==================== 窗口管理 ====================
 
 function createWindow(): void {
@@ -391,8 +445,13 @@ function createTray(): void {
           mainWindow.focus()
           mainWindow.webContents.send('tray-quit')
         } else {
-          _forceQuit = true
-          app.quit()
+          void requestManagedQuit(false, 2000).then(reclaimed => {
+            if (reclaimed) app.quit()
+            else {
+              resetFailedQuitAttempt()
+              showQuitFailure()
+            }
+          })
         }
       }
     }
@@ -436,24 +495,24 @@ function setupIPC(): void {
   // 优雅关闭带 stop_live=false，后端只保存进度并回收自建本地进程；
   // 外部 OBS 推流不受影响。
   ipcMain.handle('confirm-quit', async (_event, stopLive: boolean) => {
-    _forceQuit = true;
-    lifecycle.setQuitting();
-    if (stopLive) {
-      try {
-        await fetch(`http://${BACKEND_HOST}:${BACKEND_PORT}/api/live/stop`, {
-          method: 'POST', signal: AbortSignal.timeout(5000),
-        });
-      } catch { /* */ }
+    const reclaimed = await requestManagedQuit(stopLive, 10000);
+    if (reclaimed) app.quit();
+    else {
+      resetFailedQuitAttempt();
+      showQuitFailure();
     }
-    await lifecycle.stop(true, 10000, stopLive);
-    app.quit();
+    return { success: reclaimed };
   });
 
-  // 强制退出（不弹确认，直接退）
+  // 强制退出（不弹确认，但仍回收本应用自建后端；不发送平台停播）
   ipcMain.on('force-quit', () => {
-    _forceQuit = true;
-    lifecycle.setQuitting();
-    app.quit();
+    void requestManagedQuit(false, 10000).then(reclaimed => {
+      if (reclaimed) app.quit()
+      else {
+        resetFailedQuitAttempt()
+        showQuitFailure()
+      }
+    });
   });
 
   // 选择文件/目录
@@ -497,7 +556,12 @@ function setupIPC(): void {
 
 // ==================== 应用生命周期 ====================
 
-app.whenReady().then(async () => {
+async function initializeAfterReady(): Promise<void> {
+  // A quit can arrive before Electron resolves whenReady().  Do not let a
+  // late ready callback create a window or start a backend after ownership has
+  // already moved to the exit path.
+  if (_forceQuit || lifecycle.isQuitting()) return;
+
   setupIPC();
 
   // E3：初始化数据目录（失败则提示并继续——后端会给健康检查错误）
@@ -507,13 +571,28 @@ app.whenReady().then(async () => {
     dialog.showErrorBox('数据目录不可用', `无法创建或写入数据目录：\n${getDataDir()}\n\n${err}`);
   }
 
+  if (_forceQuit || lifecycle.isQuitting()) return;
+
   // E1/E2：端口可用性预检（未知占用 → 明确报错，不杀进程）
   const portErr = await ensurePortAvailable();
   if (portErr) {
     dialog.showErrorBox('端口被占用', portErr);
+    // A foreign listener blocks this instance.  Do not continue into a
+    // second spawn attempt or create a misleading window after the error.
+    const reclaimed = await requestManagedQuit(false, 2000);
+    if (reclaimed) app.quit();
+    else {
+      resetFailedQuitAttempt();
+      showQuitFailure();
+    }
+    return;
   }
 
+  if (_forceQuit || lifecycle.isQuitting()) return;
+
   await lifecycle.start();
+
+  if (_forceQuit || lifecycle.isQuitting()) return;
 
   createWindow();
   createTray();
@@ -544,7 +623,7 @@ app.whenReady().then(async () => {
       mainWindow.show();
     }
   });
-});
+}
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {
@@ -555,14 +634,23 @@ app.on('window-all-closed', () => {
 // E2/D2：before-quit 兜底——正常退出路径（confirm-quit）已完整收尾；
 // 其它退出来源（window-all-closed、更新安装）在此标记退出并尽力回收。
 // 属无人值守路径：不发送平台命令（stop_live=false），只回收本地进程。
-app.on('before-quit', () => {
-  (app as any).isQuitting = true;
-  _forceQuit = true;
-  if (!lifecycle.isQuitting()) {
-    lifecycle.setQuitting();
-    // 有界异步收尾：不阻塞退出，但给后端 2 秒优雅退出窗口
-    void lifecycle.stop(true, 2000, false);
+app.on('before-quit', (event) => {
+  // A second before-quit can arrive while the first cleanup is still
+  // pending.  Keep Electron blocked until that same owner chain completes;
+  // only the final app.quit() from the completion callback is allowed through.
+  if (quitCleanup !== null) {
+    if (!quitCleanupComplete || !quitCleanupSucceeded) event.preventDefault();
+    return;
   }
+  event.preventDefault();
+  // 无人值守退出不发送平台停播，只回收本应用自建的后端进程树。
+  void requestManagedQuit(false, 2000).then(reclaimed => {
+    if (reclaimed) app.quit()
+    else {
+      resetFailedQuitAttempt()
+      showQuitFailure()
+    }
+  });
 });
 
 // 防止多个实例
@@ -577,4 +665,7 @@ if (!gotLock) {
       mainWindow.focus();
     }
   });
+  // The lock must be acquired before registering this callback.  In a second
+  // instance, app.quit() above therefore cannot run startup/port/backend code.
+  app.whenReady().then(initializeAfterReady);
 }

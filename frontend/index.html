@@ -2,14 +2,43 @@
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <!-- 相对引用是 Electron file:// 加载 dist/index.html 的必要条件。 -->
+    <link rel="icon" type="image/svg+xml" href="./vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' https: data:; connect-src 'self' http://127.0.0.1:* https://api.bilibili.com https://api.live.bilibili.com https://passport.bilibili.com; font-src 'self' data:" />
     <meta name="referrer" content="no-referrer" />
     <title>直播控制系统</title>
+    <!--
+      静态启动外壳：入口 bundle 未加载或初始化挂起时也必须有可见状态。
+      CSP 只允许 inline style，不允许 inline script；重试/重载由 Vue 根层接管。
+    -->
+    <style>
+      #boot-shell{display:flex;align-items:center;justify-content:center;min-height:100vh;padding:24px;box-sizing:border-box;background:#f5f7fa;font-family:"Helvetica Neue",Helvetica,Arial,"Microsoft YaHei",sans-serif}
+      #boot-shell .boot-card{max-width:420px;width:100%;padding:32px 28px;border-radius:12px;background:#fff;box-shadow:0 2px 12px rgba(0,0,0,.08);text-align:center}
+      #boot-shell .boot-title{font-size:20px;font-weight:600;color:#303133;margin-bottom:20px}
+      #boot-shell .boot-spinner{width:28px;height:28px;margin:0 auto 14px;border:3px solid #e4e7ed;border-top-color:#00a1d6;border-radius:50%;animation:boot-shell-spin .9s linear infinite}
+      @keyframes boot-shell-spin{to{transform:rotate(360deg)}}
+      #boot-shell .boot-line{font-size:15px;color:#303133}
+      #boot-shell .boot-hint{margin-top:8px;font-size:13px;color:#909399;line-height:1.6}
+      #boot-shell a{color:#00a1d6;text-decoration:none}
+    </style>
   </head>
   <body>
-    <div id="app"></div>
+    <div id="app">
+      <div id="boot-shell">
+        <div class="boot-card">
+          <div class="boot-title">直播控制系统</div>
+          <div class="boot-spinner"></div>
+          <div class="boot-line">正在连接…</div>
+          <div class="boot-hint">长时间停在这里可尝试<a href="./index.html">重新加载</a></div>
+        </div>
+      </div>
+    </div>
+    <noscript>
+      <div style="padding:24px;text-align:center;font-family:sans-serif">
+        本页面需要启用 JavaScript 才能使用。
+      </div>
+    </noscript>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

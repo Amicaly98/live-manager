@@ -48,9 +48,23 @@ type RetryConfig = InternalAxiosRequestConfig & {
   signal?: AbortSignal
   /** 标记"这是内部取票请求"：响应错误不弹通用 toast，由取票逻辑分类处理。 */
   _ticketRequest?: boolean
+  /** 已有服务端票据，可安全识别同一控制意图的传输层重放。 */
+  _replaySafe?: boolean
+  /** 一次逻辑请求允许实际发出的总次数（含首次）。 */
+  _maxAttempts?: number
 }
 
 let instance: AxiosInstance | null = null
+
+/** 没有服务端重放票据的写请求最多重试两次，之后结果必须待确认。 */
+const MAX_UNSAFE_WRITE_RETRIES = 2
+
+function markResultUnknown(error: unknown, config?: RetryConfig): unknown {
+  const target = error as Record<string, unknown>
+  target.resultUnknown = true
+  if (config) target.requestUrl = config.url
+  return error
+}
 
 /** 取消错误判断：取消不重试，也不提示网络错误。 */
 function isCancellation(error: unknown): boolean {
@@ -159,6 +173,7 @@ function getInstance(): AxiosInstance {
           const ticket = await obtainServerTicket(config.signal)
           if (ticket) {
             headers[OPERATION_TOKEN_HEADER] = ticket
+            ;(config as RetryConfig)._replaySafe = true
             return config
           }
           // 只有旧后端（404）才会走到这里：明确的兼容边界。
@@ -187,6 +202,19 @@ function getInstance(): AxiosInstance {
       const config = error.config as RetryConfig | undefined
 
       if (!error.response && config) {
+        const attemptsMade = (config._retryCount || 0) + 1
+        if (typeof config._maxAttempts === 'number'
+            && attemptsMade >= config._maxAttempts) {
+          return Promise.reject(error)
+        }
+        const method = String(config.method || 'get').toLowerCase()
+        const isWrite = method !== 'get' && method !== 'head' && method !== 'options'
+        if (isWrite && !config._replaySafe
+            && (config._retryCount || 0) >= MAX_UNSAFE_WRITE_RETRIES) {
+          markResultUnknown(error, config)
+          ElMessage.warning('网络中断：该操作结果待确认，恢复后请刷新页面核对')
+          return Promise.reject(error)
+        }
         // 网络错误（断线）——持续重试，指数退避上限 30s，可用 signal 取消。
         // 关键：经**同一实例**重试（不是全局 axios），重试请求再次进入
         // 请求/响应拦截器——票据复用与错误分类全部保留。
@@ -281,20 +309,49 @@ class ApiWrapper {
     this.axios = getInstance()
   }
 
-  async get<T = unknown>(url: string, params?: Record<string, unknown>, options?: { signal?: AbortSignal }): Promise<T> {
-    return this.axios.get(url, { params, signal: options?.signal }) as Promise<T>
+  async get<T = unknown>(url: string, params?: Record<string, unknown>, options?: { signal?: AbortSignal; maxAttempts?: number }): Promise<T> {
+    const config = { params, signal: options?.signal } as InternalAxiosRequestConfig
+    if (typeof options?.maxAttempts === 'number') {
+      ;(config as unknown as RetryConfig)._maxAttempts = options.maxAttempts
+    }
+    return this.axios.get(url, config) as Promise<T>
   }
 
   async post<T = unknown>(url: string, data?: unknown, options?: { signal?: AbortSignal }): Promise<T> {
     return this.axios.post(url, data, { signal: options?.signal }) as Promise<T>
   }
 
-  async put<T = unknown>(url: string, data?: unknown): Promise<T> {
-    return this.axios.put(url, data) as Promise<T>
+  async put<T = unknown>(url: string, data?: unknown, options?: { signal?: AbortSignal; headers?: Record<string, string> }): Promise<T> {
+    return this.axios.put(url, data, {
+      signal: options?.signal,
+      headers: options?.headers,
+    }) as Promise<T>
+  }
+
+  async postForm<T = unknown>(url: string, formData: FormData, options?: { signal?: AbortSignal }): Promise<T> {
+    // The shared instance defaults to JSON.  Leaving that default on a
+    // FormData request makes Axios/browser serialize the File as `{}` and
+    // removes the multipart boundary.  `undefined` clears the inherited
+    // header so the browser supplies `multipart/form-data; boundary=...`.
+    // The same Axios config still carries the operation token and retry
+    // counter, so a transport retry reuses the original ticket.
+    return this.axios.post(url, formData, {
+      signal: options?.signal,
+      headers: { 'Content-Type': undefined },
+    }) as Promise<T>
   }
 
   async delete<T = unknown>(url: string): Promise<T> {
     return this.axios.delete(url) as Promise<T>
+  }
+
+  async getBlob(url: string): Promise<Blob> {
+    const data = await (this.axios.get(url, {
+      responseType: 'arraybuffer',
+    }) as unknown as Promise<ArrayBuffer | Uint8Array>)
+    return new Blob([data as unknown as BlobPart], {
+      type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    })
   }
 }
 

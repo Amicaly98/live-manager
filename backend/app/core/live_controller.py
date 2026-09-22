@@ -12,11 +12,13 @@ import time
 import random
 import logging
 import secrets
+import uuid
 import threading
 import subprocess
 import hashlib
 import collections
 import urllib.parse
+import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict, TYPE_CHECKING
@@ -94,8 +96,23 @@ class BilibiliApi:
         self.cookie_file = Path(cookie_file) if cookie_file else cookies_file_path()
         # 网络重试上下文：后台线程可用 retry_network_until_cancelled 注入
         # 取消事件实现"无限重试直到恢复/取消"；面板查询保持有限重试。
-        self._retry_context = type('_RetryCtx', (), {'cancel': None})()
+        self._retry_context = type('_RetryCtx', (), {
+            'cancel': None, 'cookies_override': None})()
+        self._cookie_lock = threading.RLock()
+        self._auth_revocations = {}
         self._load_cookies()
+
+    def _cookies_mutex(self):
+        """Return the credential lock (also for minimal test doubles)."""
+        lock = self.__dict__.get('_cookie_lock')
+        if lock is None:
+            lock = threading.RLock()
+            self._cookie_lock = lock
+        return lock
+
+    def _cookie_snapshot(self) -> dict:
+        with self._cookies_mutex():
+            return dict(self.cookies)
 
     def _load_cookies(self):
         if not self.cookie_file.exists():
@@ -103,32 +120,87 @@ class BilibiliApi:
         try:
             with open(self.cookie_file, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-            self.cookies = data.get('cookies', {})
+            loaded = data.get('cookies', {})
+            self.cookies = dict(loaded) if isinstance(loaded, dict) else {}
+            revoked = data.get('logout_tokens', {})
+            self._auth_revocations = dict(revoked) if isinstance(revoked, dict) else {}
             if self.cookies:
                 logger.debug(f" 已加载 {len(self.cookies)} 个 cookies")
         except Exception as e:
             logger.debug(f" 加载 cookies 失败：{e}")
 
-    def _save_cookies(self):
-        if not self.cookies:
-            return
+    def _save_cookies(self, cookies: dict = None) -> bool:
+        """Atomically persist credentials, including an empty logout state."""
+        snapshot = self._cookie_snapshot() if cookies is None else dict(cookies)
+        temp_name = None
         try:
-            with open(self.cookie_file, 'w', encoding='utf-8') as f:
+            self.cookie_file.parent.mkdir(parents=True, exist_ok=True)
+            fd, temp_name = tempfile.mkstemp(
+                prefix=f'.{self.cookie_file.name}.', suffix='.tmp',
+                dir=str(self.cookie_file.parent))
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
                 json.dump({
-                    'cookies': self.cookies,
+                    'cookies': snapshot,
+                    'logout_tokens': dict(getattr(self, '_auth_revocations', {}) or {}),
                     'last_update': datetime.now().isoformat()
                 }, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temp_name, self.cookie_file)
+            temp_name = None
+            return True
         except Exception as e:
-            logger.debug(f" 保存 cookies 失败：{e}")
+            logger.warning(f" 保存 cookies 失败，认证状态未确认落盘：{e}")
+            if temp_name:
+                try:
+                    Path(temp_name).unlink(missing_ok=True)
+                except OSError:
+                    pass
+            return False
 
-    def update_cookies(self, cookies: dict):
-        self.cookies.update(cookies)
-        self._save_cookies()
-        logger.info(f" Cookies 已更新（共{len(self.cookies)}项）")
+    def update_cookies(self, cookies: dict) -> bool:
+        if not isinstance(cookies, dict):
+            return False
+        with self._cookies_mutex():
+            candidate = dict(self.cookies)
+            candidate.update(cookies)
+            if not self._save_cookies(candidate):
+                return False
+            self.cookies = candidate
+        logger.info(f" Cookies 已更新（共{len(candidate)}项）")
+        return True
+
+    def replace_cookies(self, cookies: dict) -> bool:
+        """Replace the complete account snapshot after it has been verified."""
+        if not isinstance(cookies, dict):
+            return False
+        with self._cookies_mutex():
+            candidate = dict(cookies)
+            if not self._save_cookies(candidate):
+                return False
+            self.cookies = candidate
+        logger.info(f" Cookies 已替换（共{len(candidate)}项）")
+        return True
+
+    def get_auth_revocations(self) -> dict:
+        with self._cookies_mutex():
+            return dict(getattr(self, '_auth_revocations', {}) or {})
+
+    def save_auth_revocations(self, records: dict) -> bool:
+        if not isinstance(records, dict):
+            return False
+        with self._cookies_mutex():
+            previous = dict(getattr(self, '_auth_revocations', {}) or {})
+            self._auth_revocations = dict(records)
+            if self._save_cookies(self._cookie_snapshot()):
+                return True
+            self._auth_revocations = previous
+            return False
 
     def is_logged_in(self) -> bool:
         required_keys = ['SESSDATA', 'bili_jct', 'DedeUserID']
-        return all(key in self.cookies for key in required_keys)
+        snapshot = self._cookie_snapshot()
+        return all(key in snapshot for key in required_keys)
 
     def validate_login(self) -> bool:
         if not self.is_logged_in():
@@ -192,7 +264,8 @@ class BilibiliApi:
             resp = None
             try:
                 url = url.strip()
-                req_cookies = self.cookies.copy()
+                override = getattr(self._retry_context, 'cookies_override', None)
+                req_cookies = dict(override) if override is not None else self._cookie_snapshot()
                 if 'buvid3' not in req_cookies:
                     buvid3 = self._get_buvid3_simple()
                     if buvid3:
@@ -349,7 +422,7 @@ class BilibiliApi:
 
     def get_csrf(self) -> Optional[str]:
         """从 cookies 中获取 csrf token"""
-        return self.cookies.get('bili_jct')
+        return self._cookie_snapshot().get('bili_jct')
 
     def get_room_id_by_uid(self, uid: int) -> Tuple[bool, dict]:
         """通过 UID 获取直播间 ID（多接口容错）"""
@@ -389,11 +462,24 @@ class BilibiliApi:
             pass
         return False, {'code': -1, 'msg': '无法获取直播间 ID'}
 
-    def clear_cookies(self):
-        """清除 cookies"""
-        self.cookies = {}
-        self._save_cookies()
+    def clear_cookies(self) -> bool:
+        """Clear credentials only after the empty snapshot is durably saved."""
+        with self._cookies_mutex():
+            if not self._save_cookies({}):
+                return False
+            self.cookies = {}
         logger.info(" Cookies 已清除")
+        return True
+
+    @contextmanager
+    def cookie_context(self, cookies: dict):
+        """Use candidate credentials for the current thread without committing."""
+        previous = getattr(self._retry_context, 'cookies_override', None)
+        self._retry_context.cookies_override = dict(cookies)
+        try:
+            yield
+        finally:
+            self._retry_context.cookies_override = previous
 
     def get_push_url(self, room_id: int) -> Tuple[bool, dict]:
         """获取推流地址（RTMP 地址 + 推流码）"""
@@ -592,110 +678,600 @@ except ImportError:
         return ''
 
 # ==================== LiveState（直播状态持久化） ====================
-class LiveState:
-    """直播状态持久化管理器"""
+STATE_SCHEMA_VERSION = 2
 
-    def __init__(self, state_file: str = None):
+#: 会话来源：新建 / 恢复 / 重连 / 手动。恢复与重连都不允许重抽时长。
+SOURCE_NEW = 'new'
+SOURCE_RESUME = 'resume'
+SOURCE_RECONNECT = 'reconnect'
+SOURCE_MANUAL = 'manual'
+
+#: 阶段：不是"画面健康"的同义词，只描述控制链路走到哪一步。
+PHASE_IDLE = 'idle'
+PHASE_STARTING = 'starting'
+PHASE_LIVE = 'live'
+PHASE_RECOVERING = 'recovering'
+PHASE_STOPPING = 'stopping'
+PHASE_BLOCKED = 'blocked'
+
+# ==================== 有效直播时长（确认区间 + 待确认区间） ====================
+# 目标：每日任务必须累计"平台确认过的连续在播时间"才完成，而不是"会话经过了多久"。
+# 只有三个值，各自只有一个解释，不再和墙钟总时长混用：
+#
+# - ``confirmed``：累计**有效**时长（权威值）。只有当前会话所有者能推进；用于结算
+#   与持久化。上次落盘后新增的区间必须重新经平台确认才算数。
+# - ``pending``：最近一次可信观察之后的**待确认**区间。只允许有界显示推算，
+#   不参与结算，不落盘。
+# - **固定目标**：本次启动意图确定的 duration_seconds/duration_known。断流、恢复、
+#   重启都不重新抽取（沿用既有随机额外时长，一次确定）。
+#
+# 观察新鲜度：一条"平台在播"的响应只能证明**该次查询期间**房间是在播的，证明不了
+# 两次查询之间一直正常。因此给相邻两次可信观察的间隔设上限，超过就当作未知区间
+# 丢弃、只重立锚点，绝不把长时间空档整段补记（宁可多播一点，也不要在没播够时结算）。
+#
+# 入账间隔上限的推导：监控循环每 ``monitor_interval`` 秒做一次状态查询，单次查询
+# 在传输层重试后最多花掉 EFFECTIVE_QUERY_BUDGET_SECONDS。正常节奏下相邻两次
+# "在播"返回之间的间隔 ≈ monitor_interval + 查询耗时，所以上限取
+#     max(下限, 2 × monitor_interval + 查询预算)
+# 2× 用来覆盖"一次查询变慢把下一次检查整体推迟"的情况。默认 monitor_interval=30s
+# 时上限 = 90s：代价是"最多 90 秒的未观察区间仍会被当作在播"；收益是既不会因为一次
+# 慢查询把正常直播判成断流，也不会把分钟级的线程阻塞整段补记。
+EFFECTIVE_QUERY_BUDGET_SECONDS = 30.0
+EFFECTIVE_MIN_CREDIT_GAP_SECONDS = 90.0
+
+# 计时状态：只用于让面板选择一句简短文案，不承载任何区间/补偿明细。
+TIMER_RUNNING = 'running'
+TIMER_PAUSED_CLOSED = 'paused_closed'
+TIMER_PAUSED_UNKNOWN = 'paused_unknown'
+TIMER_PAUSED_BLOCKED = 'paused_blocked'
+
+
+def effective_credit_limit(monitor_interval: float) -> float:
+    """相邻两次可信观察之间最多可入账的间隔（秒）。公式与代价见上方注释。"""
+    try:
+        interval = float(monitor_interval)
+    except (TypeError, ValueError):
+        interval = 0.0
+    if interval < 0:
+        interval = 0.0
+    return max(EFFECTIVE_MIN_CREDIT_GAP_SECONDS,
+               interval * 2.0 + EFFECTIVE_QUERY_BUDGET_SECONDS)
+
+
+def _monotonic() -> float:
+    """计时用的单调时钟（唯一读取点，可注入以便确定性验证）。
+
+    有效时长、观察新鲜度、监控周期都以它为准：系统时钟被回拨或前跳都不会让
+    进度倒退或翻倍。测试可以把它替换成"只在被推进时前进"的时钟，从而用有限的
+    Event 交错复现多小时场景，而不必真的等下去。
+    """
+    return time.monotonic()
+
+
+class EffectiveClock:
+    """有效时长计时（单一所有权：只有当前会话所有者能推进或暂停）。
+
+    计时**锚点**由控制器持有（``LiveController._segment_monotonic``），避免"锚点与
+    累计值各存一份、彼此漂移"：
+
+    - ``anchor is None`` ⇒ 暂停：没有开放区间，confirmed 不再增长；
+    - ``anchor is not None`` ⇒ 正在计时，pending = now - anchor。
+
+    本类只保存 confirmed 与新鲜度记录，自己不读时钟（``now`` 一律由调用方传入），
+    因此可以用可注入的单调时钟做确定性验证。
+    """
+
+    __slots__ = ('confirmed', 'credit_limit', 'origin', 'paused_reason',
+                 'last_request_start', 'last_ok_return')
+
+    def __init__(self, credit_limit: float = EFFECTIVE_MIN_CREDIT_GAP_SECONDS,
+                 origin: str = 'none'):
+        self.confirmed: float = 0.0
+        self.credit_limit: float = float(credit_limit)
+        # 'none'（无进度）| 'live'（本次进程内确认）| 'legacy'（旧状态迁移基线）
+        self.origin: str = origin
+        self.paused_reason: str = ''
+        self.last_request_start: Optional[float] = None
+        self.last_ok_return: Optional[float] = None
+
+    def reset(self, confirmed: float = 0.0, origin: str = 'none',
+              credit_limit: Optional[float] = None) -> None:
+        """重置为一次会话的起点（新开播/恢复继承/停止）。"""
+        self.confirmed = max(0.0, float(confirmed or 0))
+        self.origin = origin
+        if credit_limit is not None:
+            self.credit_limit = float(credit_limit)
+        self.paused_reason = ''
+        self.last_request_start = None
+        self.last_ok_return = None
+
+    def set_confirmed(self, seconds: float, origin: str = 'live') -> float:
+        """抬高权威累计值（恢复继承 / 旧状态迁移 / 夹具注入）。
+
+        只增不减：旧状态里的合法进度一次性继承，不清零、不倒扣历史。
+        """
+        value = max(0.0, float(seconds or 0))
+        if value > self.confirmed:
+            self.confirmed = value
+            self.origin = origin
+        return self.confirmed
+
+    @staticmethod
+    def pending(anchor: Optional[float], now: float) -> float:
+        """待确认区间长度（秒）；没有锚点（暂停）时为 0。"""
+        if anchor is None:
+            return 0.0
+        return max(0.0, float(now) - float(anchor))
+
+    def observe_ok(self, anchor: Optional[float], request_start: float,
+                   returned: float) -> Tuple[Optional[float], float, str]:
+        """处理一次**可信在播观察**（平台明确返回 live_status == 1）。
+
+        返回 ``(新锚点, 本次并入 confirmed 的秒数, 结论)``：
+
+        - ``'anchor'``：此前没有锚点（新会话 / 恢复 / 暂停后首次在播）且**本次回复新鲜**
+          → 只立锚点，不补算启动或离线等待；
+        - ``'credited'``：与上一段连续、且间隔在可入账上限内 → 整段并入 confirmed，
+          并以本次返回时刻重立锚点；
+        - ``'dropped_stale'``：**本次响应本身太晚返回**（超过查询预算）→ 这个结果已经
+          不代表"当时平台在播"：丢弃上一段，**并且不立新锚点**（保持无锚点，等下一次
+          新鲜成功）；
+        - ``'dropped_gap'``：本次回复新鲜，但距上次可信观察太久（超过可入账间隔上限）
+          → 丢弃上一段，**可以**以本次返回时刻重立锚点（回复新鲜就证明"现在在播"）。
+
+        锚点取**响应返回时刻**而不是请求开始时刻：响应只能证明"返回前后平台说在播"，
+        按更保守的一端起算，避免把"还没观察到"的时间也记成有效时长。
+
+        **新鲜度必须最先判断**（在"没有锚点就立锚"之前）：否则一条早已失去新鲜度的成功
+        响应会成为下一段的起点，等于拿过期结论给接下来的整整一个入账上限授权——它证明
+        不了等待期间平台在播，却让这段未知时间可能被计入任务。恢复/新会话的第一次观察
+        同样受这条规则约束（无锚点不是免检通道）。
+        """
+        self.last_request_start = float(request_start)
+        if float(returned) - float(request_start) > EFFECTIVE_QUERY_BUDGET_SECONDS:
+            # 过期结果：既不并入 confirmed，也不立锚、不登记为"最后可信成功"。
+            # 返回 None 让调用方保持无锚点（暂停），下一次新鲜成功才重新开始计时。
+            self.paused_reason = TIMER_PAUSED_UNKNOWN
+            return None, 0.0, 'dropped_stale'
+        self.last_ok_return = float(returned)
+        self.paused_reason = ''
+        if anchor is None:
+            return float(returned), 0.0, 'anchor'
+        gap = float(returned) - float(anchor)
+        if gap < 0:
+            # 锚点比返回时刻还晚（时钟被注入/替换）：不产生负区间，重立锚点。
+            return float(returned), 0.0, 'anchor'
+        if gap > self.credit_limit:
+            return float(returned), 0.0, 'dropped_gap'
+        self.confirmed += gap
+        return float(returned), gap, 'credited'
+
+    def pause(self, reason: str, anchor: Optional[float],
+              at: Optional[float] = None) -> float:
+        """暂停计时（明确关闭 / 查询未知 / 恢复阻塞）：丢弃待确认区间，保留 confirmed。
+
+        返回被丢弃的待确认秒数（0 表示本来就没有开放区间）。锚点由调用方（控制器）
+        清空——丢弃与清锚点是同一件事的两面，必须一起做，所以这里也把它显式收进来。
+        """
+        dropped = self.pending(anchor, at if at is not None else 0.0)
+        self.paused_reason = reason
+        return dropped
+
+    def snapshot(self, anchor: Optional[float], now: float) -> dict:
+        """给 API 的计时视图：权威值 + 有界外推信息。"""
+        pending = self.pending(anchor, now)
+        remaining = max(0.0, self.credit_limit - pending) if anchor is not None else 0.0
+        return {
+            'confirmed': self.confirmed,
+            'pending': pending,
+            'pending_limit': self.credit_limit,
+            'pending_remaining': remaining,
+            'extrapolatable': bool(anchor is not None and remaining > 0),
+            'state': TIMER_RUNNING if anchor is not None else (
+                self.paused_reason or TIMER_PAUSED_UNKNOWN),
+        }
+
+
+class LiveState:
+    """直播状态持久化管理器（会话快照 + 原子保存）。
+
+    字段含义（每个字段只有一个解释）：
+    - ``run_id``：本场直播（会话）身份。换任务/新开播都换；重连不变。
+    - ``source_mode``：这次会话是 new / resume / reconnect / manual。
+    - ``duration_known``：目标时长是否已知。**未知 != 0**，0 只表示业务"不限时"。
+    - ``effective_seconds``：累计**有效**时长（权威值，保留小数精度，避免每次检查
+      取整造成持续少算）。**只有平台确认过的区间才算数**。
+    - ``elapsed_seconds``/``accumulated_seconds``：``effective_seconds`` 的整数
+      兼容别名（旧版本、回退目标 cc191db、跨仓契约夹具都只认它）。别名**可写**：
+      给 ``elapsed_seconds`` 赋值会同步改写 ``effective_seconds``，因此任何按旧字段
+      写入的代码都不会与权威值分叉。
+    - ``resumable``：可恢复性由统一判定给出（见 :meth:`resumable`），不再让
+      "分区名非空"与"另一个布尔"各说一套。
+    """
+
+    def __init__(self, state_file: str = "live_state.json"):
         self.state_file = Path(state_file) if state_file else state_file_path()
         self.is_streaming = False
         self.current_zone = ""
+        # 先建权威值，再写兼容别名（别名 setter 会同步到权威值）。
+        # 累计**有效**时长（权威值，保留小数精度）。
+        self.effective_seconds: float = 0.0
+        # 'none' | 'legacy'（旧状态迁移基线）| 'live'
+        self.effective_origin: str = 'none'
         self.elapsed_seconds = 0
         self.room_id = 0
         self.start_time: Optional[str] = None  # ISO 格式
+        # 保留任务进度与允许自动开播是两个独立状态。
+        self.auto_resume = True  # 兼容无此字段的旧状态文件
+
+        self.schema_version = STATE_SCHEMA_VERSION
+        self.run_id: str = ''
+        self.service_instance: str = ''
+        self.session_version: int = 0
+        self.source_mode: str = SOURCE_NEW
+        self.phase: str = PHASE_IDLE
+        self.task_id: Optional[int] = None
+        self.execution_date: Optional[str] = None
+        self.duration_seconds: int = 0
+        self.duration_known: bool = False
+        self.accumulated_seconds: int = 0
+        self.resume_blocked_reason: str = ''
+        self.stop_blocked_reason: str = ''
+        # 状态文件损坏/半写：必须显式暴露，不能解释成"没有任务"。
+        self.corrupt: bool = False
+        self._last_save_error: str = ''
         self._load()
 
+    # ---------- 兼容别名（可读写，始终与权威值一致） ----------
+
+    @property
+    def elapsed_seconds(self) -> int:
+        """已确认有效时长的整数别名（展示/兼容用）。"""
+        return int(getattr(self, 'effective_seconds', 0.0) or 0.0)
+
+    @elapsed_seconds.setter
+    def elapsed_seconds(self, value):
+        # 任何按旧字段写入的代码（旧版本回退、外部手工改状态、跨仓契约夹具）
+        # 都必须落到权威值上，否则"写 elapsed、读 effective"会分叉成两份进度。
+        self.effective_seconds = _safe_float(value, 0.0)
+
+    # ---------- 持久化 ----------
+
     def _load(self):
-        if self.state_file.exists():
-            try:
-                with open(self.state_file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                # 检查是否跨日，如果是则丢弃旧状态
-                last_update = data.get('last_update', '')
-                if last_update:
-                    try:
-                        last_date = datetime.fromisoformat(last_update).date()
-                        if last_date != date.today():
-                            logger.info(f"状态文件来自 {last_date}（非今天），已弃置")
-                            self.save()
-                            return
-                    except ValueError:
-                        pass
-                self.is_streaming = data.get('is_streaming', False)
-                self.current_zone = data.get('current_zone', '')
-                self.elapsed_seconds = data.get('elapsed_seconds', 0)
-                self.room_id = data.get('room_id', 0)
-                self.duration_seconds = data.get('duration_seconds', 0)
-                self.start_time = data.get('start_time')
-                if self.is_streaming:
-                    logger.debug(f"恢复直播状态：分区={self.current_zone}, 已播={self.elapsed_seconds // 60}分钟")
-            except Exception as e:
-                logger.debug(f" 加载状态文件失败：{e}")
-
-    def save(self):
-        data = {
-            'is_streaming': self.is_streaming,
-            'current_zone': self.current_zone or '',
-            'elapsed_seconds': self.elapsed_seconds,
-            'room_id': self.room_id,
-            'duration_seconds': getattr(self, 'duration_seconds', 0),
-            'start_time': self.start_time or datetime.now().isoformat(),
-            'last_update': datetime.now().isoformat()
-        }
+        if not self.state_file.exists():
+            return
         try:
-            with open(self.state_file, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+            with open(self.state_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
         except Exception as e:
-            logger.error(f" 保存状态失败：{e}")
+            # 文件损坏/写到一半：保留现场并标记，绝不覆盖、绝不解释成"没有任务"。
+            self.corrupt = True
+            self._last_save_error = f'状态文件无法解析：{e}'
+            logger.error(f" 状态文件损坏，已保留现场不做覆盖：{self.state_file}（{e}）")
+            return
+        if not isinstance(data, dict):
+            self.corrupt = True
+            self._last_save_error = '状态文件内容不是对象'
+            logger.error(f" 状态文件内容非法，已保留现场：{self.state_file}")
+            return
+        # 检查是否跨日，如果是则丢弃旧状态
+        last_update = data.get('last_update', '')
+        if last_update:
+            try:
+                last_date = datetime.fromisoformat(last_update).date()
+                if last_date != date.today():
+                    logger.info(f"状态文件来自 {last_date}（非今天），已弃置")
+                    self._reset_memory()
+                    self.save()
+                    return
+            except ValueError:
+                pass
+        self.is_streaming = bool(data.get('is_streaming', False))
+        self.current_zone = data.get('current_zone', '') or ''
+        legacy_elapsed = _safe_int(data.get('elapsed_seconds'), 0)
+        if 'effective_seconds' in data:
+            # 新状态：有效时长是权威值，elapsed/accumulated 是它的兼容别名。
+            self.effective_seconds = _safe_float(data.get('effective_seconds'),
+                                                 float(legacy_elapsed))
+            self.effective_origin = str(data.get('effective_origin') or 'live')
+        else:
+            # 旧状态（无有效时长字段）：把**合法的旧 elapsed** 作为一次性迁移基线
+            # 继承，并标注 legacy 来源。过去这段时间里是否包含断流无法追溯——
+            # 不倒扣历史、不清零、也不改任务完成天数；重启后新增的区间必须重新确认。
+            self.effective_seconds = float(legacy_elapsed)
+            self.effective_origin = 'legacy' if legacy_elapsed > 0 else 'none'
+        self.accumulated_seconds = _safe_int(data.get('accumulated_seconds'),
+                                             self.elapsed_seconds)
+        self.accumulated_seconds = max(self.accumulated_seconds,
+                                       self.elapsed_seconds)
+        self.room_id = _safe_int(data.get('room_id'), 0)
+        self.duration_seconds = _safe_int(data.get('duration_seconds'), 0)
+        # 旧文件没有 duration_known：有分区且时长>0 视为已知；否则未知（不猜 0）。
+        if 'duration_known' in data:
+            self.duration_known = bool(data.get('duration_known'))
+        else:
+            self.duration_known = bool(self.current_zone) and self.duration_seconds > 0
+        self.start_time = data.get('start_time')
+        self.auto_resume = bool(data.get('auto_resume', True))
+        self.schema_version = _safe_int(data.get('schema_version'), 1)
+        self.run_id = data.get('run_id') or ''
+        self.service_instance = data.get('service_instance') or ''
+        self.session_version = _safe_int(data.get('session_version'), 0)
+        self.source_mode = data.get('source_mode') or SOURCE_NEW
+        self.phase = data.get('phase') or PHASE_IDLE
+        self.task_id = data.get('task_id')
+        if self.task_id is not None:
+            try:
+                self.task_id = int(self.task_id)
+            except (TypeError, ValueError):
+                self.task_id = None
+        self.execution_date = data.get('execution_date')
+        self.resume_blocked_reason = data.get('resume_blocked_reason') or ''
+        if self.effective_origin == 'legacy':
+            logger.info(
+                "状态缺少有效时长字段：把旧的已播 %s 秒作为迁移基线一次性继承"
+                "（来源标注 legacy；过去是否包含断流无法追溯，不清零不倒扣）",
+                self.elapsed_seconds)
+        if self.is_streaming:
+            logger.debug(
+                f"恢复直播状态：分区={self.current_zone}, "
+                f"已播={self.elapsed_seconds // 60}分钟")
 
-    def start_streaming(self, zone_name: str, room_id: int):
-        self.is_streaming = True
-        self.current_zone = zone_name
-        self.elapsed_seconds = 0
-        self.room_id = room_id
-        self.start_time = datetime.now().isoformat()
-        self.save()
-        logger.info(f" 直播状态已保存：开始 {zone_name}")
-
-    def start_streaming_with_duration(self, zone_name: str, room_id: int, duration_seconds: int, initial_elapsed: int = 0):
-        """带时长信息的开始直播"""
-        self.is_streaming = True
-        self.current_zone = zone_name
-        self.elapsed_seconds = initial_elapsed
-        self.room_id = room_id
-        self.start_time = datetime.now().isoformat()
-        self.duration_seconds = duration_seconds
-        self.save()
-
-    def update_progress(self, elapsed: int):
-        self.elapsed_seconds = elapsed
-        self.save()
-
-    def stop_streaming(self):
+    def _reset_memory(self):
         self.is_streaming = False
         self.current_zone = ''
-        self.elapsed_seconds = 0
+        self.effective_seconds = 0.0
+        self.effective_origin = 'none'
+        self.accumulated_seconds = 0
+        self.room_id = 0
+        self.duration_seconds = 0
+        self.duration_known = False
         self.start_time = None
+        self.phase = PHASE_IDLE
+        self.source_mode = SOURCE_NEW
+        self.task_id = None
+        self.execution_date = None
+        self.run_id = ''
+        self.session_version = 0
+
+    def to_dict(self) -> dict:
+        # elapsed_seconds/accumulated_seconds 是 effective_seconds 的兼容别名：
+        # 旧版本（含回退目标 cc191db）只认它们，回退期间读到的仍是合理进度。
+        effective = max(0.0, float(self.effective_seconds or 0))
+        return {
+            'schema_version': STATE_SCHEMA_VERSION,
+            'run_id': self.run_id,
+            'service_instance': self.service_instance,
+            'session_version': self.session_version,
+            'source_mode': self.source_mode,
+            'phase': self.phase,
+            'task_id': self.task_id,
+            'execution_date': self.execution_date,
+            'is_streaming': self.is_streaming,
+            'current_zone': self.current_zone or '',
+            'effective_seconds': round(effective, 3),
+            'effective_origin': self.effective_origin or 'none',
+            'elapsed_seconds': int(effective),
+            'accumulated_seconds': int(effective),
+            'room_id': self.room_id,
+            'duration_seconds': int(self.duration_seconds),
+            'duration_known': bool(self.duration_known),
+            'auto_resume': self.auto_resume,
+            'resume_blocked_reason': self.resume_blocked_reason,
+            'start_time': self.start_time or datetime.now().isoformat(),
+            'last_update': datetime.now().isoformat(),
+        }
+
+    def save(self) -> bool:
+        """原子保存：临时文件 + fsync + 读回校验 + os.replace。
+
+        失败时保留磁盘上的上一个完整状态并显式报错，绝不"假成功"。
+        """
+        data = self.to_dict()
+        target = self.state_file
+        tmp = target.with_name(target.name + f'.{os.getpid()}.tmp')
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            # 读回校验：写坏的内容不会替换掉好的状态
+            with open(tmp, 'r', encoding='utf-8') as f:
+                check = json.load(f)
+            if check.get('current_zone', '') != data['current_zone'] or \
+                    int(check.get('elapsed_seconds', -1)) != int(data['elapsed_seconds']):
+                raise IOError('状态文件读回校验不一致')
+            os.replace(tmp, target)
+            self._last_save_error = ''
+            return True
+        except Exception as e:
+            self._last_save_error = str(e)
+            logger.error(f" 保存状态失败（已保留上一个完整状态）：{e}")
+            try:
+                if tmp.exists():
+                    os.unlink(tmp)
+            except OSError:
+                pass
+            return False
+
+    # ---------- 会话生命周期 ----------
+
+    def begin_session(self, zone_name: str, room_id: int, duration_seconds: int,
+                      duration_known: bool = True, source: str = SOURCE_NEW,
+                      task_id: Optional[int] = None,
+                      execution_date: Optional[str] = None,
+                      initial_elapsed: int = 0,
+                      service_instance: str = '',
+                      run_id: Optional[str] = None) -> str:
+        """开启一个会话（新开播/恢复）。重连**不**调用它。
+
+        ``run_id`` 由调用方在**意图登记时**冻结后传入：恢复/验证后重试都沿用
+        同一个身份，不会因为中间多等了一会儿就变成另一场会话。
+        """
+        self.is_streaming = True
+        self.current_zone = zone_name
+        self.room_id = room_id
+        self.duration_seconds = int(duration_seconds or 0)
+        self.duration_known = bool(duration_known)
+        self.source_mode = source
+        self.phase = PHASE_STARTING
+        self.task_id = task_id
+        self.execution_date = execution_date or date.today().isoformat()
+        inherited = max(0.0, float(initial_elapsed or 0))
+        self.effective_seconds = inherited
+        # 继承来的进度的"来源"跟随旧值：恢复（沿用存档）或本次进程内确认。
+        self.effective_origin = ('resume' if source == SOURCE_RESUME and inherited > 0
+                                 else ('live' if inherited > 0 else 'none'))
+        self.accumulated_seconds = self.elapsed_seconds
+        self.start_time = datetime.now().isoformat()
+        self.auto_resume = True
+        self.resume_blocked_reason = ''
+        self.corrupt = False
+        if service_instance:
+            self.service_instance = service_instance
+        if source != SOURCE_RECONNECT:
+            self.run_id = run_id or f"{int(time.time()):x}-{uuid.uuid4().hex[:8]}"
+            self.session_version = 1
+        else:
+            self.session_version += 1
+        self.save()
+        return self.run_id
+
+    def start_streaming(self, zone_name: str, room_id: int):
+        """兼容入口：无时长信息的新开播（时长视为未知）。"""
+        self.begin_session(zone_name, room_id, 0, duration_known=False,
+                           source=SOURCE_NEW)
+        logger.info(f" 直播状态已保存：开始 {zone_name}")
+
+    def start_streaming_with_duration(self, zone_name: str, room_id: int,
+                                      duration_seconds: int,
+                                      initial_elapsed: int = 0,
+                                      **kwargs):
+        """带时长信息的开始直播（兼容旧签名）。"""
+        self.begin_session(zone_name, room_id, duration_seconds,
+                           duration_known=True, initial_elapsed=initial_elapsed,
+                           **kwargs)
+
+    def mark_phase(self, phase: str, persist: bool = False) -> None:
+        self.phase = phase
+        if persist:
+            self.save()
+
+    def update_progress(self, elapsed: float):
+        """持久化可恢复的累计**有效**时长（监控周期调用，每次入账一次）。
+
+        只接受已经确认过的值：待确认区间不落盘，重启后最多恢复到最后一次成功
+        保存的保守进度，绝不编造未落盘的时间。
+        """
+        value = max(0.0, float(elapsed or 0))
+        self.effective_seconds = value
+        if self.effective_origin == 'none' and value > 0:
+            self.effective_origin = 'live'
+        self.accumulated_seconds = self.elapsed_seconds
+        self.save()
+
+    def stop_streaming(self, preserve: bool = False):
+        """停止/清空会话。``preserve=True`` 时保留进度供恢复。"""
+        if preserve:
+            self.is_streaming = False
+            self.phase = PHASE_IDLE
+            self.effective_seconds = max(float(self.effective_seconds or 0),
+                                         float(self.elapsed_seconds or 0))
+            self.accumulated_seconds = max(self.accumulated_seconds,
+                                           self.elapsed_seconds)
+            self.save()
+            return
+        self._reset_memory()
         self.save()
         logger.info(" 直播状态已重置")
 
     def reload(self):
         """重新从文件加载状态（方便手动编辑 live_state.json 后刷新）"""
-        # 先保存当前状态再加载（保留未保存的更改）
         self._load()
-        logger.debug(f"已重新加载状态文件：is_streaming={self.is_streaming}, zone={self.current_zone}")
+        logger.debug(
+            f"已重新加载状态文件：is_streaming={self.is_streaming}, "
+            f"zone={self.current_zone}")
+
+    # ---------- 可恢复性 / 校验 ----------
+
+    def resumable(self) -> bool:
+        """统一的可恢复判定：不再用"分区名非空"或另一个布尔各说一套。"""
+        if self.corrupt:
+            return False
+        if not self.current_zone:
+            return False
+        if not self.duration_known:
+            # Unknown is different from an explicit unlimited target (0).  A
+            # resume without a fixed target cannot safely reach settlement or
+            # expiry, so the UI must not advertise it as executable.
+            return False
+        return True
+
+    def resume_reason(self) -> str:
+        """不可恢复时给出原因（可操作，不留空白）。"""
+        if self.corrupt:
+            return '状态文件损坏，已保留现场未覆盖；请修复或清空后重试'
+        if not self.current_zone:
+            return '没有可恢复的会话（未保存分区）'
+        if not self.duration_known:
+            return '恢复状态的目标时长未知，请在任务页重新开始'
+        return ''
+
+    def matches_identity(self, zone_name: str = None,
+                         task_id: Optional[int] = None,
+                         execution_date: Optional[str] = None) -> bool:
+        """恢复意图的身份核对：同名但换了记录/换了执行日都不算同一个任务。"""
+        if zone_name is not None and self.current_zone != zone_name:
+            return False
+        if task_id is not None:
+            if self.task_id is None:
+                return False
+            try:
+                if int(task_id) != int(self.task_id):
+                    return False
+            except (TypeError, ValueError):
+                return False
+        if execution_date is not None:
+            if not self.execution_date or self.execution_date != execution_date:
+                return False
+        return True
 
     def update_state(self, **kwargs):
-        """更新状态字段并保存（方便修改待恢复任务的参数）"""
-        allowed = {'is_streaming', 'current_zone', 'elapsed_seconds', 'room_id', 'duration_seconds'}
+        """更新状态字段并保存（仅在**未推流**时允许直接改恢复参数）。"""
+        allowed = {
+            'is_streaming': (bool,),
+            'current_zone': (str,),
+            'elapsed_seconds': (int,),
+            'duration_seconds': (int,),
+            'room_id': (int,),
+        }
         changed = False
         for key, val in kwargs.items():
-            if key in allowed and hasattr(self, key):
-                current = getattr(self, key)
-                if current != val:
-                    setattr(self, key, val)
-                    changed = True
-                    logger.info(f" 状态更新：{key} = {val}")
+            if key not in allowed:
+                continue
+            expected = allowed[key]
+            # bool 是 int 的子类：True 不能当成 duration_seconds=1 混进来
+            if expected == (int,) and (isinstance(val, bool)
+                                       or not isinstance(val, int)):
+                raise ValueError(f'字段 {key} 类型不合法：{type(val).__name__}')
+            if not isinstance(val, expected):
+                raise ValueError(f'字段 {key} 类型不合法：{type(val).__name__}')
+            if expected == (int,) and val < 0:
+                raise ValueError(f'字段 {key} 不能为负数：{val}')
+            if key == 'duration_seconds':
+                self.duration_known = True
+            if getattr(self, key, None) != val:
+                setattr(self, key, val)
+                changed = True
+                logger.info(f" 状态更新：{key} = {val}")
         if changed:
+            if kwargs.get('elapsed_seconds') is not None:
+                # 手工改写已播进度：elapsed 的可写别名已经把权威值一起改掉了，
+                # 这里只需同步 accumulated 与来源标注。
+                if self.effective_origin == 'none' and self.effective_seconds > 0:
+                    self.effective_origin = 'live'
+                self.accumulated_seconds = self.elapsed_seconds
             self.save()
         return changed
 
@@ -709,7 +1285,7 @@ class LiveState:
         try:
             start = datetime.fromisoformat(self.start_time)
             return start.date() != date.today()
-        except:
+        except Exception:
             return False
 
     def get_status(self) -> dict:
@@ -718,11 +1294,60 @@ class LiveState:
             'current_zone': self.current_zone,
             'elapsed_seconds': self.elapsed_seconds,
             'room_id': self.room_id,
-            'start_time': self.start_time
+            'start_time': self.start_time,
+        }
+
+    def snapshot(self) -> dict:
+        """对外暴露的会话快照（每个字段含义单一）。"""
+        return {
+            'run_id': self.run_id,
+            'service_instance': self.service_instance,
+            'session_version': self.session_version,
+            'source_mode': self.source_mode,
+            'phase': self.phase,
+            'task_id': self.task_id,
+            'execution_date': self.execution_date,
+            'current_zone': self.current_zone or '',
+            # 存档里的 elapsed_seconds 就是**已确认的有效时长**（整数显示别名）；
+            # 待确认区间不落盘，因此存档值天然是保守值。
+            'elapsed_seconds': int(self.effective_seconds),
+            'effective_origin': self.effective_origin or 'none',
+            'duration_seconds': int(self.duration_seconds),
+            'duration_known': bool(self.duration_known),
+            'room_id': self.room_id,
+            'resumable': self.resumable(),
+            'resume_blocked_reason': self.resume_blocked_reason,
+            'auto_resume': self.auto_resume,
+            'state_corrupt': self.corrupt,
+            'last_save_error': self._last_save_error,
         }
 
 
-# ==================== 控制操作票据（A2/A3：识别"响应丢失后的重放"） ====================
+def _safe_int(value, default: int = 0) -> int:
+    """把外部/旧文件里的值收敛成非负整数（NaN/None/负数都不静默通过）。"""
+    if value is None or isinstance(value, bool):
+        return default
+    try:
+        result = int(value)
+    except (TypeError, ValueError):
+        return default
+    return result if result >= 0 else default
+
+
+def _safe_float(value, default: float = 0.0) -> float:
+    """把外部/旧文件里的值收敛成非负浮点数（NaN/None/负数都不静默通过）。"""
+    if value is None or isinstance(value, bool):
+        return default
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return default
+    if result != result:  # NaN
+        return default
+    return result if result >= 0 else default
+
+
+# ==================== LiveController（核心控制器重构） ====================
 
 _ISSUED_TICKET = __import__('re').compile(r'^([0-9a-f]+):(\d+):(\d+)$')
 
@@ -943,6 +1568,288 @@ class LiveController:
 
     _CLASS_FALLBACK_LOCK = threading.Lock()
 
+    # Effective-time state is deliberately kept in the desktop controller rather
+    # than in the platform adapter.  The adapter only answers what the platform
+    # confirmed; this layer owns the bounded confirmation window and persistence.
+    _segment_monotonic = None
+    _effective_clock = None
+    _monitor_interval_seconds = MONITOR_INTERVAL
+    _current_source = SOURCE_NEW
+    _pending_source = SOURCE_NEW
+    _pending_inherit = 0
+    _current_run_id = ''
+    _pending_run_id = ''
+
+    def _clock(self) -> EffectiveClock:
+        """Return this controller's effective-time clock (lazy for test doubles)."""
+        clock = self.__dict__.get('_effective_clock')
+        if clock is None:
+            clock = EffectiveClock(
+                effective_credit_limit(
+                    getattr(self, '_monitor_interval_seconds', MONITOR_INTERVAL)))
+            self._effective_clock = clock
+        return clock
+
+    @staticmethod
+    def _new_run_id() -> str:
+        return f'{int(time.time()):x}-{uuid.uuid4().hex[:8]}'
+
+    def _owns_current_run(self, epoch: int, run_id: Optional[str]) -> bool:
+        """Check that a monitor response still belongs to the current desktop run."""
+        try:
+            if not self._is_epoch_current(epoch):
+                return False
+        except Exception:
+            return False
+        current = (getattr(self, '_current_run_id', '') or
+                   getattr(self.state, 'run_id', '') or '')
+        return not run_id or not current or current == run_id
+
+    def _register_active_task(self, instruction: LiveInstruction,
+                              run_id: Optional[str] = None) -> bool:
+        """Atomically reserve the exact task row before committing a session."""
+        tm = getattr(self, 'task_manager', None)
+        # Manual mode and small controller doubles can run without a task
+        # manager.  A real task session must have the reservation primitive;
+        # silently falling back to set_active_task(None) would leave deletion
+        # and import protection without a stable identity.
+        if tm is None:
+            return True
+        task_id = getattr(instruction, 'task_id', None) if instruction else None
+        if task_id is None:
+            logger.warning('拒绝登记任务直播：指令缺少稳定 task_id')
+            return False
+        target_run = run_id or self._current_run_id or self.state.run_id or None
+        try:
+            reserve = getattr(tm, 'reserve_active_task', None)
+            if not callable(reserve):
+                logger.error('拒绝登记任务直播：TaskManager 缺少原子 reserve_active_task')
+                return False
+
+            execution_day = getattr(instruction, 'execution_date', None)
+            zone_name = getattr(instruction, 'zone_name', None)
+
+            def validate(row):
+                if row.get('id') != task_id:
+                    return '任务身份已变化'
+                if row.get('zone_name') != zone_name:
+                    return '任务分区已变化'
+                if int(row.get('category') or 0) <= 0:
+                    return '任务已完成'
+                if row.get('today_done') == 1:
+                    return '任务今日已完成'
+                return None
+
+            try:
+                ok = reserve(task_id, run_id=target_run, validate=validate)
+            except TypeError:
+                # A pre-L1 test double may not accept validate.  It is not a
+                # production fallback: without the atomic validation contract
+                # we cannot claim the task identity is protected.
+                logger.error('拒绝登记任务直播：reserve_active_task 不支持 validate')
+                return False
+            if ok:
+                self._active_run_id = target_run
+            return bool(ok)
+        except Exception as exc:
+            logger.warning("登记运行中任务失败，放弃开播：%s", exc)
+            return False
+
+    def _release_active_task(self, run_id: Optional[str] = None) -> None:
+        tm = getattr(self, 'task_manager', None)
+        target = run_id if run_id is not None else getattr(self, '_active_run_id', None)
+        if tm is not None:
+            try:
+                clear = getattr(tm, 'clear_active_task', None)
+                if callable(clear):
+                    clear(run_id=target)
+            except Exception as exc:
+                logger.debug("清理运行中任务标记失败：%s", exc)
+        if run_id is None or run_id == getattr(self, '_active_run_id', None):
+            self._active_run_id = None
+
+    def validate_face_verify_retry_intent(self, intent: Optional[dict] = None) -> bool:
+        """Recheck a frozen face-verification retry before dispatching it.
+
+        A face challenge can leave an accepted task instruction pending for a
+        while.  The final ``reserve_active_task`` check still protects the
+        platform start commit, but a retry must also reject an instruction
+        whose task was completed, deleted, or replaced during that wait.  In
+        particular, a saved ``resume`` instruction must not be trusted merely
+        because its old run/epoch still matches.
+
+        This method only validates; it does not reserve the task.  Reservation
+        remains in ``_start_streaming_sync`` after the platform response so a
+        task mutation racing with that response is compensated safely.
+        """
+        frozen = dict(intent or {})
+        source = frozen.get('source') or getattr(self, '_pending_source', SOURCE_NEW)
+        if source != SOURCE_RESUME:
+            return True
+
+        with self._start_lock:
+            if self.is_streaming or self._is_starting:
+                return False
+            if self.stop_monitor.is_set() or self._start_cancel.is_set():
+                return False
+
+            instruction = getattr(self, 'current_instruction', None)
+            if instruction is None:
+                return False
+            zone_name = frozen.get('zone') or getattr(instruction, 'zone_name', '')
+            task_id = frozen.get('task_id', getattr(instruction, 'task_id', None))
+            execution_date = frozen.get(
+                'execution_date', getattr(instruction, 'execution_date', None))
+            if task_id is None or not zone_name or not execution_date:
+                return False
+            if not self.state.matches_identity(zone_name, task_id, execution_date):
+                return False
+            if str(execution_date) != date.today().isoformat():
+                return False
+
+            tm = getattr(self, 'task_manager', None)
+            mutation_lock = getattr(tm, '_mutation_lock', None) if tm else None
+            db = getattr(tm, 'db', None) if tm else None
+            if mutation_lock is None or db is None:
+                return False
+            try:
+                with mutation_lock:
+                    row = db.get_task_by_id(task_id)
+                    if not row:
+                        return False
+                    row = dict(row)
+                    if row.get('id') != task_id or row.get('zone_name') != zone_name:
+                        return False
+                    if int(row.get('category') or 0) <= 0:
+                        return False
+                    if row.get('today_done') == 1:
+                        return False
+            except Exception as exc:
+                logger.warning('人脸验证恢复身份复核失败，拒绝重试：%s', exc)
+                return False
+            return True
+
+    def _current_elapsed(self) -> int:
+        """Display value: confirmed time plus the bounded pending interval."""
+        if not self.is_streaming or self._segment_monotonic is None:
+            return int(getattr(self.state, 'elapsed_seconds', 0) or 0)
+        clock = self._clock()
+        return int(clock.confirmed + EffectiveClock.pending(
+            self._segment_monotonic, _monotonic()))
+
+    def _confirmed_elapsed(self) -> int:
+        """Authoritative effective time used for settlement and persistence."""
+        if not self.is_streaming:
+            return int(getattr(self.state, 'elapsed_seconds', 0) or 0)
+        return int(self._clock().confirmed)
+
+    def _credit_effective_observation(self, request_start: float,
+                                      returned: float) -> str:
+        """Credit one trusted live observation, subject to freshness bounds."""
+        clock = self._clock()
+        clock.credit_limit = effective_credit_limit(
+            getattr(self, '_monitor_interval_seconds', MONITOR_INTERVAL))
+        anchor = self._segment_monotonic
+        new_anchor, credited, outcome = clock.observe_ok(
+            anchor, request_start, returned)
+        self._segment_monotonic = new_anchor
+        if credited > 0 and getattr(self, '_stream_mode', '') != 'manual':
+            self.state.update_progress(clock.confirmed)
+        if outcome in ('dropped_gap', 'dropped_stale'):
+            logger.info(
+                "有效计时丢弃未观察区间（%s），已确认 %.1f 秒",
+                outcome, clock.confirmed)
+        return outcome
+
+    def _pause_effective_timer(self, reason: str,
+                               at: Optional[float] = None) -> float:
+        """Pause effective-time accounting and discard only pending time."""
+        clock = self._clock()
+        dropped = clock.pause(reason, self._segment_monotonic, at)
+        self._segment_monotonic = None
+        return dropped
+
+    def get_session_snapshot(self) -> dict:
+        """Return one coherent desktop session snapshot for API and UI consumers."""
+        snapshot_fn = getattr(self.state, 'snapshot', None)
+        if callable(snapshot_fn):
+            snap = snapshot_fn()
+        else:
+            snap = {
+                'run_id': getattr(self.state, 'run_id', ''),
+                'source_mode': getattr(self.state, 'source_mode', SOURCE_NEW),
+                'phase': getattr(self.state, 'phase', PHASE_IDLE),
+                'task_id': getattr(self.state, 'task_id', None),
+                'execution_date': getattr(self.state, 'execution_date', None),
+                'current_zone': getattr(self.state, 'current_zone', '') or '',
+                'elapsed_seconds': getattr(self.state, 'elapsed_seconds', 0),
+                'duration_seconds': getattr(self.state, 'duration_seconds', 0),
+                'duration_known': bool(getattr(self.state, 'duration_known', False)),
+                'room_id': getattr(self.state, 'room_id', 0),
+                'resumable': False,
+                'resume_blocked_reason': '',
+                'auto_resume': getattr(self.state, 'auto_resume', True),
+                'state_corrupt': bool(getattr(self.state, 'corrupt', False)),
+                'last_save_error': '',
+            }
+        elapsed = self._confirmed_elapsed()
+        duration = 0
+        duration_known = False
+        if self.current_instruction:
+            duration = int(self.current_instruction.duration_seconds or 0)
+            duration_known = True
+        elif bool(getattr(self.state, 'duration_known', False)):
+            duration = int(getattr(self.state, 'duration_seconds', 0) or 0)
+            duration_known = True
+        if self._is_starting:
+            phase = PHASE_STOPPING if self._start_cancel.is_set() else PHASE_STARTING
+        elif self.is_streaming:
+            phase = PHASE_RECOVERING if (self._recovery_blocked or self.reconnect_attempts) else PHASE_LIVE
+        elif self._recovery_blocked:
+            phase = PHASE_BLOCKED
+        else:
+            phase = snap.get('phase', PHASE_IDLE)
+            if phase == PHASE_LIVE:
+                phase = PHASE_IDLE
+        if (self.is_streaming or self._is_starting) and self.current_instruction:
+            snap.update({
+                'current_zone': self.current_instruction.zone_name,
+                'task_id': getattr(self.current_instruction, 'task_id', None),
+                'execution_date': (getattr(self.current_instruction, 'execution_date', None)
+                                   or snap.get('execution_date')),
+                'run_id': (self._current_run_id or self._pending_run_id
+                           or snap.get('run_id', '')),
+                'source_mode': (self._current_source or self._pending_source
+                                or snap.get('source_mode', SOURCE_NEW)),
+            })
+        resumable_fn = getattr(self.state, 'resumable', None)
+        resumable = bool(resumable_fn()) if callable(resumable_fn) else False
+        snap.update({
+            'phase': phase,
+            'elapsed_seconds': elapsed,
+            'duration_seconds': duration,
+            'duration_known': duration_known,
+            'remaining_seconds': max(0, duration - elapsed) if duration_known and duration > 0 else None,
+            'resumable': resumable and not self.is_streaming,
+            'recovery_blocked': self._recovery_blocked,
+            'is_anomaly': bool(self._recovery_blocked),
+        })
+        snap.update(self._effective_timer_view())
+        return snap
+
+    def _effective_timer_view(self) -> dict:
+        clock = self._clock()
+        anchor = self._segment_monotonic if self.is_streaming else None
+        view = clock.snapshot(anchor, _monotonic())
+        pending = min(view['pending'], view['pending_limit'])
+        return {
+            'pending_seconds': int(pending),
+            'pending_valid_seconds': round(view['pending_remaining'], 3),
+            'pending_limit_seconds': round(view['pending_limit'], 3),
+            'pending_extrapolatable': bool(view['extrapolatable']),
+            'timer_state': view['state'],
+        }
+
     def __init__(
         self,
         task_manager: 'TaskManager' = None,
@@ -974,6 +1881,19 @@ class LiveController:
         # 流模式：'task'（任务模式）| 'manual'（手动模式）| None
         self._stream_mode: Optional[str] = None
 
+        # 会话有效计时：只在平台明确确认在播时入账；单调锚点不落盘。
+        self._segment_monotonic: Optional[float] = None
+        self._effective_clock = EffectiveClock(
+            effective_credit_limit(MONITOR_INTERVAL))
+        self._monitor_interval_seconds = MONITOR_INTERVAL
+        self._stop_progress_accumulated = 0
+        self._current_source = SOURCE_NEW
+        self._pending_source = SOURCE_NEW
+        self._pending_inherit = 0
+        self._current_run_id = ''
+        self._pending_run_id = ''
+        self._active_run_id = None
+
         # FFmpeg 推流状态
         self._ffmpeg_loop_thread: Optional[threading.Thread] = None
         self._ffmpeg_stop_event = threading.Event()  # 独立信号：停止 FFmpeg 循环
@@ -982,6 +1902,13 @@ class LiveController:
         # 人脸验证状态
         self._pending_face_verify: bool = False
         self._face_verify_url: str = ''
+
+        # 认证意图代际：扫码轮询可能在网络层滞留，迟到的旧账号结果不能
+        # 覆盖登出后或新扫码已经提交的账号。
+        self._auth_lock = threading.RLock()
+        self._auth_generation = 0
+        self._qr_generations: Dict[str, int] = {}
+        self._auth_operation_seq = 0
 
         # ---------- A2：控制代际与票据 ----------
         self._start_lock = threading.Lock()
@@ -998,6 +1925,18 @@ class LiveController:
         # 平台下播与"本地 owned 进程回收"分开记录：确认下发后不再重复下播，
         # 未下发/失败则保留待办，允许后续显式停止重试（见 _cleanup_confirmed）。
         self._platform_stop_done = False
+        # A newly accepted start is only an intent until _start_streaming_sync
+        # commits is_streaming/state.begin_session.  Keep the previous stop
+        # result so cancelling that pending intent cannot turn its instruction
+        # into a persisted session or lose the old session's cleanup fact.
+        self._pending_previous_cleanup_done = False
+        self._pending_previous_platform_stop_done = False
+        self._pending_previous_stream_mode = None
+        # Stop owns the cleanup interval as well as the committed state.  A
+        # new start must not be accepted while an older stop is still joining
+        # or reclaiming resources, even if the old worker has already cleared
+        # _is_starting in its finally block.
+        self._stop_in_progress = False
         # D1：每次被接受的开播意图分配唯一 id；停止在登记时快照目标意图，
         # 执行器队列中迟到的停止不再停掉"之后新接受"的开播意图。
         self._start_intent_id = 0
@@ -1024,6 +1963,8 @@ class LiveController:
 
         # 后端事件日志（供前端轮询展示）
         self._backend_events: list = []
+        self._event_seq = 0
+        self._event_lock = threading.Lock()
 
         # A1：启动时断网也不能阻塞服务就绪——登录/分区拉取放入后台引导线程，
         # 保留登录和状态数据直至网络恢复。注意：桌面版**不自动恢复直播**，
@@ -1063,9 +2004,14 @@ class LiveController:
 
     def _persist_stop_intent(self):
         try:
+            # A pending start has not committed a session yet; its instruction
+            # must not replace the zone belonging to the saved resumable run.
+            instruction = self.current_instruction if self.is_streaming else None
+            zone = (instruction.zone_name if instruction
+                    else (self.state.current_zone or ''))
             stop_intent_file_path().write_text(json.dumps({
                 'stopped_at': datetime.now().isoformat(),
-                'zone': self.current_instruction.zone_name if self.current_instruction else (self.state.current_zone or ''),
+                'zone': zone,
                 'epoch': self._control_epoch,
             }, ensure_ascii=False), encoding='utf-8')
         except Exception as e:
@@ -1090,96 +2036,160 @@ class LiveController:
                 logger.warning(" 在线拉取分区失败，部分功能不可用")
 
     def login(self) -> bool:
-        """自动登录（优先 cookies，否则返回需要扫码的状态）"""
+        """Validate persisted credentials and commit room identity atomically."""
+        with self._auth_lock:
+            auth_generation = self._auth_generation
         if self.api.validate_login():
             success, user_info = self.api.get_user_info()
             if success and user_info.get('code') == 0:
                 data = user_info.get('data', {})
                 uid = data.get('mid')
                 if uid:
-                    # 通过 UID 获取真实 room_id
                     ok, room_resp = self.api.get_room_id_by_uid(uid)
-                    if ok:
-                        self.current_room_id = room_resp['data']['room_id']
-                        logger.info(f" 自动登录成功 | {data.get('name', '')} (UID:{uid}, Room:{self.current_room_id})")
+                    room_id = (room_resp.get('data', {}).get('room_id')
+                               if isinstance(room_resp, dict) else None)
+                    if ok and room_id:
+                        # Serialize with start acceptance and auth logout.  A
+                        # late response cannot replace an account after either
+                        # operation advanced the auth generation.
+                        with self._start_lock:
+                            with self._auth_lock:
+                                if (auth_generation != self._auth_generation
+                                        or self.is_streaming):
+                                    logger.warning("登录结果已过期或直播中，未覆盖当前账号")
+                                    return False
+                                self.current_room_id = int(room_id)
+                        logger.info("自动登录成功 | %s (UID:%s, Room:%s)",
+                                    data.get('name', ''), uid, room_id)
                         return True
-                    else:
-                        # 降级：使用 UID 作为 room_id
-                        self.current_room_id = uid
-                        logger.warning(f" 无法获取直播间 ID，使用 UID 替代：{uid}")
-                        return True
-
-        logger.info(" Cookies 无效或已过期，需要扫码登录")
+                    logger.warning("无法获取真实直播间 ID，自动登录未完成")
+                    return False
+        logger.info("Cookies 无效或已过期，需要扫码登录")
         return False
 
     def get_qrcode_data(self) -> Optional[dict]:
-        """获取二维码数据（供前端展示）"""
+        """Fetch and register a real QR intent before exposing its key."""
         success, resp = self.api.get_qrcode()
         if success and resp.get('code') == 0:
             data = resp.get('data', {})
-            return {
-                'qrcode_url': data.get('url'),
-                'qrcode_key': data.get('qrcode_key')
-            }
+            key = data.get('qrcode_key')
+            if not key:
+                return None
+            with self._auth_lock:
+                self._auth_generation += 1
+                generation = self._auth_generation
+                self._qr_generations[str(key)] = generation
+                if len(self._qr_generations) > 32:
+                    oldest = next(iter(self._qr_generations))
+                    self._qr_generations.pop(oldest, None)
+            return {'qrcode_url': data.get('url'), 'qrcode_key': key}
         return None
 
     def poll_login_status(self, qrcode_key: str) -> dict:
-        """轮询扫码登录状态"""
+        """Poll only a QR key issued by this controller instance."""
+        key = str(qrcode_key or '')
+        with self._auth_lock:
+            generation = self._qr_generations.get(key)
+            if generation is None:
+                return {'logged_in': False, 'message': '二维码不是由当前实例签发'}
         success, resp = self.api.poll_qrcode(qrcode_key)
         if success and resp.get('code') == 0:
             data = resp.get('data', {})
-            status = data.get('code', -1)  # 0=扫码中，86101=未扫码，86038=二维码过期
+            status = data.get('code', -1)
             if 'url' in data and data['url']:
-                # 提取 cookies
                 from urllib.parse import parse_qs, urlparse
                 parsed = urlparse(data['url'])
                 query_params = parse_qs(parsed.query)
-                cookies = {}
-                for key in ['SESSDATA', 'bili_jct', 'DedeUserID']:
-                    if key in query_params:
-                        cookies[key] = query_params[key][0]
-                if cookies:
-                    self.api.update_cookies(cookies)
-                    # 获取用户信息
-                    suc, user_info = self.api.get_user_info()
-                    if suc and user_info.get('code') == 0:
-                        info = user_info.get('data', {})
-                        uid = info.get('mid')
-                        if uid:
-                            # 获取真实 room_id
-                            ok, room_resp = self.api.get_room_id_by_uid(uid)
-                            if ok:
-                                self.current_room_id = room_resp['data']['room_id']
-                            else:
-                                self.current_room_id = uid
-                            return {
-                                'logged_in': True,
-                                'user_info': {
-                                    'uid': uid,
-                                    'uname': info.get('name', ''),
-                                    'face': info.get('face', ''),
-                                    'level': info.get('level', 0)
-                                }
-                            }
-                return {'logged_in': False, 'message': '提取 cookies 失败'}
-            elif status == 0:
+                cookies = {
+                    name: query_params[name][0]
+                    for name in ('SESSDATA', 'bili_jct', 'DedeUserID')
+                    if name in query_params and query_params[name]
+                }
+                if not all(cookies.get(name) for name in
+                           ('SESSDATA', 'bili_jct', 'DedeUserID')):
+                    return {'logged_in': False, 'message': '提取 cookies 失败'}
+                # Resolve identity with candidate cookies before changing the
+                # durable account.  No shared cookie mutation occurs here.
+                with self.api.cookie_context(cookies):
+                    valid, user_info = self.api.get_user_info()
+                    info = user_info.get('data', {}) if valid else {}
+                    uid = info.get('mid')
+                    room_ok, room_resp = (
+                        self.api.get_room_id_by_uid(uid) if uid else (False, {}))
+                room_id = (room_resp.get('data', {}).get('room_id')
+                           if isinstance(room_resp, dict) else None)
+                if not (valid and user_info.get('code') == 0 and uid
+                        and room_ok and room_id):
+                    return {'logged_in': False, 'message': '账号身份或直播间校验失败'}
+                # The commit lock spans generation check, in-stream guard,
+                # durable replacement and in-memory room assignment.  This
+                # closes the logout/new-QR TOCTOU window.
+                with self._start_lock:
+                    with self._auth_lock:
+                        if generation != self._auth_generation:
+                            return {'logged_in': False,
+                                    'message': '登录结果已过期，未覆盖当前账号'}
+                        if self.is_streaming or self._is_starting:
+                            return {'logged_in': False,
+                                    'message': '直播进行中，不能切换账号'}
+                        if not self.api.replace_cookies(cookies):
+                            return {'logged_in': False,
+                                    'message': '登录凭据未确认落盘'}
+                        self.current_room_id = int(room_id)
+                        self._auth_generation += 1
+                        self._qr_generations.pop(key, None)
+                return {'logged_in': True, 'user_info': {
+                    'uid': uid, 'uname': info.get('name', ''),
+                    'face': info.get('face', ''), 'level': info.get('level', 0)}}
+            if status == 0:
                 return {'logged_in': False, 'scanning': True}
-            elif status == 86038:
+            if status == 86038:
                 return {'logged_in': False, 'expired': True}
-            else:
-                return {'logged_in': False, 'scanning': False}
-        else:
-            msg = resp.get('msg', '查询失败')
-            if '二维码尚未生成' in msg:
-                return {'logged_in': False, 'scanning': False}
-            return {'logged_in': False, 'message': msg}
+            return {'logged_in': False, 'scanning': False}
+        msg = resp.get('msg', '查询失败') if isinstance(resp, dict) else '查询失败'
+        if '二维码尚未生成' in msg:
+            return {'logged_in': False, 'scanning': False}
+        return {'logged_in': False, 'message': msg}
+
+    def logout(self, operation_token: str = '') -> dict:
+        """Persist logout before acknowledging it; stale replays are idempotent."""
+        token = str(operation_token or '').strip()
+        # Keep the same start→auth lock order as login/QR commit so an account
+        # cannot be swapped between the in-stream check and durable clearing.
+        with self._start_lock:
+            with self._auth_lock:
+                revoked = self.api.get_auth_revocations()
+                if token and token in revoked:
+                    return {'success': True, 'message': '已登出（重放确认）',
+                            'replayed': True}
+                if self.is_streaming or self._is_starting:
+                    return {'success': False, 'status_code': 409,
+                            'code': 'auth_logout_blocked',
+                            'message': '直播进行中，停止直播后才能登出'}
+                previous_revoked = dict(revoked)
+                if token:
+                    revoked[token] = datetime.now().isoformat()
+                self.api._auth_revocations = revoked
+                if not self.api._save_cookies({}):
+                    self.api._auth_revocations = previous_revoked
+                    return {'success': False, 'status_code': 503,
+                            'code': 'auth_logout_persistence_failed',
+                            'message': '登出凭据撤销未落盘，未确认登出成功'}
+                self.api.cookies = {}
+                self.current_room_id = None
+                self._auth_generation += 1
+                return {'success': True, 'message': '已登出'}
 
     def get_live_status_api(self) -> dict:
         """获取当前直播状态（供 API 响应）"""
         payload = self.state.get_status()
         payload['is_streaming'] = self.is_streaming
-        payload['is_starting'] = self._is_starting  # 后台开播进行中（A1/A2）
-        payload['duration_seconds'] = getattr(self.state, 'duration_seconds', 0)
+        payload['is_starting'] = self._is_starting
+        payload['is_cancelling'] = self._is_starting and self._start_cancel.is_set()
+        payload['recovery_blocked'] = self._recovery_blocked
+        payload['status_query_failures'] = getattr(self, '_status_query_failures', 0)
+        payload['status_query_failures_total'] = getattr(self, '_status_query_failures_total', 0)
+        payload['ffmpeg_unrecycled'] = getattr(self, '_ffmpeg_unrecycled', False)
         payload['stream_mode'] = self._stream_mode or ''
         # 人脸验证待处理（自动切任务触发时前端轮询感知）
         payload['pending_face_verify'] = self._pending_face_verify
@@ -1190,13 +2200,10 @@ class LiveController:
         payload['ffmpeg_current_video'] = self.ffmpeg_current_video or ''
         # 后端事件日志（最近50条）
         payload['backend_events'] = self._backend_events[-50:] if hasattr(self, '_backend_events') else []
-        if self.stream_start_time and self.current_instruction:
-            elapsed = (datetime.now() - self.stream_start_time).total_seconds()
-            payload['elapsed_seconds'] = int(elapsed)
-            payload['remaining_seconds'] = max(0, self.current_instruction.duration_seconds - int(elapsed))
-            payload['current_zone'] = self.current_instruction.zone_name
-            # 优先使用指令中的时长
-            payload['duration_seconds'] = self.current_instruction.duration_seconds
+        payload.update(self.get_session_snapshot())
+        payload['duration_seconds'] = payload.get('duration_seconds', 0)
+        payload['elapsed_seconds'] = payload.get('elapsed_seconds', 0)
+        payload['remaining_seconds'] = payload.get('remaining_seconds') or 0
         return payload
 
     # ---------------- 控制代际（A2：停止让此前的操作失效） ----------------
@@ -1290,7 +2297,9 @@ class LiveController:
         logger.info(" 开播前清理完成")
 
     def start_streaming(self, instruction: LiveInstruction, video_path: str,
-                        is_task_mode: bool = True, epoch: int = None) -> bool:
+                        is_task_mode: bool = True, epoch: int = None,
+                        source: Optional[str] = None,
+                        inherit_elapsed: Optional[int] = None) -> bool:
         """接受开播请求，使用独立后台线程持续等待网络恢复（A1/A2）。
 
         epoch=None 表示这是停止之后（或从未停止时）新发起的请求，取当前代际；
@@ -1305,12 +2314,18 @@ class LiveController:
                 self._push_backend_event(
                     '停止', 'info', '已放弃停止之前发起的开播请求，未重新开播')
                 return False
+            if self._stop_in_progress:
+                logger.info('停止清理尚未完成，暂不受理新的开播意图')
+                return False
             if self._is_starting or self.is_streaming:
                 return False
             cancel = threading.Event()
             self._start_cancel = cancel
             self._is_starting = True
             self._start_intent_id += 1  # D1：新接受的开播意图（停止执行时核对）
+            self._pending_previous_cleanup_done = self._stop_cleanup_done
+            self._pending_previous_platform_stop_done = self._platform_stop_done
+            self._pending_previous_stream_mode = self._stream_mode
             # 新意图接管后，上一次停止的"清理已完成"不再适用于本会话：
             # 之后到来的停止必须真正执行一次回收与下播。
             self._stop_cleanup_done = False
@@ -1318,6 +2333,34 @@ class LiveController:
             self._recovery_blocked = ''
             self._pending_face_verify = False
             self.current_instruction = instruction
+            self._pending_source = source or (SOURCE_NEW if is_task_mode else SOURCE_MANUAL)
+            requested_inherit = inherit_elapsed
+            if inherit_elapsed is None:
+                inherit_elapsed = 0
+            self._pending_inherit = max(0, int(inherit_elapsed or 0))
+            if self._pending_source == SOURCE_RESUME:
+                # Resume is an explicit desktop action.  Validate the saved
+                # identity before a background thread can touch the platform.
+                if not is_task_mode or not self.state.matches_identity(
+                        getattr(instruction, 'zone_name', None),
+                        getattr(instruction, 'task_id', None),
+                        getattr(instruction, 'execution_date', None)):
+                    self._stop_cleanup_done = self._pending_previous_cleanup_done
+                    self._platform_stop_done = self._pending_previous_platform_stop_done
+                    self._stream_mode = self._pending_previous_stream_mode
+                    self._pending_source = SOURCE_NEW
+                    self._pending_inherit = 0
+                    self._pending_run_id = ''
+                    self._is_starting = False
+                    self.current_instruction = None
+                    return False
+                if requested_inherit is None:
+                    self._pending_inherit = int(self.state.elapsed_seconds or 0)
+                else:
+                    self._pending_inherit = max(0, int(inherit_elapsed or 0))
+                self._pending_run_id = self.state.run_id or self._new_run_id()
+            else:
+                self._pending_run_id = self._new_run_id()
             self._start_thread = threading.Thread(
                 target=self._start_in_background,
                 args=(instruction, video_path, is_task_mode, cancel, epoch),
@@ -1347,6 +2390,11 @@ class LiveController:
         is_task_mode=True: 任务模式，保存 live_state、可继承已播时长
         is_task_mode=False: 手动模式，不触碰 live_state、已播时长始终=0、时长=0表示不限时
         """
+        if cancel.is_set() or not self._is_epoch_current(epoch):
+            logger.info(" 开播工作线程在提交前已过期，未触碰平台或恢复状态")
+            return False
+        # Do not let a cancelled/old worker rewrite the mode of the current
+        # committed session before it has passed the same epoch boundary.
         self._stream_mode = 'task' if is_task_mode else 'manual'
         dur_label = '不限时' if (not is_task_mode and instruction.duration_seconds == 0) else f"{instruction.duration_seconds // 60}分钟"
         logger.info("=" * 70)
@@ -1417,7 +2465,10 @@ class LiveController:
             self._pending_face_verify = True
             self._face_verify_url = verify_url
             logger.info(f"人脸验证 URL：{verify_url}")
-            self._push_backend_event('验证', 'warning', f'开播需要人脸验证 (code={code})')
+            self._push_backend_event(
+                '验证', 'warning', f'开播需要人脸验证 (code={code})', notify=False)
+            self._notify_verification_required(
+                f'开播需要人脸验证 (code={code})', stage='start_blocked')
             return False  # API 层检查 _pending_face_verify 返回给前端
 
         if not success:
@@ -1448,18 +2499,46 @@ class LiveController:
 
             self.is_streaming = True
             self._clear_stop_intent()  # A7：成功开播即清除持久化的停止意图
-            # 已播时长：任务模式可继承，手动模式始终为 0
-            if is_task_mode:
-                saved_elapsed = self.state.elapsed_seconds if self.state.is_streaming else 0
-            else:
-                saved_elapsed = 0
+            # 只继承意图登记时冻结的有效进度；等待平台响应期间状态文件变化
+            # 不得把别的任务的进度带进本场。
+            source = self._pending_source or (SOURCE_NEW if is_task_mode else SOURCE_MANUAL)
+            saved_elapsed = self._pending_inherit if is_task_mode else 0
             self.stream_start_time = datetime.now() - timedelta(seconds=saved_elapsed)
+            self._segment_monotonic = _monotonic()
+            self._stop_progress_accumulated = int(saved_elapsed)
+            self._current_source = source
+            self._current_run_id = self._pending_run_id or self._new_run_id()
+            clock = self._clock()
+            clock.reset(
+                confirmed=saved_elapsed,
+                origin='resume' if source == SOURCE_RESUME and saved_elapsed > 0 else 'live',
+                credit_limit=effective_credit_limit(self._monitor_interval_seconds))
             self.stop_monitor.clear()
             # 任务模式保存 state，手动模式不触碰
             if is_task_mode:
-                self.state.start_streaming_with_duration(
-                    instruction.zone_name, self.current_room_id, instruction.duration_seconds,
-                    initial_elapsed=saved_elapsed)
+                if not self._register_active_task(
+                        instruction, self._current_run_id):
+                    logger.error('任务身份预留失败，撤销已开启的平台直播间：%s',
+                                 instruction.zone_name)
+                    try:
+                        self._platform_stop_done = self._platform_stop_ok(
+                            self.api.stop_live(self.current_room_id, csrf))
+                    except Exception:
+                        logger.debug('任务身份预留失败后的补偿下播异常',
+                                     exc_info=True)
+                    self.is_streaming = False
+                    self.current_instruction = None
+                    self._current_run_id = ''
+                    return False
+                self.state.begin_session(
+                    instruction.zone_name, self.current_room_id,
+                    instruction.duration_seconds, duration_known=True,
+                    source=source, task_id=getattr(instruction, 'task_id', None),
+                    execution_date=getattr(instruction, 'execution_date', None),
+                    initial_elapsed=saved_elapsed,
+                    service_instance=self._boot_id,
+                    run_id=self._current_run_id)
+                self.state.mark_phase(PHASE_LIVE, persist=True)
 
             # 推送开播事件（触发邮件/Server酱通知）
             mode_label = '任务模式' if is_task_mode else '手动模式'
@@ -2092,16 +3171,46 @@ class LiveController:
             self._ffmpeg_unrecycled = False
             logger.info(" 推流进程已确认退出并回收")
 
-    def confirm_face_verify(self) -> bool:
-        """清除人脸验证待处理状态，供前端确认后重试开播。
+    def _verification_owner_mismatch(self, run_id=None, room_id=None,
+                                     epoch=None) -> str:
+        """Return a reason when a confirmation belongs to an older session."""
+        if epoch is not None:
+            try:
+                if int(epoch) != int(self._control_epoch):
+                    return (f'控制代际已变化（确认链接={epoch}，'
+                            f'当前={self._control_epoch}）')
+            except (TypeError, ValueError):
+                return '控制代际不可比对'
+        if room_id is not None and self.current_room_id is not None:
+            try:
+                if int(room_id) != int(self.current_room_id):
+                    return (f'房间号已变化（确认链接={room_id}，'
+                            f'当前={self.current_room_id}）')
+            except (TypeError, ValueError):
+                return '房间号不可比对'
+        if run_id:
+            current = (self._current_run_id or self._pending_run_id
+                       or getattr(self.state, 'run_id', '') or '')
+            if current and current != run_id:
+                return f'会话身份已变化（确认链接属于 {run_id}，当前为 {current}）'
+        return ''
 
-        A7：确认动作绑定当前控制代际——用户停止后（代际已推进）到达的
-        邮件/远程确认不会重试开播。
-        """
-        self._pending_face_verify = False
-        self._face_verify_url = ''
-        logger.info(" 人脸验证状态已清除，可重试开播")
-        return True
+    def confirm_face_verify(self, run_id=None, room_id=None,
+                            epoch=None) -> bool:
+        """Clear verification only for the still-current locked session."""
+        with self._start_lock:
+            mismatch = self._verification_owner_mismatch(run_id, room_id, epoch)
+            if mismatch:
+                logger.warning('忽略过期的人脸验证确认：%s', mismatch)
+                return False
+            if self.stop_monitor.is_set():
+                logger.info('已请求停止，忽略人脸验证确认')
+                return False
+            self._pending_face_verify = False
+            self._face_verify_url = ''
+            self._recovery_blocked = ''
+            logger.info(' 人脸验证状态已清除，可重试开播')
+            return True
 
     def retry_after_face_verify_guarded(self, confirm_epoch: int = None) -> bool:
         """邮件确认后的重试守卫（A7）。
@@ -2114,58 +3223,332 @@ class LiveController:
             return False
         return True
 
-    def _push_backend_event(self, tag: str, event_type: str, message: str):
-        """向后端事件日志推送一条记录（供前端轮询展示），同时触发邮件"""
+    _NOTIFY_BY_TAG = {
+        '重连': 'recovering',
+        '验证': 'action_required',
+        '错误': 'action_required',
+        '异常': 'action_required',
+    }
+
+    def _push_backend_event(self, tag: str, event_type: str, message: str,
+                            notify: bool = True):
+        """Append a stable, bounded operation event and optionally notify."""
+        with self._event_lock:
+            self._event_seq += 1
+            seq = self._event_seq
         self._backend_events.append({
             'tag': tag,
-            'type': event_type,  # success|danger|warning|info
+            'type': event_type,
             'message': message,
             'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'seq': seq,
+            'boot_id': self._boot_id,
+            'id': f'{self._boot_id}:{seq}',
         })
         if len(self._backend_events) > 100:
             self._backend_events = self._backend_events[-50:]
-        # 触发邮件通知
-        self._try_email_notify(tag, event_type, message)
+        if notify:
+            self._try_email_notify(tag, event_type, message)
 
     def _try_email_notify(self, tag: str, event_type: str, message: str):
-        """根据事件类型决定是否发送邮件"""
+        """Send structured facts from the event's current session snapshot."""
         try:
             from app.dependencies import get_email_sender
             sender = get_email_sender()
             if not sender:
                 return
-            zone = self.current_instruction.zone_name if self.current_instruction else ''
-            elapsed = int((datetime.now() - self.stream_start_time).total_seconds()) if self.stream_start_time else 0
-            elapsed_label = f"{elapsed // 60}分钟" if elapsed > 0 else ""
-
-            if tag in ('开播',):
-                dur = self.current_instruction.duration_seconds if self.current_instruction else 0
-                dur_label = f"{dur // 60}分钟" if dur > 0 else '不限时'
-                sender.send_task_start(zone, dur_label)
-            elif tag in ('完成',) and '任务完成' in message:
-                sender.send_task_complete(zone, elapsed_label)
-            elif tag in ('重连',) and '重试次数耗尽' in message:
-                try:
-                    from app.api.settings import load_settings
-                    s = load_settings()
-                    sender.send_reconnect_exhausted(s.live_retry_cooldown_minutes)
-                except Exception:
-                    sender.send_reconnect_exhausted(60)
-            elif tag in ('重连',) and '尝试重连' in message:
-                import re
-                m = re.search(r'(\d+)/(\d+)', message)
-                if m:
-                    sender.send_reconnect_start(int(m.group(1)), int(m.group(2)))
-            elif tag in ('验证',) and '人脸验证' in message:
-                verify_url = self._face_verify_url or ''
-                if verify_url:
-                    sender.send_face_verify(verify_url)
+            zone = (self.current_instruction.zone_name
+                    if self.current_instruction else self.state.current_zone)
+            elapsed = self._confirmed_elapsed() if self.is_streaming else 0
+            elapsed_label = f'{elapsed // 60} 分钟'
+            duration = (self.current_instruction.duration_seconds
+                        if self.current_instruction else self.state.duration_seconds)
+            duration_label = f'{duration // 60} 分钟' if duration > 0 else '不限时'
+            remaining = max(0, duration - elapsed) if duration > 0 else 0
+            run_id = getattr(self.state, 'run_id', '') or self._current_run_id
+            if tag == '开播':
+                sender.notify_stream_running(
+                    zone, self._current_source, elapsed_label, duration_label,
+                    f'{remaining // 60} 分钟' if remaining else '未知',
+                    room_id=self.current_room_id, run_id=run_id)
+            elif tag == '完成':
+                # Completion is emitted by the settlement path after its DB commit.
+                return
+            elif tag == '停播':
+                sender.notify_stopped(zone, 'stopped', elapsed_label)
+            elif tag in self._NOTIFY_BY_TAG:
+                if self._NOTIFY_BY_TAG[tag] == 'recovering':
+                    sender.notify_recovering(
+                        zone, self.reconnect_attempts, message, run_id=run_id)
                 else:
-                    sender.send_error('人脸验证', message)
-            elif tag in ('错误', '异常') and event_type == 'danger':
-                sender.send_error(tag, message)
-        except Exception as e:
-            logger.debug(f" 邮件通知异常：{e}")
+                    sender.notify_action_required(
+                        tag, message, still_streaming=bool(self.is_streaming),
+                        action='按提示处理后在面板重试；如需中断请先点停止',
+                        identity=f'{run_id}:{self._control_epoch}')
+            elif tag == '推流':
+                sender.notify_local_stream_fail(zone, message, run_id=run_id)
+        except Exception as exc:
+            logger.debug('结构化通知异常：%s', exc)
+
+    def _notify_verification_required(self, message: str,
+                                      stage: str = 'start_blocked',
+                                      local_stop_requested: bool = False) -> None:
+        """Freeze the face-verification retry intent at notification time."""
+        self._verify_retry_mode = (
+            'manual' if self._stream_mode == 'manual' else 'task')
+        try:
+            from app.dependencies import get_email_sender
+            sender = get_email_sender()
+            if not sender or not self._face_verify_url:
+                return
+            instruction = self.current_instruction
+            # Before the session is committed, _current_source still carries
+            # its class default (``new``).  Use the pending intent for that
+            # path so a resume challenge cannot be retried as a fresh start.
+            source = (self._current_source if self.is_streaming or
+                      self._current_run_id else self._pending_source)
+            sender.send_face_verify(
+                self._face_verify_url,
+                run_id=(self._current_run_id or self._pending_run_id
+                        or getattr(self.state, 'run_id', '')),
+                room_id=self.current_room_id,
+                epoch=self._control_epoch,
+                still_streaming=bool(self.is_streaming),
+                stage=stage,
+                local_stop_requested=local_stop_requested,
+                mode=self._verify_retry_mode,
+                source=(source or SOURCE_NEW),
+                inherit_elapsed=int(self._pending_inherit or 0),
+                zone=(instruction.zone_name if instruction else self.state.current_zone),
+                task_id=(instruction.task_id if instruction else None),
+                execution_date=(instruction.execution_date if instruction else None),
+                reason=message)
+        except Exception as exc:
+            logger.debug('人脸验证通知异常：%s', exc)
+
+    def _notify_task_complete(self, zone_name: str, outcome: dict,
+                              result: Optional[str] = None) -> None:
+        """Notify only after the settlement transaction has reported its result."""
+        try:
+            from app.dependencies import get_email_sender
+            sender = get_email_sender()
+            if not sender:
+                return
+            status = result or (outcome or {}).get('status', 'failed')
+            if status not in ('settled', 'already', 'failed'):
+                status = 'failed'
+            scope = 'all' if (outcome or {}).get('all_done') else 'today'
+            days = (outcome or {}).get('days_done')
+            progress = f'已完成 {days} 天' if days is not None else ''
+            sender.notify_task_complete(
+                zone_name,
+                str((outcome or {}).get('execution_date') or ''),
+                scope=scope,
+                result=status,
+                progress=progress)
+        except Exception as exc:
+            logger.debug('完成通知异常：%s', exc)
+
+    def _notify_stopped(self, zone_name: str, stage: str = 'stopped',
+                        elapsed: int = 0, reason: str = '') -> None:
+        """Notify the confirmed stop stage without changing stop semantics."""
+        try:
+            from app.dependencies import get_email_sender
+            sender = get_email_sender()
+            if not sender:
+                return
+            label = f'{int(elapsed) // 60} 分钟' if elapsed else ''
+            sender.notify_stopped(zone_name, stage, label, reason)
+        except Exception as exc:
+            logger.debug('停止通知异常：%s', exc)
+
+    def _notify_recovered(self, zone_name: str, scope: str = 'platform',
+                          evidence: str = '', run_id: str = '') -> None:
+        """Notify a recovery only at a production recovery success point."""
+        try:
+            from app.dependencies import get_email_sender
+            sender = get_email_sender()
+            if not sender:
+                return
+            sender.notify_recovered(zone_name, scope=scope,
+                                    evidence=evidence, run_id=run_id)
+        except Exception as exc:
+            logger.debug('恢复通知异常：%s', exc)
+
+    def _finish_manual_expiry(self, zone_name: str, elapsed: int) -> None:
+        """Finish a manual duration expiry, then report the real cleanup stage."""
+        try:
+            self._stop_live_process(preserve_state=False)
+            confirmed = self._cleanup_confirmed()
+            stage = 'stopped' if confirmed else 'pending_recycle'
+            reason = ('' if confirmed
+                      else '仍有资源未确认回收，可再次点击停止重试')
+            panel_line = (
+                f'直播已停止（{zone_name or "未知分区"}）' if confirmed
+                else f'直播停止处理中（{zone_name or "未知分区"}）；清理结果待确认，{reason}')
+            self._push_backend_event('停播', 'info', panel_line, notify=False)
+            self._notify_stopped(zone_name or '未知分区', stage, elapsed, reason)
+        except Exception:
+            logger.debug('手动到期收尾通知异常（不影响停止结果）', exc_info=True)
+
+    def _settle_natural_completion(self, zone_name: str,
+                                   task_id: Optional[int],
+                                   execution_day: Optional[str],
+                                   run_id: Optional[str] = None) -> str:
+        """Settle one task identity and report only the committed outcome.
+
+        A single bounded retry covers a transient database failure.  Identity,
+        execution date and run id stay frozen from the completed session, so a
+        replacement task cannot receive a late completion.
+        """
+        exec_date = None
+        if execution_day:
+            try:
+                exec_date = datetime.strptime(str(execution_day), '%Y-%m-%d').date()
+            except (TypeError, ValueError):
+                exec_date = None
+
+        def settle_once():
+            if not self.task_manager:
+                return {'status': 'failed', 'zone_name': zone_name,
+                        'task_id': task_id, 'execution_date': execution_day}
+            try:
+                return self.task_manager.settle_task_done(
+                    zone_name, execution_date=exec_date,
+                    task_id=task_id, run_id=run_id)
+            except TypeError as exc:
+                # Do not retry the call without run identity: a real signature
+                # failure must remain an explicit failed settlement.
+                logger.error('任务结算身份接口错误：%s', exc)
+                return {'status': 'failed', 'zone_name': zone_name,
+                        'task_id': task_id, 'execution_date': execution_day}
+
+        outcome = settle_once()
+        status = outcome.get('status', 'failed') if isinstance(outcome, dict) else (
+            'settled' if outcome else 'failed')
+        if status in ('settled', 'already'):
+            outcome = outcome if isinstance(outcome, dict) else {
+                'status': status, 'execution_date': execution_day}
+            self._push_backend_event(
+                '完成', 'success' if status == 'settled' else 'info',
+                (f'任务完成：{zone_name}（执行日 {outcome.get("execution_date", execution_day)}）'
+                 if status == 'settled'
+                 else f'任务今日已完成，未重复计天：{zone_name}'),
+                notify=False)
+            self._notify_task_complete(zone_name, outcome)
+            return status
+        if status in ('replaced', 'not_found', 'stale_day'):
+            self._push_backend_event(
+                '完成', 'warning',
+                f'任务已被替换、删除或执行日已失效，未结算到新记录：{zone_name}')
+            logger.warning('任务自然结束但身份/执行日已变化，跳过结算：%s (%s)',
+                           zone_name, status)
+            return status
+
+        # One retry is deliberately bounded.  A persistent failure remains
+        # visible and is sent as an action-required notification, never as a
+        # successful completion.
+        logger.warning('任务结算失败，重试一次：%s', zone_name)
+        time.sleep(0.5)
+        retry = settle_once()
+        retry_status = retry.get('status', 'failed') if isinstance(retry, dict) else (
+            'settled' if retry else 'failed')
+        retry = retry if isinstance(retry, dict) else {
+            'status': retry_status, 'execution_date': execution_day}
+        if retry_status in ('settled', 'already'):
+            self._push_backend_event(
+                '完成', 'success' if retry_status == 'settled' else 'info',
+                f'任务完成（重试后提交）：{zone_name}', notify=False)
+            self._notify_task_complete(zone_name, retry)
+        else:
+            self._push_backend_event(
+                '完成', 'danger',
+                f'任务结算失败，需人工处理：{zone_name}（数据库写入未完成，可稍后在任务页手动标记完成）')
+            self._notify_task_complete(zone_name, retry, result='failed')
+            logger.error('任务自然结束但结算未提交（已回滚）：%s → %s',
+                         zone_name, retry_status)
+        return retry_status
+
+    @staticmethod
+    def classify_failure(resp: dict) -> str:
+        """Classify one platform result without treating unknown as success."""
+        if not isinstance(resp, dict):
+            return 'unknown'
+        if resp.get('cancelled'):
+            return 'cancelled'
+        if resp.get('retryable'):
+            return 'transient'
+        code = resp.get('code', -1)
+        if code in (60024, 60043):
+            return 'verification'
+        if isinstance(code, int) and not isinstance(code, bool) and code < 0:
+            return 'transient'
+        return 'rejected'
+
+    def _handle_platform_failure(self, resp: dict,
+                                 context: str = 'control') -> None:
+        """Handle explicit platform failures while keeping unknown status safe.
+
+        Desktop has no server diagnostics subsystem.  Status queries only emit
+        a bounded, user visible unknown/verification event and keep the local
+        stream alive; control failures may pause recovery and stop owned local
+        output when the platform explicitly requires human verification.
+        """
+        kind = self.classify_failure(resp)
+        if kind in ('transient', 'cancelled'):
+            return
+        payload = resp if isinstance(resp, dict) else {}
+        code = payload.get('code', -1)
+        message = payload.get('message') or payload.get('msg') or '平台拒绝请求'
+
+        if context == 'status_query':
+            self._status_query_failures = getattr(self, '_status_query_failures', 0) + 1
+            self._status_query_failures_total = getattr(
+                self, '_status_query_failures_total', 0) + 1
+            if code in (60024, 60043):
+                self._pending_face_verify = True
+                uid = self.api.cookies.get('DedeUserID', '')
+                self._face_verify_url = (
+                    'https://www.bilibili.com/blackboard/live/face-auth-middle.html'
+                    f'?source_event=400&mid={uid}')
+                self._push_backend_event(
+                    '验证', 'warning',
+                    '直播间状态查询提示需要人脸验证，请完成验证后继续',
+                    notify=False)
+                self._notify_verification_required(
+                    '直播间状态查询提示需要人脸验证（推流可能仍在继续）',
+                    stage='status_query')
+                return
+            if (self._status_query_failures == 1 or
+                    self._status_query_failures % 20 == 0):
+                self._push_backend_event(
+                    '监控', 'warning',
+                    f'直播状态查询失败（第 {self._status_query_failures} 次，状态未知），'
+                    '推流保持不变')
+            logger.warning('直播间状态查询失败（第 %s 次，code=%s）：%s',
+                           self._status_query_failures, code, message)
+            return
+
+        self._recovery_blocked = f'{message} (code={code})'
+        if code in (60024, 60043):
+            self._pending_face_verify = True
+            uid = self.api.cookies.get('DedeUserID', '')
+            self._face_verify_url = (
+                'https://www.bilibili.com/blackboard/live/face-auth-middle.html'
+                f'?source_event=400&mid={uid}')
+            self._ffmpeg_stop_event.set()
+            self._kill_ffmpeg()
+            self._push_backend_event(
+                '验证', 'warning',
+                '恢复直播需要人脸验证，请完成验证后继续', notify=False)
+            self._notify_verification_required(
+                '恢复直播需要人脸验证', stage='resume_blocked',
+                local_stop_requested=True)
+        else:
+            self._push_backend_event(
+                '错误', 'danger', f'自动恢复暂停：{self._recovery_blocked}')
+            self._ffmpeg_stop_event.set()
+            self._kill_ffmpeg()
 
     def _check_network_ok(self) -> bool:
         """快速检查自身网络是否正常（ping 百度）"""
@@ -2225,7 +3608,9 @@ class LiveController:
         if not csrf:
             return
         area_id = self.area_loader.get_area_id(self.current_instruction.zone_name, auto_update=False)
+        request_start = _monotonic()
         success, resp = self.api.start_live(self.current_room_id, area_id, csrf)
+        returned = _monotonic()
         # D1：平台响应期间的停止 → 撤销刚重开的房间，绝不恢复推流。
         # 若期间用户已接受新开播意图，房间状态归新意图的清理流程管，
         # 这里不再补发下播（避免误关新任务的房间）。
@@ -2240,6 +3625,16 @@ class LiveController:
             return
         if success:
             logger.info(" 重连成功，直播间已重新开启")
+            self._credit_effective_observation(request_start, returned)
+            zone = (self.current_instruction.zone_name
+                    if self.current_instruction else
+                    getattr(self.state, 'current_zone', '') or '')
+            self._push_backend_event(
+                '重连', 'success', '直播间已重新开启，正在恢复本地推流',
+                notify=False)
+            self._notify_recovered(
+                zone, 'platform', '平台 start_live 返回成功',
+                getattr(self.state, 'run_id', '') or self._current_run_id)
             self._extract_and_cache_rtmp(resp)  # 更新推流码缓存
             # CTRL-01：缓存/准备期间同样可能发生停止；stop_monitor 会被下一次
             # 开播清除，不能作为唯一判据——必须复核本代是否仍是当前代，之后才
@@ -2266,148 +3661,157 @@ class LiveController:
                 logger.warning(" 重连遇到人脸验证，停止重试等待人工确认")
 
     def _monitor_streaming(self):
-        """监控直播状态 — 分层重试策略：
-        - 自身网络不通 → 无限重试（等网络恢复）
-        - 直播间状态异常 → 1h 内最多 max_reconnect 次，耗尽后冷却 live_retry_cooldown_minutes
-        - 人脸验证(60024/60043) → 不重试，等人工确认
+        """监控直播并按平台确认的有效时长结算任务。
+
+        查询失败或平台明确关闭都会暂停有效计时；查询结果返回后还要复核
+        epoch/run 身份，迟到的旧响应不能给新会话加时。
         """
         is_manual = (self._stream_mode == 'manual')
-        logger.info(f" 启动直播监控线程（模式：{self._stream_mode}）")
-        last_check_time = time.time()
-        last_cross_day_check = time.time()
+        monitor_epoch = self._control_epoch
+        monitor_run_id = getattr(self, '_current_run_id', '') or getattr(self.state, 'run_id', '')
+        last_check_time = _monotonic()
+        last_cross_day_check = _monotonic()
         should_stop = False
         cross_day_detected = False
 
-        # 读取重试设置
         max_retries = self.max_reconnect
         cooldown_minutes = 60
         monitor_interval = MONITOR_INTERVAL
         try:
             from app.api.settings import load_settings
-            s = load_settings()
-            max_retries = s.max_reconnect
-            cooldown_minutes = s.live_retry_cooldown_minutes
-            if s.scan_interval_seconds and s.scan_interval_seconds >= 5:
-                monitor_interval = s.scan_interval_seconds
+            settings = load_settings()
+            max_retries = settings.max_reconnect
+            cooldown_minutes = settings.live_retry_cooldown_minutes
+            if settings.scan_interval_seconds and settings.scan_interval_seconds >= 5:
+                monitor_interval = settings.scan_interval_seconds
         except Exception:
             pass
+        self._monitor_interval_seconds = monitor_interval
+        self._clock().credit_limit = effective_credit_limit(monitor_interval)
 
         while not self.stop_monitor.is_set() and self.is_streaming and not should_stop:
-            now = time.time()
-
-            # 跨日检测（仅任务模式，手动模式不受干扰）
-            if not is_manual and now - last_cross_day_check >= CROSS_DAY_CHECK_INTERVAL:
+            if self._recovery_blocked:
+                self._pause_effective_timer(TIMER_PAUSED_BLOCKED)
+                self.stop_monitor.wait(1)
+                continue
+            now = _monotonic()
+            if (not is_manual and
+                    now - last_cross_day_check >= CROSS_DAY_CHECK_INTERVAL):
                 last_cross_day_check = now
                 if self.state.is_cross_day():
-                    logger.warning(" 检测到跨日！中断当前直播任务..")
-                    self._push_backend_event('跨日', 'warning', '检测到跨日，中断当前任务，等待每日重置后执行新任务')
+                    logger.warning("检测到跨日，中断当前直播任务")
+                    self._push_backend_event(
+                        '跨日', 'warning', '检测到跨日，中断当前任务，等待每日重置后执行新任务')
                     cross_day_detected = True
                     should_stop = True
                     break
 
             if now - last_check_time >= monitor_interval:
                 last_check_time = now
-                if self.stream_start_time and self.current_instruction:
-                    elapsed = (datetime.now() - self.stream_start_time).total_seconds()
-                    if not is_manual:
-                        self.state.update_progress(int(elapsed))
-                    dur = self.current_instruction.duration_seconds
-                    if dur > 0 and elapsed >= dur:
-                        logger.info(f" 直播时长已到 ({elapsed / 60:.1f}分钟)")
-                        should_stop = True
-                        break
-
-                # === 分层重试逻辑（A4：查询失败只记未知，不据此掐流） ===
                 if self.current_room_id:
+                    request_start = _monotonic()
                     success, status_resp = self.api.get_live_status(self.current_room_id)
-                    live_ok = success and status_resp.get('data', {}).get('live_status') == 1
-
+                    returned = _monotonic()
+                    if not self._owns_current_run(monitor_epoch, monitor_run_id):
+                        logger.info("状态观察返回时本场已被接管，丢弃旧观察：%s", monitor_run_id)
+                        break
+                    data = status_resp.get('data') if isinstance(status_resp, dict) else None
+                    live_status = data.get('live_status') if isinstance(data, dict) else None
+                    known_status = (isinstance(live_status, int)
+                                    and not isinstance(live_status, bool)
+                                    and live_status in (0, 1))
+                    live_ok = success and known_status and live_status == 1
                     if live_ok:
-                        # 直播状态正常，重置重试计数与未知计数
                         self.reconnect_attempts = 0
                         self._retry_cooldown_until = None
                         self._retry_window_start = None
                         self._status_query_failures = 0
-                    elif success:
-                        # API 成功但 live_status != 1（确认被平台关闭）
-                        self._status_query_failures = 0
-                        logger.warning(" 直播间已被平台关闭 (live_status=0)")
-                        if not self._check_network_ok():
-                            logger.warning(" 自身网络不通，等待恢复...")
-                            if self.stop_monitor.wait(10):
-                                break
-                            continue
-                        # 网络正常 → 尝试重开直播间（限次）
+                        self._credit_effective_observation(request_start, returned)
+                        mode, _ = self._get_stream_settings()
+                        if mode == 'ffmpeg' and not (
+                                self._ffmpeg_loop_thread and
+                                self._ffmpeg_loop_thread.is_alive()):
+                            self._start_ffmpeg_stream(monitor_epoch)
+                    elif success and known_status and live_status == 0:
+                        logger.warning("直播间已被平台关闭 (live_status=0)")
+                        self._pause_effective_timer(TIMER_PAUSED_CLOSED, returned)
                         self._handle_live_anomaly_retry(max_retries, cooldown_minutes)
                     else:
-                        # API 调用本身失败：状态未知 ≠ 直播已断。
-                        # 本地 FFmpeg 可能仍在正常推进，绝不能据此重开/停播（A4）。
-                        code = status_resp.get('code', -1)
-                        if code in (60024, 60043):
-                            logger.warning(" 直播状态异常（人脸验证），等待人工确认")
-                            continue
-                        self._status_query_failures += 1
-                        self._status_query_failures_total += 1
-                        now = time.time()
-                        if now - self._last_query_failure_notice >= 60.0:
-                            self._last_query_failure_notice = now
-                            logger.warning(
-                                f" 状态查询失败（未知，第 {self._status_query_failures} 次），"
-                                f"保持当前直播不动，仅节流提示")
-                            self._push_backend_event(
-                                '监控', 'warning',
-                                f'直播状态查询失败（状态未知，不影响本地推流），已连续 {self._status_query_failures} 次')
+                        failure_kind = self.classify_failure(status_resp)
+                        handled_explicit = (
+                            not success and
+                            failure_kind in ('verification', 'rejected'))
+                        if handled_explicit:
+                            # Explicit platform failures get their structured
+                            # status/verification fact once.  Transport and
+                            # malformed envelopes remain the generic unknown
+                            # path below and never trigger reconnect.
+                            self._handle_platform_failure(
+                                status_resp, context='status_query')
+                        # A successful HTTP/API envelope without an explicit
+                        # live_status is still an unknown observation.  It must
+                        # pause confirmation accounting, never trigger reconnect.
+                        self._pause_effective_timer(TIMER_PAUSED_UNKNOWN, returned)
+                        if not handled_explicit:
+                            self._status_query_failures += 1
+                            self._status_query_failures_total += 1
+                            if (self._status_query_failures == 1 or
+                                    self._status_query_failures % 20 == 0):
+                                self._push_backend_event(
+                                    '监控', 'warning',
+                                    f'直播状态查询失败（状态未知，不影响本地推流），已连续 '
+                                    f'{self._status_query_failures} 次')
+                if self.current_instruction:
+                    confirmed = self._confirmed_elapsed()
+                    duration = int(self.current_instruction.duration_seconds or 0)
+                    if duration > 0 and confirmed >= duration:
+                        logger.info("直播有效时长已到（%.1f 分钟）", confirmed / 60.0)
+                        should_stop = True
+                        break
+            self.stop_monitor.wait(1)
 
-            if self.stop_monitor.wait(1):
-                break
-
-        # 退出处理（不变）
         if should_stop:
-            zone_name_done = self.current_instruction.zone_name if self.current_instruction else '未知'
+            zone_name_done = (self.current_instruction.zone_name
+                              if self.current_instruction else '未知')
+            if not self._owns_current_run(monitor_epoch, monitor_run_id):
+                logger.info("监控退出时本场已被接管，放弃下播与轮转：%s", monitor_run_id)
+                return
             if cross_day_detected:
-                logger.info(" 跨日中断：任务被跳过，等待重置后选取新任务")
                 self._stop_live_process(preserve_state=False)
                 self.state.stop_streaming()
                 self.current_instruction = None
-                # 等待 TaskManager 每日重置，然后自动执行下一个任务
-                if self.task_manager:
-                    logger.info(" 等待 TaskManager 每日重置...")
-                    self._push_backend_event('重置', 'info', '每日重置中，等待完成后执行新任务')
-                    self.task_manager.wait_for_reset_complete(timeout=120.0)
-                    logger.info(" 重置完成，执行下一个任务...")
-                    self._push_backend_event('重置', 'success', '每日重置完成')
-                    self.run_next_task()
             elif is_manual:
-                logger.info("手动模式直播时长已到，自动下播")
-                self._push_backend_event('停播', 'info', f'手动模式时长已到，自动下播（{zone_name_done}）')
-                self._stop_live_process(preserve_state=False)
+                self._push_backend_event(
+                    '停播', 'info',
+                    f'手动模式时长已到，自动下播（{zone_name_done}）',
+                    notify=False)
+                self._finish_manual_expiry(
+                    zone_name_done,
+                    self._confirmed_elapsed() if self.is_streaming else 0)
+                self.current_instruction = None
             else:
-                logger.info("任务完成，更新 Excel...")
-                self._push_backend_event('完成', 'success', f'任务完成：{zone_name_done}')
+                instruction = self.current_instruction
+                task_id = getattr(instruction, 'task_id', None) if instruction else None
+                execution_day = (getattr(instruction, 'execution_date', None)
+                                 or getattr(self.state, 'execution_date', None))
                 self._stop_live_process(preserve_state=False)
-                task_done = False
-                if self.current_instruction and self.task_manager:
-                    if self.task_manager.mark_task_done(self.current_instruction.zone_name):
-                        logger.info(f" 任务 '{self.current_instruction.zone_name}' 已完成并写入 Excel")
-                        self.current_instruction = None
-                        self.state.stop_streaming()
-                        task_done = True
-                # 任务模式下自动执行下一个任务
-                if task_done:
-                    logger.info(" 自动查找并执行下一个任务...")
-                    self._push_backend_event('切换', 'info', f'任务「{zone_name_done}」完成，自动执行下一个任务')
-                    self.run_next_task()
-                    if self._pending_face_verify:
-                        logger.warning(" 自动切换任务遇到人脸验证，等待前端确认")
-        logger.info(" 直播监控线程已退出")
+                self._release_active_task(monitor_run_id)
+                status = self._settle_natural_completion(
+                    zone_name_done, task_id, execution_day, monitor_run_id)
+                if status in ('settled', 'already'):
+                    self.current_instruction = None
+                    self.state.stop_streaming()
+                    self._current_run_id = ''
+                    self.run_next_task(epoch=monitor_epoch)
+                else:
+                    self.current_instruction = None
+                    self.state.stop_streaming()
+                    self._current_run_id = ''
+        logger.info("直播监控线程已退出")
 
     @staticmethod
     def _platform_stop_ok(result) -> bool:
-        """平台下播结果归一化：容错 (ok, payload) 元组与裸布尔。
-
-        None 表示实现没有返回值——请求未抛异常，视为已下发（与旧行为一致，
-        不把"没有返回值"当成失败而反复重试平台下播）。
-        """
+        """Normalize platform stop responses from adapters and test doubles."""
         if isinstance(result, tuple):
             return bool(result[0]) if result else False
         if result is None:
@@ -2415,95 +3819,169 @@ class LiveController:
         return bool(result)
 
     def _cleanup_confirmed(self) -> bool:
-        """本次停止是否**确认**完成：owned 进程已回收、平台下播已下发。
-
-        必须基于实际状态判定，不能因为清理函数"返回了"就当作完成：回收失败时
-        引用仍在且 _ffmpeg_unrecycled 为真，此时若标记完成，重复停止会被
-        "已完成"分支短路，连一次回收重试都没有机会。
-        """
+        """Confirm that owned local processes and platform stop are both done."""
         if self._process_alive(self.video_process):
             return False
-        if self._ffmpeg_unrecycled:
+        if getattr(self, '_ffmpeg_unrecycled', False):
             return False
         return bool(self._platform_stop_done)
 
-    def _stop_live_process(self, preserve_state: bool = False):
-        """停止直播进程（不 join 线程）
-        preserve_state=True: 保留 live_state 以便恢复（任务模式手动停播时使用）
+    def _clear_pending_start_intent(self) -> None:
+        """Forget an uncommitted start after its owned cleanup has run."""
+        self._pending_source = SOURCE_NEW
+        self._pending_inherit = 0
+        self._pending_run_id = ''
+
+    def _stop_live_process(self, preserve_state: bool = False,
+                           persist_state: bool = True,
+                           stop_platform: bool = True):
+        """Stop owned local processes and optionally retain a resumable task state.
+
+        ``persist_state=False`` is used when cancelling an uncommitted start:
+        owned local resources still need to be reclaimed, but the saved state
+        belongs to the previous committed session and must remain untouched.
+        ``stop_platform=False`` lets the pending worker, which owns the
+        platform request, perform the compensating stop if it returns late.
         """
-        # 通知 FFmpeg 循环线程退出
         self._ffmpeg_stop_event.set()
-        # 终止 FFmpeg/视频进程（A5：所有权精确回收，失败保留引用）
         self._kill_ffmpeg()
-        # 等待循环线程退出
         if self._ffmpeg_loop_thread and self._ffmpeg_loop_thread.is_alive():
             self._ffmpeg_loop_thread.join(timeout=3.0)
         self._ffmpeg_stop_event.clear()
-        # 平台下播与本地进程回收分开记录：已确认下发的房间不再重复下播
-        # （重试"本地回收"时不得顺手把已被新意图接管的房间再下一次播）；
-        # 未下发/失败则保留待办，允许后续显式停止重试。
-        if not self.current_room_id:
-            self._platform_stop_done = True
-        elif not self._platform_stop_done:
-            csrf = self.api.get_csrf()
-            if csrf:
-                try:
-                    self._platform_stop_done = self._platform_stop_ok(
-                        self.api.stop_live(self.current_room_id, csrf))
-                except Exception as e:
-                    logger.warning(f" 平台下播请求异常（本地进程仍会停止）：{e}")
-        # 保留实际已播时长（在清除 stream_start_time 之前计算）
+
+        if stop_platform:
+            if not self.current_room_id:
+                self._platform_stop_done = True
+            elif not self._platform_stop_done:
+                csrf = self.api.get_csrf()
+                if csrf:
+                    try:
+                        self._platform_stop_done = self._platform_stop_ok(
+                            self.api.stop_live(self.current_room_id, csrf))
+                    except Exception as exc:
+                        logger.warning("平台下播请求异常（本地进程仍会停止）：%s", exc)
+
         actual_elapsed = 0
-        if preserve_state and self.stream_start_time and self.current_instruction:
-            actual_elapsed = int((datetime.now() - self.stream_start_time).total_seconds())
+        if preserve_state and self.current_instruction:
+            actual_elapsed = max(
+                int(self._stop_progress_accumulated or 0),
+                self._confirmed_elapsed(),
+                int(float(getattr(self.state, 'effective_seconds', 0) or 0)))
         self.is_streaming = False
         self.stream_start_time = None
+        self._segment_monotonic = None
+        run_at_stop = self._current_run_id
         if preserve_state:
-            # 保留状态以供恢复（任务模式下手动停播后显示恢复提示）
-            self.state.elapsed_seconds = max(self.state.elapsed_seconds, actual_elapsed)
+            if self.current_instruction:
+                self.state.current_zone = self.current_instruction.zone_name
+                self.state.task_id = getattr(self.current_instruction, 'task_id', None)
+            if run_at_stop:
+                self.state.run_id = run_at_stop
+            self.state.effective_seconds = max(
+                float(getattr(self.state, 'effective_seconds', 0) or 0),
+                float(actual_elapsed))
+            self.state.accumulated_seconds = self.state.elapsed_seconds
             self.state.is_streaming = True
+            self.state.phase = PHASE_IDLE
+            self.state.source_mode = SOURCE_RESUME
             self.state.save()
-            logger.info(f" 已保留直播状态以便恢复（已播={self.state.elapsed_seconds}秒）")
-        else:
+            self._clock().reset(confirmed=self.state.effective_seconds,
+                                origin='resume')
+            logger.info("已保留直播状态（已确认有效时长=%s秒）",
+                        self.state.elapsed_seconds)
+        elif persist_state:
             self.state.is_streaming = False
-
+            self._clock().reset(0.0, 'none')
+        else:
+            # Keep the previous saved identity/target intact while real local
+            # resources are reclaimed for a pending, not-yet-committed start.
+            saved_effective = float(
+                getattr(self.state, 'effective_seconds', 0) or 0)
+            saved_origin = ('resume' if getattr(self.state, 'current_zone', '')
+                            else 'none')
+            self._clock().reset(saved_effective, saved_origin)
+        self._current_run_id = ''
+        self._release_active_task(run_at_stop)
     def stop_streaming(self, token: str = '') -> bool:
-        """停止直播（用户对外接口，A7）。
+        """Stop once, keeping the cleanup interval exclusive to this intent."""
+        with self._start_lock:
+            if self._stop_in_progress:
+                logger.info("停止清理已在进行中，重复请求只等待既有结果")
+                return True
+            self._stop_in_progress = True
+            # Freeze the committed-vs-pending decision and invalidate the
+            # current start worker before releasing the same lock used by the
+            # final session commit.  This closes the interval in which a
+            # pending B could commit after stop had decided to preserve A.
+            pending_only = bool(self._is_starting and not self.is_streaming)
+            if pending_only:
+                zone_at_stop = getattr(self.state, 'current_zone', '') or ''
+                elapsed_at_stop = int(
+                    getattr(self.state, 'elapsed_seconds', 0) or 0)
+            else:
+                zone_at_stop = (
+                    self.current_instruction.zone_name
+                    if self.current_instruction
+                    else getattr(self.state, 'current_zone', '') or '')
+                elapsed_at_stop = (
+                    self._confirmed_elapsed() if self.is_streaming else 0)
+            self._control_epoch += 1
+            self._start_cancel.set()
+        try:
+            return self._stop_streaming_impl(
+                token, pending_only, zone_at_stop, elapsed_at_stop)
+        finally:
+            with self._start_lock:
+                self._stop_in_progress = False
 
-        - 先推进控制代际并取消在途开播：挂起中的 start 在各复核点失效，
-          其迟到结果被撤销（包括平台侧刚打开的房间）；
-        - 持久化用户停止意图：旧开播/邮件回调不能改回；重开应用只提示继续；
-        - 任务模式保留状态以便恢复（保持桌面默认"重开后提示继续，不自动开播"），
-          手动模式彻底清除。
-        """
-        logger.info("  停止直播...")
-        # 1) 推进代际 + 取消在途开播（A2/A7：停止优先于一切挂起操作）
-        self._advance_control_epoch()
-        self._start_cancel.set()
-        # 2) 停监控
+    def _stop_streaming_impl(self, token: str, pending_only: bool,
+                             zone_at_stop: str, elapsed_at_stop: int) -> bool:
+        """Stop the current session while preserving desktop resume intent."""
+        logger.info("停止直播...")
         self.stop_monitor.set()
         if self.monitor_thread and self.monitor_thread.is_alive():
             try:
                 self.monitor_thread.join(timeout=3.0)
             except Exception:
                 pass
-        # 3) 持久化停止意图（在动 state 之前记录原始分区名）
         self._persist_stop_intent()
-        # 4) 停进程与平台侧。
-        # 重复停止的判据必须明确：清理已经完成、且此后没有新的在播会话时，
-        # 重复请求只确认既有结果——不再重复回收进程/重复下播（否则新会话
-        # 刚建立时会被旧停止请求误清理）。新会话会重置该标记（见 start_streaming）。
-        preserve = (self._stream_mode == 'task')
-        if self._stop_cleanup_done and not self.is_streaming:
-            logger.info("重复的停止请求：清理已完成且无新的在播会话，只确认结果")
+        if pending_only:
+            # A late worker will observe the advanced epoch/cancel event and
+            # compensate any platform response itself.  Reclaim any owned
+            # local process here, but do not use the pending instruction to
+            # write the previous state.
+            previous_platform_stop = self._pending_previous_platform_stop_done
+            self._platform_stop_done = previous_platform_stop
+            self._stop_live_process(
+                preserve_state=False,
+                persist_state=False,
+                stop_platform=bool(
+                    getattr(self.state, 'current_zone', '') and
+                    not previous_platform_stop))
+            self._stop_cleanup_done = self._cleanup_confirmed()
+            previous_stream_mode = self._pending_previous_stream_mode
+            self._clear_pending_start_intent()
+            self._stream_mode = previous_stream_mode
+        elif self._stop_cleanup_done and not self.is_streaming:
+            logger.info("重复停止只确认既有清理结果")
         else:
+            preserve = (self._stream_mode == 'task')
             self._stop_live_process(preserve_state=preserve)
-            # 只有确认回收（owned 进程已退出、平台下播已下发）才记"清理完成"。
-            # 回收失败时引用仍在、_ffmpeg_unrecycled 为真 → 保留失败状态，
-            # 让用户再次停止时还能真正重试回收，而不是被"已完成"分支短路。
             self._stop_cleanup_done = self._cleanup_confirmed()
         self.current_instruction = None
-        logger.info(" 直播已完全停止")
+        try:
+            stage = 'stopped' if self._stop_cleanup_done else 'pending_recycle'
+            reason = ('' if self._stop_cleanup_done
+                      else '仍有资源未确认回收，可再次点击停止重试')
+            panel_line = (
+                f'直播已停止（{zone_at_stop or "未知分区"}）' if self._stop_cleanup_done
+                else f'直播停止处理中（{zone_at_stop or "未知分区"}）；清理结果待确认，{reason}')
+            self._push_backend_event('停播', 'info', panel_line, notify=False)
+            self._notify_stopped(zone_at_stop or '未知分区', stage,
+                                 elapsed_at_stop, reason)
+        except Exception:
+            logger.debug('停止事件/通知异常（不影响停止结果）', exc_info=True)
+        logger.info("直播已完全停止")
         return True
 
     def run_next_task(self, epoch: int = None) -> bool:
@@ -2532,6 +4010,109 @@ class LiveController:
 
         return self.start_streaming(instruction, video_path, is_task_mode=True,
                                     epoch=epoch)
+
+    def resolve_resume_target(self) -> Tuple[Optional[LiveInstruction], str]:
+        """Resolve the saved session to the same live task identity.
+
+        The saved zone name is only display context.  A task id, current
+        business day, and an unfinished row are required before the resume API
+        may dispatch an opening request.  The final ``reserve_active_task``
+        validation in the start commit closes the delete/replace race after
+        this read.
+        """
+        state = self.state
+        zone_name = getattr(state, 'current_zone', '') or ''
+        task_id = getattr(state, 'task_id', None)
+        if not zone_name:
+            return None, '没有可恢复的直播任务'
+        if getattr(state, 'source_mode', SOURCE_NEW) == SOURCE_MANUAL:
+            return None, '手动直播没有任务恢复身份，请重新选择分区开播'
+
+        legacy_identity = task_id is None
+        if not legacy_identity:
+            try:
+                task_id = int(task_id)
+            except (TypeError, ValueError):
+                return None, '恢复状态中的任务身份无效，请在任务页重新开始'
+
+        execution_day = getattr(state, 'execution_date', None)
+        today = date.today().isoformat()
+        if execution_day and str(execution_day) != today:
+            return None, f'恢复状态属于执行日 {execution_day}，当前业务日已变更'
+        if not execution_day:
+            # Legacy 1.0 state had no execution_date.  Only migrate it when
+            # its saved start timestamp proves it belongs to today's window.
+            saved_start = getattr(state, 'start_time', None)
+            try:
+                saved_day = datetime.fromisoformat(
+                    str(saved_start).replace('Z', '+00:00')).date()
+            except (TypeError, ValueError):
+                return None, '旧恢复状态缺少可核实的保存日期，请在任务页重新开始'
+            if saved_day != date.today():
+                return None, f'旧恢复状态属于执行日 {saved_day}，当前业务日已变更'
+            execution_day = today
+        execution_day = str(execution_day)
+
+        if not bool(getattr(state, 'duration_known', False)):
+            return None, '恢复状态的目标时长未知，请在任务页重新开始'
+        duration = int(getattr(state, 'duration_seconds', 0) or 0)
+        if duration < 0:
+            return None, '恢复状态的目标时长无效，请在任务页重新开始'
+
+        tm = getattr(self, 'task_manager', None)
+        if tm is None or not getattr(tm, 'db', None):
+            return None, '任务管理器尚未就绪，暂不能恢复'
+        try:
+            mutation_lock = getattr(tm, '_mutation_lock', None)
+            if mutation_lock is None:
+                return None, '任务管理器缺少身份校验锁，暂不能恢复'
+            with mutation_lock:
+                row = (tm.db.get_task_by_id(task_id)
+                       if task_id is not None
+                       else tm.db.get_task_by_zone(zone_name))
+                if not row:
+                    return None, '恢复任务已删除或不存在'
+                row = dict(row)
+                if legacy_identity:
+                    # The old format has no row id.  The zone is unique in the
+                    # database, but same-name delete/recreate must still be
+                    # rejected when the row was changed after the saved
+                    # session began; otherwise old progress could attach to a
+                    # replacement task.
+                    saved_start = datetime.fromisoformat(
+                        str(getattr(state, 'start_time')).replace('Z', '+00:00'))
+                    created_at = row.get('created_at')
+                    if not created_at:
+                        return None, '旧恢复任务缺少可核实的保存时间，请在任务页重新开始'
+                    row_time = datetime.strptime(
+                        str(created_at), '%Y-%m-%d %H:%M:%S')
+                    saved_naive = saved_start.replace(tzinfo=None)
+                    if row_time > saved_naive:
+                        return None, '旧恢复任务在保存后已变更，请在任务页重新开始'
+                    task_id = row.get('id')
+                if row.get('zone_name') != zone_name:
+                    return None, '恢复任务身份已变化，请在任务页重新开始'
+                task = tm._row_to_task(row)
+                if task.category <= 0:
+                    return None, '恢复任务已经完成'
+                if task.today_done == 1:
+                    return None, '恢复任务今日已经完成'
+        except Exception as exc:
+            logger.warning('解析恢复任务失败：%s', exc)
+            return None, '任务状态读取失败，请稍后重试'
+
+        # A duration of zero is a valid, explicitly unlimited target.  Never
+        # redraw or reconstruct a missing duration from the task category.
+        state.task_id = task_id
+        state.execution_date = execution_day
+        state.duration_known = True
+        instruction = LiveInstruction(
+            zone_name=zone_name,
+            duration_seconds=duration,
+            task_id=task_id,
+            run_id=getattr(state, 'run_id', '') or None,
+            execution_date=execution_day)
+        return instruction, ''
 
     def get_qrcode_for_login(self) -> dict:
         """获取登录二维码数据（供 API 使用）"""
@@ -2566,11 +4147,17 @@ class LiveController:
                     self.monitor_thread.join(timeout=2.0)
                 # 保存进度：任务模式把已播时长写入 live_state（重开后提示继续）
                 if self._stream_mode == 'task' and self.stream_start_time:
-                    elapsed = int((datetime.now() - self.stream_start_time).total_seconds())
-                    self.state.elapsed_seconds = max(self.state.elapsed_seconds, elapsed)
+                    elapsed = max(self._confirmed_elapsed(),
+                                  int(getattr(self.state, 'effective_seconds', 0) or 0))
+                    self.state.effective_seconds = max(
+                        float(getattr(self.state, 'effective_seconds', 0) or 0),
+                        float(elapsed))
                     self.state.is_streaming = True
+                    self.state.phase = PHASE_IDLE
+                    self.state.source_mode = SOURCE_RESUME
+                    self._segment_monotonic = None
                     self.state.save()
-                    logger.info(f" 已保存进度（已播={self.state.elapsed_seconds}秒），平台侧未下播")
+                    logger.info(f" 已保存进度（已确认有效时长={elapsed}秒），平台侧未下播")
                 self.is_streaming = False  # 本地控制器视角停止；平台/OBS 不受影响
         # A5：只回收自建进程（所有权感知），绝不全局 taskkill
         self._kill_ffmpeg()

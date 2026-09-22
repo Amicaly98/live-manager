@@ -34,6 +34,34 @@ DATA_DIR: Path = BASE_DIR / "data"
 _data_dir_initialized = False
 
 
+def get_data_path(name: str = "") -> Path:
+    """Return a path below the initialized desktop data directory.
+
+    The server task/transaction code uses this small accessor.  Keep it as a
+    compatibility shim over the desktop ``userData/data`` layout so that
+    callers never fall back to the process working directory.
+    """
+    # DATA_DIR is the single runtime root.  Tests and the Electron launcher may
+    # replace it before importing business modules; do not consult a second
+    # hidden server-style root when the initialization flag is false.
+    base = DATA_DIR
+    return base / name if name else base
+
+
+def get_project_root() -> Path:
+    """Return the desktop project root for legacy cache discovery."""
+    return BASE_DIR
+
+
+def init(data_dir: Optional[str] = None) -> Path:
+    """Compatibility alias used by shared offline tests.
+
+    Desktop launchers call :func:`init_data_dir`; server-derived tests and
+    adapters use ``config.init``.  Both must select the same user data root.
+    """
+    return init_data_dir(data_dir)
+
+
 def init_data_dir(data_dir: Optional[str] = None) -> Path:
     """初始化数据目录（必须在导入业务模块之前调用，幂等）。
 

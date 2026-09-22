@@ -47,6 +47,110 @@ class FakeProc {
   async killTree() { this.killCalls += 1; this._alive = false; return true; }
 }
 
+test('D2: waitReady late result after failed stop keeps the live owner for retry', async () => {
+  let releaseReady;
+  const ready = new Promise(resolve => { releaseReady = resolve; });
+  const proc = new FakeProc(12345, true);
+  proc.killTree = async () => {
+    proc.killCalls += 1;
+    return false;
+  };
+  const lc = new BackendLifecycle({
+    async spawn() { return proc; },
+    async requestShutdown() { return true; },
+    async waitReady() { return ready; },
+    log: () => {},
+  });
+
+  const startPromise = lc.start();
+  while (lc.getPid() === null) await new Promise(resolve => setImmediate(resolve));
+  const stopped = await lc.stop(false, 0);
+  assert.equal(stopped, false);
+  assert.equal(lc.getPid(), 12345);
+  assert.equal(lc.getState(), 'stopping');
+
+  releaseReady(true);
+  const started = await startPromise;
+  assert.equal(started.started, false);
+  assert.equal(lc.getPid(), 12345, 'late health must not discard a live owner');
+  assert.equal(lc.getState(), 'stopping');
+
+  proc.killTree = async () => {
+    proc.killCalls += 1;
+    proc._alive = false;
+    return true;
+  };
+  assert.equal(await lc.stop(false, 1000), true, 'retry may clear only after exit is confirmed');
+  assert.equal(lc.getPid(), null);
+  assert.equal(lc.getState(), 'exited');
+});
+
+test('D2: stop during a pending spawn waits for late child reclamation', async () => {
+  let releaseSpawn;
+  const spawnGate = new Promise(resolve => { releaseSpawn = resolve; });
+  const proc = new FakeProc(22345, true);
+  const lc = new BackendLifecycle({
+    async spawn() { await spawnGate; return proc; },
+    async requestShutdown() { return true; },
+    async waitReady() { return true; },
+    log: () => {},
+  });
+
+  const startPromise = lc.start();
+  while (lc.getState() !== 'starting') await new Promise(resolve => setImmediate(resolve));
+  let stopSettled = false;
+  const stopPromise = lc.stop(false, 1000).then(result => {
+    stopSettled = true;
+    return result;
+  });
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(stopSettled, false, 'pending spawn must not report reclaimed before it exists');
+  assert.equal(lc.getState(), 'stopping');
+  assert.deepEqual(await lc.start(), { started: false, reason: 'state=stopping' },
+    'a new start must not cover the pending owner');
+  releaseSpawn();
+  assert.equal(await stopPromise, true);
+  assert.deepEqual(await startPromise, { started: false, reason: 'stopped_during_spawn' });
+  assert.equal(lc.getPid(), null);
+  assert.equal(lc.getState(), 'exited');
+});
+
+test('D2: pending spawn kill failure keeps the late owner for a retry', async () => {
+  let releaseSpawn;
+  const spawnGate = new Promise(resolve => { releaseSpawn = resolve; });
+  const proc = new FakeProc(32345, true);
+  proc.killTree = async () => {
+    proc.killCalls += 1;
+    return false;
+  };
+  const lc = new BackendLifecycle({
+    async spawn() { await spawnGate; return proc; },
+    async requestShutdown() { return true; },
+    async waitReady() { return true; },
+    log: () => {},
+  });
+
+  const startPromise = lc.start();
+  while (lc.getState() !== 'starting') await new Promise(resolve => setImmediate(resolve));
+  const stopPromise = lc.stop(false, 1000);
+  await new Promise(resolve => setTimeout(resolve, 10));
+  releaseSpawn();
+  assert.equal(await stopPromise, false);
+  assert.deepEqual(await startPromise, { started: false, reason: 'stopped_during_spawn' });
+  assert.equal(lc.getPid(), 32345, 'failed late kill must retain the owner');
+  assert.equal(lc.getState(), 'stopping');
+  assert.deepEqual(await lc.start(), { started: false, reason: 'state=stopping' });
+
+  proc.killTree = async () => {
+    proc.killCalls += 1;
+    proc._alive = false;
+    return true;
+  };
+  assert.equal(await lc.stop(false, 1000), true);
+  assert.equal(lc.getPid(), null);
+  assert.equal(lc.getState(), 'exited');
+});
+
 test('E2: start 拒绝 starting/ready/stopping 状态下的重复启动', async () => {
   const { deps } = makeDeps();
   let proc = new FakeProc(1);
