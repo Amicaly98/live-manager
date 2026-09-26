@@ -130,9 +130,8 @@
 
               <!-- 已停止：双模式 + 进行中任务恢复 -->
               <div v-else class="idle-info">
-                <!-- 进行中的任务提示（只要分区名不为空就显示） -->
                 <el-alert
-                  v-if="activeTaskState.current_zone"
+                  v-if="canResumeDashboardTask(activeTaskState)"
                   title="存在未完成的直播任务"
                   type="warning"
                   :closable="false"
@@ -145,7 +144,7 @@
                       &nbsp;|&nbsp; 总时长 {{ formatDuration(activeTaskState.duration_seconds) }}
                     </p>
                     <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
-                      <el-button size="small" type="primary" @click="resumeTask">继续任务</el-button>
+                      <el-button size="small" type="primary" :disabled="!canResumeDashboardTask(activeTaskState)" @click="resumeTask">继续任务</el-button>
                       <el-button size="small" @click="clearTaskState">清空状态</el-button>
                       <el-popover trigger="click" :width="280" placement="bottom">
                         <template #reference>
@@ -170,6 +169,28 @@
                     </div>
                   </template>
                 </el-alert>
+                <el-alert
+                  v-else-if="!activeTaskState.resume_status_fresh"
+                  title="恢复状态待确认"
+                  type="info"
+                  :closable="false"
+                  style="margin-bottom:12px"
+                >
+                  <template #default>
+                    <p>暂时无法读取最新服务端状态；连接恢复前不会提供继续或修改入口。</p>
+                  </template>
+                </el-alert>
+                <el-alert
+                  v-else-if="activeTaskState.current_zone && activeTaskState.resume_blocked_reason"
+                  title="保存的直播状态当前不可继续"
+                  type="info"
+                  :closable="false"
+                  style="margin-bottom:12px"
+                >
+                  <template #default>
+                    <p>{{ activeTaskState.resume_blocked_reason }}</p>
+                  </template>
+                </el-alert>
                 <el-tabs v-model="liveMode" class="mode-tabs">
                   <el-tab-pane label="任务模式" name="task">
                     <div class="mode-content">
@@ -185,9 +206,13 @@
                           type="primary"
                           @click="startNextTask"
                           :loading="liveStore.isStarting"
+                          :disabled="!canStartDashboardTask(activeTaskState)"
                         >
                           开始下一任务
                         </el-button>
+                        <p v-if="activeTaskState.has_active && activeTaskState.resume_status_fresh" class="task-progress">
+                          请先继续未完成任务，完成或清理后再开始下一任务。
+                        </p>
                       </template>
                       <div v-else class="empty-task">
                         <el-icon :size="36" color="#c0c4cc"><CircleCheck /></el-icon>
@@ -323,6 +348,14 @@ import { useSettingsStore } from '@/stores/settings'
 import { operationEvents } from '@/stores/operationEvents'
 import { usePolling } from '@/composables/usePolling'
 import { useNotification } from '@/composables/useNotification'
+import {
+  applyDashboardResumeStatus,
+  canResumeDashboardTask,
+  canStartDashboardTask,
+  emptyDashboardResumeState,
+  type DashboardResumeState,
+} from '@/composables/dashboardResume'
+import type { LiveStatus } from '@/types/api'
 import Sidebar from '@/components/Sidebar.vue'
 import StreamConfigurator from '@/components/StreamConfigurator.vue'
 import FaceVerifyModal from '@/components/FaceVerifyModal.vue'
@@ -341,13 +374,7 @@ const pollInterval = computed(() => (settingsStore.settings.scan_interval_second
 const liveMode = ref<'task' | 'manual'>('task')
 
 // 进行中的任务状态
-const activeTaskState = ref<{
-  has_active: boolean
-  current_zone: string
-  elapsed_seconds: number
-  room_id: number
-  duration_seconds: number
-}>({ has_active: false, current_zone: '', elapsed_seconds: 0, room_id: 0, duration_seconds: 0 })
+const activeTaskState = ref<DashboardResumeState>(emptyDashboardResumeState())
 
 // 编辑待恢复任务参数
 const editState = reactive({ zone: '', duration: 0, elapsed: 0 })
@@ -471,24 +498,22 @@ const overtime = computed(() => {
 let _wasStreaming = false
 // 轮询不重复触发 success：retryStartLive 成功时置 true，轮询消费后复位
 let _faceVerifySuccessHandled = false
-const { start: startPoll } = usePolling(async () => {
-  // 直播状态与任务列表**并行但互不阻塞**：慢任务查询不会拖住状态应用，
-  // 状态一回来就更新计时显示。
-  // 状态走 store 的单飞入口：慢请求不会叠加，任务查询再慢也不拖住状态应用。
-  await Promise.allSettled([
-    liveStore.pollStatus(),
-    taskStore.fetchTasks(),
-  ])
+function applyDashboardStatus(status: LiveStatus | undefined) {
+  activeTaskState.value = applyDashboardResumeStatus(activeTaskState.value, status)
+  // A failed status read is unknown. Keep the last stream state and bounded timer
+  // intact; only a fresh backend snapshot may confirm that streaming stopped.
+  if (!status) return
+
   liveStore.syncFromServer()
   // 事件展示由响应式 store 驱动（服务器事件在状态应用路径上已直接摄取）。
   // 人脸验证弹窗感知
-  if ((liveStore.status as any).pending_face_verify && !showVerifyModal.value) {
+  if (status.pending_face_verify && !showVerifyModal.value) {
     showVerifyModal.value = true
-    verifyUrl.value = (liveStore.status as any).face_verify_url || ''
+    verifyUrl.value = status.face_verify_url || ''
     pendingRetryResume = false
   }
   // 邮箱远程确认后开播成功，自动关闭人脸验证弹窗
-  if (showVerifyModal.value && liveStore.status.is_streaming) {
+  if (showVerifyModal.value && status.is_streaming) {
     showVerifyModal.value = false
     pendingRetryResume = false
     if (!_faceVerifySuccessHandled) {
@@ -496,14 +521,14 @@ const { start: startPoll } = usePolling(async () => {
     }
     _faceVerifySuccessHandled = false
   }
-  if (liveStore.status.is_streaming) {
+  if (status.is_streaming) {
     if (!liveStore.tickActive) liveStore.startLocalTick()
     _wasStreaming = true
   } else {
     if (_wasStreaming) {
       _wasStreaming = false
       // 手动模式停播：保持手动页面 + 剩余时长预填
-      if (liveStore.status.stream_mode === 'manual') {
+      if (status.stream_mode === 'manual') {
         liveMode.value = 'manual'
         const elapsedMins = Math.round(liveStore.localElapsed / 60)
         if (lastManualDuration.value > 0 && elapsedMins > 0) {
@@ -514,15 +539,27 @@ const { start: startPoll } = usePolling(async () => {
     }
     liveStore.stopLocalTick()
   }
-}, pollInterval.value)
+}
+
+async function refreshDashboardStatus() {
+  const statusPromise = liveStore.pollStatus().then((status) => {
+    applyDashboardStatus(status)
+    return status
+  })
+  // Task data refresh is independent; a slow task list cannot hold the status card,
+  // restore decision, or operation log behind it.
+  void taskStore.fetchTasks().catch(() => { /* task list refresh is independent */ })
+  await statusPromise
+}
+
+const { start: startPoll } = usePolling(refreshDashboardStatus, pollInterval.value)
 
 const { notify } = useNotification()
 
 onMounted(async () => {
-  await fetchStatus()
-  liveStore.syncFromServer()  // 立即同步服务器时间，避免切回时显示旧进度
-  startPoll()
   loadCrossEvents()
+  await fetchStatus()
+  startPoll()
   // 确保 DOM 渲染完成后滚到底部
   await nextTick()
   setTimeout(() => {
@@ -553,27 +590,14 @@ function loadCrossEvents() {
 
 // ==================== Actions ====================
 async function fetchStatus() {
-  try {
-    await Promise.all([
-      liveStore.pollStatus(),
-      taskStore.fetchTasks(),
-      fetchActiveTaskState(),
-    ])
-  } catch {
-    // polling silently handles errors
-  }
-}
-
-async function fetchActiveTaskState() {
-  try {
-    const { useRequest } = await import('@/api/request')
-    const req = useRequest()
-    const res = await req.get<typeof activeTaskState.value>('/api/live/state/full')
-    activeTaskState.value = res
-  } catch { /* ignore */ }
+  await refreshDashboardStatus()
 }
 
 async function updateTaskState() {
+  if (!canResumeDashboardTask(activeTaskState.value)) {
+    ElMessage.warning('恢复状态尚未确认，请连接恢复后重试')
+    return
+  }
   try {
     const { useRequest } = await import('@/api/request')
     const req = useRequest()
@@ -582,9 +606,14 @@ async function updateTaskState() {
       duration_seconds: editState.duration,
       elapsed_seconds: editState.elapsed,
     })
-    activeTaskState.value.current_zone = editState.zone
-    activeTaskState.value.duration_seconds = editState.duration
-    activeTaskState.value.elapsed_seconds = editState.elapsed
+    activeTaskState.value = {
+      ...activeTaskState.value,
+      current_zone: editState.zone,
+      duration_seconds: editState.duration,
+      elapsed_seconds: editState.elapsed,
+      resume_status_fresh: false,
+    }
+    await fetchStatus()
     ElMessage.success('任务参数已更新')
     addEvent('状态', 'info', `修改恢复参数：${editState.zone}，时长 ${formatDuration(editState.duration)}`)
   } catch {
@@ -593,6 +622,10 @@ async function updateTaskState() {
 }
 
 async function resumeTask() {
+  if (!canResumeDashboardTask(activeTaskState.value)) {
+    ElMessage.warning('恢复状态尚未确认，请连接恢复后重试')
+    return
+  }
   try {
     // 走 store 的 resumeLive：与 start 共用同一套在途意图管理，
     // 取票等待期间点停止能真正取消这次恢复（旧实现直接 req.post 不受控）。
@@ -612,7 +645,6 @@ async function resumeTask() {
       ElMessage.error(res.message)
     }
     await fetchStatus()
-    await fetchActiveTaskState()
   } catch {
     ElMessage.error('恢复失败')
   }
@@ -623,7 +655,7 @@ async function clearTaskState() {
     const { useRequest } = await import('@/api/request')
     const req = useRequest()
     await req.post('/api/live/clear-state')
-    activeTaskState.value = { has_active: false, current_zone: '', elapsed_seconds: 0, room_id: 0, duration_seconds: 0 }
+    activeTaskState.value = { ...emptyDashboardResumeState(), resume_status_fresh: true }
     ElMessage.success('任务状态已清空')
   } catch {
     ElMessage.error('清空失败')
@@ -631,6 +663,7 @@ async function clearTaskState() {
 }
 
 async function startNextTask() {
+  if (!canStartDashboardTask(activeTaskState.value)) return
   const result = await liveStore.startLive()
   handleStartResult(result)
 }

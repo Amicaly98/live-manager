@@ -28,6 +28,7 @@ const defaultSettings: AppSettings = {
   email_notify_error: true,
   email_notify_complete: true,
   email_daily_summary: true,
+  email_notify_ffmpeg_retry: false,
   email_face_verify_port: 19080,
   // Server酱
   serverchan_sendkey: '',
@@ -124,6 +125,9 @@ export const useSettingsStore = defineStore('settings', () => {
       const next = { ...(res as unknown as AppSettings) } as Record<string, unknown>
       delete next._revision
       delete next._trust
+      if (typeof next.email_notify_ffmpeg_retry !== 'boolean') {
+        next.email_notify_ffmpeg_retry = false
+      }
       settings.value = next as unknown as AppSettings
       settingsRevision.value = Number.isFinite(revision) ? revision : 0
       // 重新载入 = 编辑基线重置：未保存提示随之清零。

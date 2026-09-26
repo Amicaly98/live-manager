@@ -282,7 +282,10 @@ const lifecycle = new BackendLifecycle({
       // 自建本地进程，不调用平台下播 API（不碰 OBS 推流）
       const res = await fetch(
         `http://${BACKEND_HOST}:${BACKEND_PORT}/api/shutdown?stop_live=${stopPlatform}`, {
-        method: 'POST', signal: AbortSignal.timeout(2500),
+        // Controller cleanup can wait for owned FFmpeg and persist the task.
+        // A 2.5 s timeout raced that work and led the caller to killTree while
+        // the backend was still finishing a valid shutdown request.
+        method: 'POST', signal: AbortSignal.timeout(25000),
       });
       return res.ok;
     } catch {
@@ -326,13 +329,10 @@ function requestManagedQuit(stopPlatform: boolean, timeoutMs: number): Promise<b
   quitCleanupSucceeded = false;
 
   quitCleanup = (async () => {
-    if (stopPlatform) {
-      try {
-        await fetch(`http://${BACKEND_HOST}:${BACKEND_PORT}/api/live/stop`, {
-          method: 'POST', signal: AbortSignal.timeout(5000),
-        });
-      } catch { /* 平台停播失败仍继续回收本地 owner */ }
-    }
+    // A separate /api/live/stop runs on a background executor.  If its HTTP
+    // response times out, /api/shutdown can race its state save and kill the
+    // backend mid-cleanup.  The shutdown endpoint owns the entire stop/quit
+    // transaction and must report completion before Electron exits.
     return lifecycle.stop(true, timeoutMs, stopPlatform);
   })().catch(err => {
     console.error('[Electron] 退出收尾失败:', err);

@@ -36,6 +36,7 @@ function loadMain({
     dialogs: [],
   };
   const listeners = new Map();
+  const ipcHandlers = new Map();
   let releaseCleanup = null;
   let lifecycleInstance = null;
   const userDataPath = 'C:\\synthetic\\desktop-sync-user-data';
@@ -137,7 +138,7 @@ function loadMain({
     app,
     BrowserWindow: FakeBrowserWindow,
     ipcMain: {
-      handle() {},
+      handle(name, handler) { ipcHandlers.set(name, handler); },
       on() {},
     },
     Tray: FakeTray,
@@ -238,6 +239,11 @@ function loadMain({
     app,
     calls,
     lifecycle: lifecycleInstance,
+    async invoke(name, ...args) {
+      const handler = ipcHandlers.get(name);
+      assert.ok(handler, `missing IPC handler: ${name}`);
+      return handler(null, ...args);
+    },
     releaseCleanup(value = true) {
       assert.ok(releaseCleanup, 'cleanup must be in flight before release');
       releaseCleanup(value);
@@ -298,6 +304,17 @@ test('E2/D2: failed owner reclaim keeps the app open and permits a bounded retry
   assert.equal(harness.calls.stop.length, 2);
   assert.equal(harness.calls.quit, 1, 'only the successful bounded retry may quit');
   assert.equal(harness.lifecycle.owned, false);
+});
+
+test('explicit stop-and-quit uses one backend shutdown transaction', async () => {
+  const harness = loadMain({ lock: true, readyImmediate: true });
+  await flushMicrotasks();
+  const result = await harness.invoke('confirm-quit', true);
+  assert.equal(result.success, true);
+  assert.equal(harness.calls.stop.length, 1);
+  assert.equal(harness.calls.stop[0].stopPlatform, true);
+  assert.equal(harness.calls.fetch.filter(url => String(url).includes('/api/live/stop')).length,
+    0, 'a separate stop request may still be cleaning up when shutdown begins');
 });
 
 test('E1/E2: unknown port blocks startup without HTTP shutdown or child spawn', async () => {

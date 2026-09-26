@@ -292,7 +292,16 @@
                   @update:model-value="(v: any) => settingsStore.updateField('email_notify_error', v)">异常告警</el-checkbox>
                 <el-checkbox :model-value="settingsStore.settings.email_daily_summary"
                   @update:model-value="(v: any) => settingsStore.updateField('email_daily_summary', v)">每日简报</el-checkbox>
+                <el-checkbox
+                  v-if="settingsStore.settings.notification_channel === 'email' || settingsStore.settings.notification_channel === 'both'"
+                  :model-value="settingsStore.settings.email_notify_ffmpeg_retry === true"
+                  @update:model-value="(v: any) => settingsStore.updateField('email_notify_ffmpeg_retry', Boolean(v))"
+                >本地 FFmpeg 短断流</el-checkbox>
               </el-form-item>
+              <div
+                v-if="settingsStore.settings.notification_channel === 'email' || settingsStore.settings.notification_channel === 'both'"
+                class="form-tip"
+              >默认关闭；开启后接收本地 FFmpeg 短断流邮件通知。</div>
               <el-form-item label="人脸确认">
                 <div class="form-tip">请在运行本程序的电脑上确认，也可在面板确认。</div>
               </el-form-item>

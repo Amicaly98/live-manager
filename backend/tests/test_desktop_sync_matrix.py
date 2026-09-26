@@ -647,14 +647,14 @@ def test_notification_templates_keep_stop_and_face_facts(mailer):
 
 
 def test_daily_summary_uses_stat_date_and_derived_remaining_values(mailer):
-    """日报把统计日与发送时刻分开，并展示权威剩余 8/4/4 及 8/4 统计。"""
+    """简报只展示同一冻结快照的统计日完成数和 Top10，不输出实例或版本。"""
     sender, delivered = mailer
     summary_date = TODAY - timedelta(days=1)
     result = sender.send_daily_summary(
         {
             "today_done": 4,
             "today_pending": 4,
-            "pending_total": 3,
+            "pending_total": 10,
             "remaining_time": 8,
             "avg_remaining": 4,
             "urgency": 0.4,
@@ -666,6 +666,20 @@ def test_daily_summary_uses_stat_date_and_derived_remaining_values(mailer):
              "actual_days": 5, "remaining_exec_days": 4},
             {"zone_name": "丙", "priority": 3, "days_done": 2,
              "actual_days": 6, "remaining_exec_days": 4},
+            {"zone_name": "丁", "priority": 4, "days_done": 0,
+             "actual_days": 5, "remaining_exec_days": 5},
+            {"zone_name": "戊", "priority": 5, "days_done": 0,
+             "actual_days": 5, "remaining_exec_days": 5},
+            {"zone_name": "己", "priority": 6, "days_done": 0,
+             "actual_days": 5, "remaining_exec_days": 5},
+            {"zone_name": "庚", "priority": 7, "days_done": 0,
+             "actual_days": 5, "remaining_exec_days": 5},
+            {"zone_name": "辛", "priority": 8, "days_done": 0,
+             "actual_days": 5, "remaining_exec_days": 5},
+            {"zone_name": "壬", "priority": 9, "days_done": 0,
+             "actual_days": 5, "remaining_exec_days": 5},
+            {"zone_name": "癸", "priority": 10, "days_done": 0,
+             "actual_days": 5, "remaining_exec_days": 5},
         ],
         summary_date=summary_date,
         snapshot_meta={
@@ -679,17 +693,25 @@ def test_daily_summary_uses_stat_date_and_derived_remaining_values(mailer):
                 "dateless_done_rows": 0,
             },
         },
+        brief=True,
     )
     assert result == "queued"
     _drain_notifications(sender)
     body = delivered[-1]["body"]
-    assert f"统计日期：</b>{summary_date.isoformat()}" in body
-    assert "<b>当日已完成</b></td><td>4" in body
-    assert "<b>待执行任务（当前口径）</b></td><td>4" in body
-    assert "<b>剩余时间</b></td><td>8 小时" in body
-    assert body.count("<td>8</td>") == 1
-    assert body.count("<td>4</td>") >= 2
-    assert "版本 17" in body
+    assert f"{summary_date.isoformat()} 直播简报" in body
+    assert "当日完成：4 项" in body
+    assert "当前待办：10 项" in body
+    assert "计划剩余直播：约 8 小时" in body
+    assert "紧迫率：40%" in body
+    assert "1. 甲：优先度 1，已完成 0/8 天，还需 8 天" in body
+    assert "2. 乙：优先度 2，已完成 1/5 天，还需 4 天" in body
+    assert "3. 丙：优先度 3，已完成 2/6 天，还需 4 天" in body
+    assert "10. 癸：优先度 10，已完成 0/5 天，还需 5 天" in body
+    assert delivered[-1]["html"] is False
+    assert "实例：" not in body
+    assert "instance-" not in body
+    assert "版本" not in body
+    assert "采集" not in body
 
 
 def test_settings_conflict_and_last_good_copy_are_explicit(isolated_runtime):

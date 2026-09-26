@@ -40,6 +40,9 @@ export interface LogoutResponse {
 
 export interface LiveStatus {
   is_streaming: boolean
+  /** Whether the saved session can be resumed by an explicit user action. */
+  resumable?: boolean
+  resume_blocked_reason?: string
   is_starting?: boolean
   is_cancelling?: boolean
   recovery_blocked?: string
@@ -66,7 +69,7 @@ export interface LiveStatus {
   pending_limit_seconds?: number
   /** 服务端是否允许对这段待确认区间做显示外推。 */
   pending_extrapolatable?: boolean
-  /** 'running' | 'paused_closed' | 'paused_unknown' | 'paused_blocked' */
+  /** 'running' | 'paused_closed' | 'paused_unknown' | 'paused_blocked' | 'paused_pusher' */
   timer_state?: string
   phase?: string
   run_id?: string
@@ -314,6 +317,8 @@ export interface AppSettings {
   email_notify_error: boolean
   email_notify_complete: boolean
   email_daily_summary: boolean
+  /** 默认关闭；可选接收一轮本地 FFmpeg 短断流通知 */
+  email_notify_ffmpeg_retry: boolean
   email_face_verify_port: number
   // Server酱
   serverchan_sendkey: string

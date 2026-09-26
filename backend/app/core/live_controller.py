@@ -25,6 +25,10 @@ from typing import Optional, Tuple, List, Dict, TYPE_CHECKING
 from datetime import datetime, date, timedelta
 
 import requests
+from app.core.ffmpeg_log_progress import (
+    FFmpegLogProgressReader,
+    capture_ffmpeg_log_baseline,
+)
 
 from app.core.config import (
     VIDEO_BASE_PATH, DEFAULT_VIDEO_FOLDER,
@@ -724,6 +728,10 @@ TIMER_RUNNING = 'running'
 TIMER_PAUSED_CLOSED = 'paused_closed'
 TIMER_PAUSED_UNKNOWN = 'paused_unknown'
 TIMER_PAUSED_BLOCKED = 'paused_blocked'
+TIMER_PAUSED_PUSHER = 'paused_pusher'
+
+# A long platform-confirmed outage gets one reminder, while recovery continues.
+PLATFORM_OUTAGE_ALERT_SECONDS = 300.0
 
 
 def effective_credit_limit(monitor_interval: float) -> float:
@@ -804,7 +812,9 @@ class EffectiveClock:
         return max(0.0, float(now) - float(anchor))
 
     def observe_ok(self, anchor: Optional[float], request_start: float,
-                   returned: float) -> Tuple[Optional[float], float, str]:
+                   returned: float,
+                   max_credit: Optional[float] = None
+                   ) -> Tuple[Optional[float], float, str]:
         """处理一次**可信在播观察**（平台明确返回 live_status == 1）。
 
         返回 ``(新锚点, 本次并入 confirmed 的秒数, 结论)``：
@@ -843,8 +853,15 @@ class EffectiveClock:
             return float(returned), 0.0, 'anchor'
         if gap > self.credit_limit:
             return float(returned), 0.0, 'dropped_gap'
-        self.confirmed += gap
-        return float(returned), gap, 'credited'
+        credited = gap
+        if max_credit is not None:
+            try:
+                cap = max(0.0, float(max_credit))
+            except (TypeError, ValueError):
+                cap = 0.0
+            credited = min(gap, cap)
+        self.confirmed += credited
+        return float(returned), credited, 'credited'
 
     def pause(self, reason: str, anchor: Optional[float],
               at: Optional[float] = None) -> float:
@@ -1594,6 +1611,28 @@ class LiveController:
     def _new_run_id() -> str:
         return f'{int(time.time()):x}-{uuid.uuid4().hex[:8]}'
 
+    def _cache_user_info(self, info: Optional[dict]) -> bool:
+        """Cache a name only while the response still matches the active account."""
+        with self._auth_lock:
+            if info is None:
+                self._bili_username = ''
+                self.cached_user_info = {'uname': ''}
+                return True
+            payload = info if isinstance(info, dict) else {}
+            cookie_snapshot = self.api._cookie_snapshot()
+            expected_uid = str(cookie_snapshot.get('DedeUserID') or '')
+            returned_uid = str(payload.get('mid') or payload.get('uid') or '')
+            try:
+                logged_in = bool(self.api.is_logged_in())
+            except Exception:
+                logged_in = False
+            if not logged_in or not expected_uid or returned_uid != expected_uid:
+                return False
+            uname = str(payload.get('uname') or payload.get('name') or '').strip()
+            self._bili_username = uname
+            self.cached_user_info = {'uname': uname}
+            return True
+
     def _owns_current_run(self, epoch: int, run_id: Optional[str]) -> bool:
         """Check that a monitor response still belongs to the current desktop run."""
         try:
@@ -1746,12 +1785,65 @@ class LiveController:
     def _credit_effective_observation(self, request_start: float,
                                       returned: float) -> str:
         """Credit one trusted live observation, subject to freshness bounds."""
+        media_cap = None
+        if getattr(self, '_local_pusher_required', False):
+            lock = getattr(self, '_pusher_lock', None)
+            if lock is None:
+                self._pause_effective_timer(TIMER_PAUSED_PUSHER, returned)
+                return 'paused_pusher'
+            with lock:
+                reader = getattr(self, '_pusher_media_reader', None)
+                media_generation = getattr(self, '_pusher_media_generation', -1)
+                progress_required = bool(
+                    getattr(self, '_pusher_progress_required', False))
+                process = getattr(self, 'video_process', None)
+            if (not progress_required or reader is None
+                    or not self._process_alive(process)):
+                self._pause_effective_timer(TIMER_PAUSED_PUSHER, returned)
+                return 'paused_pusher'
+            try:
+                reading = reader.read()
+            except Exception as exc:
+                logger.warning('读取 FFmpeg 媒体进度失败，暂停有效计时：%s', exc)
+                reading = None
+            with lock:
+                owned = (
+                    getattr(self, '_pusher_media_reader', None) is reader
+                    and getattr(self, '_pusher_media_generation', -1)
+                    == media_generation
+                    and getattr(self, '_video_process_generation', -1)
+                    == media_generation
+                    and getattr(self, 'video_process', None) is process
+                )
+                if not owned:
+                    self._pause_effective_timer(TIMER_PAUSED_PUSHER, returned)
+                    return 'paused_pusher'
+                if (reading is None
+                        or getattr(reading, 'outcome', None) != 'available'
+                        or getattr(reading, 'media_seconds', None) is None):
+                    if (reading is not None
+                            and getattr(reading, 'outcome', None) == 'new_baseline'):
+                        self._pusher_media_seconds = None
+                    self._pause_effective_timer(TIMER_PAUSED_PUSHER, returned)
+                    return 'paused_pusher'
+                previous_media = getattr(self, '_pusher_media_seconds', None)
+                current_media = float(reading.media_seconds)
+                self._pusher_media_seconds = current_media
+                if previous_media is None:
+                    # First output sample establishes a baseline, not elapsed time.
+                    self._segment_monotonic = None
+                elif current_media <= float(previous_media):
+                    self._pause_effective_timer(TIMER_PAUSED_PUSHER, returned)
+                    return 'paused_pusher'
+                else:
+                    media_cap = current_media - float(previous_media)
+
         clock = self._clock()
         clock.credit_limit = effective_credit_limit(
             getattr(self, '_monitor_interval_seconds', MONITOR_INTERVAL))
         anchor = self._segment_monotonic
         new_anchor, credited, outcome = clock.observe_ok(
-            anchor, request_start, returned)
+            anchor, request_start, returned, max_credit=media_cap)
         self._segment_monotonic = new_anchor
         if credited > 0 and getattr(self, '_stream_mode', '') != 'manual':
             self.state.update_progress(clock.confirmed)
@@ -1863,6 +1955,8 @@ class LiveController:
         self.state = LiveState(state_file)
 
         self.current_room_id: Optional[int] = None
+        self.cached_user_info: dict = {'uname': ''}
+        self._bili_username = ''
         self.is_streaming = False
         self.stream_start_time: Optional[datetime] = None
         self.current_instruction: Optional[LiveInstruction] = None
@@ -1937,6 +2031,15 @@ class LiveController:
         # or reclaiming resources, even if the old worker has already cleared
         # _is_starting in its finally block.
         self._stop_in_progress = False
+        self._stop_attempt_seq = 0
+        self._stop_completion_event = threading.Event()
+        self._stop_completion_event.set()
+        self._stop_wait_timeout_seconds = 15.0
+        self._last_user_stop_source_epoch: Optional[int] = None
+        self._task_rotation_lock = threading.Lock()
+        self._task_rotation_pending: Optional[dict] = None
+        self._task_rotation_context: Optional[dict] = None
+        self._task_rotation_notice_timeout_seconds = 120.0
         # D1：每次被接受的开播意图分配唯一 id；停止在登记时快照目标意图，
         # 执行器队列中迟到的停止不再停掉"之后新接受"的开播意图。
         self._start_intent_id = 0
@@ -1951,6 +2054,29 @@ class LiveController:
         self._pusher_generation = 0
         self._video_process_generation = -1
         self._ffmpeg_unrecycled = False
+
+        # Effective task time also requires a current, owned FFmpeg output
+        # sample when this session uses the local pusher.
+        self._local_pusher_required = False
+        self._pusher_progress_required = False
+        self._pusher_media_reader = None
+        self._pusher_media_generation = -1
+        self._pusher_media_seconds: Optional[float] = None
+
+        # One confirmed platform closure belongs to this run/room until its
+        # recovery or final failure is reported. Unknown queries do not open it.
+        self._platform_outage_lock = threading.Lock()
+        self._platform_outage: Optional[dict] = None
+        self._platform_outage_seq = 0
+
+        # The HTTP shutdown route and ASGI lifespan both close this singleton.
+        # Preserve the first platform policy across those two calls.
+        self._shutdown_lock = threading.Lock()
+        self._shutdown_stop_platform: Optional[bool] = None
+        self._shutdown_stop_attempted = False
+        self._shutdown_wait_timeout_seconds = 15.0
+        self._shutdown_in_progress = False
+        self._shutdown_complete = False
 
         # ---------- A4：状态查询未知失败计数 ----------
         self._status_query_failures = 0
@@ -2059,6 +2185,7 @@ class LiveController:
                                     logger.warning("登录结果已过期或直播中，未覆盖当前账号")
                                     return False
                                 self.current_room_id = int(room_id)
+                                self._cache_user_info(data)
                         logger.info("自动登录成功 | %s (UID:%s, Room:%s)",
                                     data.get('name', ''), uid, room_id)
                         return True
@@ -2136,6 +2263,7 @@ class LiveController:
                             return {'logged_in': False,
                                     'message': '登录凭据未确认落盘'}
                         self.current_room_id = int(room_id)
+                        self._cache_user_info(info)
                         self._auth_generation += 1
                         self._qr_generations.pop(key, None)
                 return {'logged_in': True, 'user_info': {
@@ -2177,6 +2305,7 @@ class LiveController:
                             'message': '登出凭据撤销未落盘，未确认登出成功'}
                 self.api.cookies = {}
                 self.current_room_id = None
+                self._cache_user_info(None)
                 self._auth_generation += 1
                 return {'success': True, 'message': '已登出'}
 
@@ -2314,6 +2443,10 @@ class LiveController:
                 self._push_backend_event(
                     '停止', 'info', '已放弃停止之前发起的开播请求，未重新开播')
                 return False
+            if (getattr(self, '_shutdown_in_progress', False)
+                    or getattr(self, '_shutdown_stop_platform', None) is not None):
+                logger.info('控制器已进入关闭流程，拒绝新的开播意图')
+                return False
             if self._stop_in_progress:
                 logger.info('停止清理尚未完成，暂不受理新的开播意图')
                 return False
@@ -2372,13 +2505,23 @@ class LiveController:
                              is_task_mode: bool, cancel: threading.Event,
                              epoch: int):
         """后台开播线程：网络重试无限等待（可取消），各边界复核代际（A2）。"""
+        rotation = self._claim_task_rotation(instruction)
         try:
             with self.api.retry_network_until_cancelled(cancel):
-                self._start_streaming_sync(instruction, video_path, is_task_mode,
-                                           cancel, epoch)
+                started = self._start_streaming_sync(
+                    instruction, video_path, is_task_mode, cancel, epoch)
+            if rotation and not started:
+                if self._pending_face_verify:
+                    self._finish_task_rotation(rotation, 'verification')
+                elif cancel.is_set() or not self._is_epoch_current(epoch):
+                    self._finish_task_rotation(rotation, 'cancelled')
+                else:
+                    self._finish_task_rotation(rotation, 'failed')
         except Exception as e:
             logger.error(f" 后台开播异常：{e}", exc_info=True)
             self._push_backend_event('错误', 'danger', f'开播异常：{e}')
+            if rotation:
+                self._finish_task_rotation(rotation, 'failed', reason=str(e))
         finally:
             with self._start_lock:
                 self._is_starting = False
@@ -2544,6 +2687,9 @@ class LiveController:
             mode_label = '任务模式' if is_task_mode else '手动模式'
             saved_label = f'（恢复，已播{saved_elapsed // 60}分钟）' if saved_elapsed > 0 else ''
             self._push_backend_event('开播', 'success', f'{mode_label}开播{saved_label} - {instruction.zone_name}，时长{dur_label}')
+
+            initial_stream_mode, _ = self._get_stream_settings()
+            self._local_pusher_required = initial_stream_mode == 'ffmpeg'
 
             # 启动监控线程
             self.monitor_thread = threading.Thread(
@@ -2923,13 +3069,23 @@ class LiveController:
 
                 try:
                     t_start = time.time()
+                    try:
+                        progress_reader = FFmpegLogProgressReader(
+                            ffmpeg_log_path(),
+                            capture_ffmpeg_log_baseline(ffmpeg_log_path()),
+                        )
+                    except Exception as exc:
+                        progress_reader = None
+                        logger.warning('无法建立本轮 FFmpeg 媒体进度基线：%s', exc)
                     # A5：不经 shell，直接持有 ffmpeg 进程（list argv）；
                     # PID 即 ffmpeg 本体，taskkill /T /PID 才能真实命中进程树
                     proc = subprocess.Popen(
                         cmd,
                         stdout=log_fp, stderr=subprocess.STDOUT,
                     )
-                    self._claim_pusher(generation, proc)
+                    self._claim_pusher(
+                        generation, proc, progress_reader=progress_reader,
+                        require_progress=True)
                     self.ffmpeg_current_video = f"concat({len(video_list)}个)"
                     logger.info(f" FFmpeg concat 进程已启动 (PID={proc.pid}, 代际={generation})")
 
@@ -3071,7 +3227,8 @@ class LiveController:
             self._pusher_generation += 1
             return self._pusher_generation
 
-    def _claim_pusher(self, generation: int, process) -> None:
+    def _claim_pusher(self, generation: int, process,
+                      progress_reader=None, require_progress: bool = False) -> None:
         """登记本代拥有的推流进程（Popen 成功后的所有权起点）。
 
         代际与进程对象成对记录：`_kill_ffmpeg` 只有在"引用仍是同一个对象、
@@ -3081,6 +3238,11 @@ class LiveController:
             self._pusher_generation = int(generation)
             self.video_process = process
             self._video_process_generation = int(generation)
+            self._pusher_media_reader = progress_reader
+            self._pusher_progress_required = bool(require_progress)
+            self._pusher_media_generation = (
+                int(generation) if require_progress else -1)
+            self._pusher_media_seconds = None
 
     def _pusher_owner_generation(self) -> int:
         return self.__dict__.get('_video_process_generation', -1)
@@ -3110,6 +3272,10 @@ class LiveController:
             self._video_process_generation = -1
             self.ffmpeg_current_video = ''
             self._ffmpeg_unrecycled = False
+            self._pusher_media_reader = None
+            self._pusher_progress_required = False
+            self._pusher_media_generation = -1
+            self._pusher_media_seconds = None
 
     def _kill_ffmpeg(self, timeout: float = 8.0):
         """强制终止当前 FFmpeg 进程（A5：只回收本应用创建的进程树）。
@@ -3267,6 +3433,10 @@ class LiveController:
             remaining = max(0, duration - elapsed) if duration > 0 else 0
             run_id = getattr(self.state, 'run_id', '') or self._current_run_id
             if tag == '开播':
+                if getattr(self, '_task_rotation_context', None):
+                    # The combined A-to-B notice is sent only after platform
+                    # status confirms B is live; this event is earlier.
+                    return
                 sender.notify_stream_running(
                     zone, self._current_source, elapsed_label, duration_label,
                     f'{remaining // 60} 分钟' if remaining else '未知',
@@ -3302,6 +3472,13 @@ class LiveController:
             if not sender or not self._face_verify_url:
                 return
             instruction = self.current_instruction
+            rotation = getattr(self, '_task_rotation_context', None)
+            if rotation and stage == 'start_blocked':
+                # Verification is part of the pending A-to-B result. Avoid a
+                # second email; the combined notice still includes the B-side
+                # verification URL and panel fallback.
+                rotation['verify_url'] = self._face_verify_url
+                return
             # Before the session is committed, _current_source still carries
             # its class default (``new``).  Use the pending intent for that
             # path so a resume challenge cannot be retried as a fresh start.
@@ -3349,6 +3526,135 @@ class LiveController:
         except Exception as exc:
             logger.debug('完成通知异常：%s', exc)
 
+    @staticmethod
+    def _rotation_task_summary(instruction) -> dict:
+        if instruction is None:
+            return None
+        try:
+            duration = max(0, int(getattr(instruction, 'duration_seconds', 0) or 0))
+        except (TypeError, ValueError):
+            duration = 0
+        return {
+            'zone': str(getattr(instruction, 'zone_name', '') or ''),
+            'duration_seconds': duration,
+        }
+
+    def _notify_task_rotation(self, completion: Optional[dict],
+                              next_task: Optional[dict], result: str,
+                              reason: str = '', late_update: bool = False,
+                              identity: str = '', verify_url: str = '',
+                              confirm_url: str = '') -> None:
+        """Deliver one frozen completion/next-task outcome through the mail contract."""
+        try:
+            from app.dependencies import get_email_sender
+            sender = get_email_sender()
+            notify = getattr(sender, 'notify_task_rotation', None) if sender else None
+            if not callable(notify):
+                return
+            notify(
+                completion=completion,
+                next_task=next_task,
+                result=result,
+                verify_url=verify_url,
+                confirm_url=confirm_url,
+                reason=reason,
+                late_update=late_update,
+                identity=identity,
+            )
+        except Exception as exc:
+            logger.debug('任务轮转通知异常：%s', exc)
+
+    def _claim_task_rotation(self, instruction) -> Optional[dict]:
+        lock = getattr(self, '_task_rotation_lock', None)
+        if lock is None:
+            return None
+        with lock:
+            pending = getattr(self, '_task_rotation_pending', None)
+            if not pending or pending.get('instruction') is not instruction:
+                return None
+            self._task_rotation_pending = None
+            pending['run_id'] = (getattr(self, '_pending_run_id', '') or
+                                 getattr(instruction, 'run_id', '') or '')
+            task_id = (getattr(instruction, 'task_id', None) or
+                       (pending.get('completion') or {}).get('task_id') or '')
+            execution_day = (getattr(instruction, 'execution_date', None) or
+                             (pending.get('completion') or {}).get('execution_date') or '')
+            pending['identity'] = f'{task_id}:{execution_day}:{pending["run_id"]}'
+            self._task_rotation_context = pending
+            timer = threading.Timer(
+                max(1.0, float(getattr(
+                    self, '_task_rotation_notice_timeout_seconds', 120.0))),
+                self._task_rotation_preparing_timeout, args=(pending,))
+            timer.daemon = True
+            pending['timer'] = timer
+            timer.start()
+            return pending
+
+    def _task_rotation_preparing_timeout(self, context: dict) -> None:
+        lock = getattr(self, '_task_rotation_lock', None)
+        if lock is None:
+            return
+        with lock:
+            if (getattr(self, '_task_rotation_context', None) is not context
+                    or context.get('finalized') or context.get('suppressed')):
+                return
+            if context.get('preparing_sent'):
+                return
+            context['preparing_sent'] = True
+            notify_lock = context.setdefault('_notify_lock', threading.Lock())
+            notify_lock.acquire()
+        try:
+            self._notify_task_rotation(
+                context.get('completion'), context.get('next_task'), 'preparing',
+                reason='开播请求仍在等待平台响应',
+                identity=context.get('identity', ''))
+        finally:
+            notify_lock.release()
+
+    def _finish_task_rotation(self, context: Optional[dict], result: str,
+                              reason: str = '') -> None:
+        if not context:
+            return
+        lock = getattr(self, '_task_rotation_lock', None)
+        if lock is None:
+            return
+        with lock:
+            if (context.get('finalized') or context.get('suppressed')
+                    or getattr(self, '_task_rotation_context', None) is not context):
+                return
+            context['finalized'] = True
+            timer = context.get('timer')
+            if timer:
+                timer.cancel()
+            late_update = bool(context.get('preparing_sent'))
+            notify_lock = context.setdefault('_notify_lock', threading.Lock())
+            self._task_rotation_context = None
+        with notify_lock:
+            self._notify_task_rotation(
+                None if late_update else context.get('completion'),
+                context.get('next_task'), result,
+                reason=reason,
+                late_update=late_update,
+                identity=context.get('identity', ''),
+                verify_url=context.get('verify_url', ''),
+                confirm_url=context.get('confirm_url', ''))
+
+    def _suppress_task_rotation(self) -> None:
+        lock = getattr(self, '_task_rotation_lock', None)
+        if lock is None:
+            return
+        with lock:
+            contexts = [getattr(self, '_task_rotation_pending', None),
+                        getattr(self, '_task_rotation_context', None)]
+            self._task_rotation_pending = None
+            self._task_rotation_context = None
+            for context in contexts:
+                if context:
+                    context['suppressed'] = True
+                    timer = context.get('timer')
+                    if timer:
+                        timer.cancel()
+
     def _notify_stopped(self, zone_name: str, stage: str = 'stopped',
                         elapsed: int = 0, reason: str = '') -> None:
         """Notify the confirmed stop stage without changing stop semantics."""
@@ -3375,6 +3681,92 @@ class LiveController:
         except Exception as exc:
             logger.debug('恢复通知异常：%s', exc)
 
+    def _notify_platform_outage_result(self, zone_name: str, result: str,
+                                       run_id: str, episode_id: int) -> None:
+        try:
+            from app.dependencies import get_email_sender
+            sender = get_email_sender()
+            notify = getattr(sender, 'notify_platform_outage_result', None) if sender else None
+            if callable(notify):
+                notify(zone_name, result, run_id, episode_id)
+        except Exception as exc:
+            logger.debug('平台断连结果通知异常：%s', exc)
+
+    def _begin_platform_outage(self, run_id: str, zone_name: str) -> Optional[dict]:
+        lock = getattr(self, '_platform_outage_lock', None)
+        if lock is None:
+            return None
+        with lock:
+            current = getattr(self, '_platform_outage', None)
+            if (current and current.get('run_id') == (run_id or '')
+                    and current.get('room_id') == self.current_room_id):
+                return current
+            self._platform_outage_seq = int(
+                getattr(self, '_platform_outage_seq', 0)) + 1
+            current = {
+                'episode_id': self._platform_outage_seq,
+                'run_id': run_id or '',
+                'room_id': self.current_room_id,
+                'zone': zone_name or '未知分区',
+                'started_at': _monotonic(),
+                'alerted': False,
+            }
+            self._platform_outage = current
+            return current
+
+    def _platform_outage_maybe_alert(self) -> None:
+        lock = getattr(self, '_platform_outage_lock', None)
+        if lock is None:
+            return
+        with lock:
+            episode = getattr(self, '_platform_outage', None)
+            if not episode or episode.get('alerted'):
+                return
+            if (_monotonic() - float(episode.get('started_at', 0))
+                    < PLATFORM_OUTAGE_ALERT_SECONDS):
+                return
+            episode['alerted'] = True
+            frozen = dict(episode)
+        self._notify_platform_outage_result(
+            frozen['zone'], 'still_retrying', frozen['run_id'],
+            frozen['episode_id'])
+
+    def _platform_outage_recovered(self, run_id: str) -> bool:
+        lock = getattr(self, '_platform_outage_lock', None)
+        if lock is None:
+            return False
+        with lock:
+            episode = getattr(self, '_platform_outage', None)
+            if not episode or episode.get('run_id') != (run_id or ''):
+                return False
+            self._platform_outage = None
+            frozen = dict(episode)
+        self._notify_platform_outage_result(
+            frozen['zone'], 'recovered', frozen['run_id'],
+            frozen['episode_id'])
+        return True
+
+    def _platform_outage_failed(self, run_id: str) -> bool:
+        lock = getattr(self, '_platform_outage_lock', None)
+        if lock is None:
+            return False
+        with lock:
+            episode = getattr(self, '_platform_outage', None)
+            if not episode or episode.get('run_id') != (run_id or ''):
+                return False
+            self._platform_outage = None
+            frozen = dict(episode)
+        self._notify_platform_outage_result(
+            frozen['zone'], 'failed', frozen['run_id'],
+            frozen['episode_id'])
+        return True
+
+    def _reset_local_media_confirmation(self) -> None:
+        lock = getattr(self, '_pusher_lock', None)
+        if lock:
+            with lock:
+                self._pusher_media_seconds = None
+
     def _finish_manual_expiry(self, zone_name: str, elapsed: int) -> None:
         """Finish a manual duration expiry, then report the real cleanup stage."""
         try:
@@ -3394,13 +3786,22 @@ class LiveController:
     def _settle_natural_completion(self, zone_name: str,
                                    task_id: Optional[int],
                                    execution_day: Optional[str],
-                                   run_id: Optional[str] = None) -> str:
+                                   run_id: Optional[str] = None,
+                                   completion_context: Optional[dict] = None) -> str:
         """Settle one task identity and report only the committed outcome.
 
         A single bounded retry covers a transient database failure.  Identity,
         execution date and run id stay frozen from the completed session, so a
         replacement task cannot receive a late completion.
         """
+        if (getattr(self.state, '_last_save_error', '')
+                or getattr(self.state, 'resume_checkpoint_failed', False)):
+            self._push_backend_event(
+                '完成', 'danger',
+                f'有效时长检查点未能保存，未结算或轮转：{zone_name}；'
+                '请检查状态文件后从面板继续')
+            return 'blocked'
+
         exec_date = None
         if execution_day:
             try:
@@ -3435,7 +3836,18 @@ class LiveController:
                  if status == 'settled'
                  else f'任务今日已完成，未重复计天：{zone_name}'),
                 notify=False)
-            self._notify_task_complete(zone_name, outcome)
+            if status == 'settled' and completion_context is not None:
+                completion_context.clear()
+                completion_context.update({
+                    'zone': zone_name,
+                    'execution_date': str(outcome.get('execution_date') or execution_day or ''),
+                    'effective_seconds': int(self._confirmed_elapsed()),
+                    'days_done': outcome.get('days_done'),
+                    'task_id': task_id,
+                    'run_id': run_id or '',
+                })
+            elif status == 'settled':
+                self._notify_task_complete(zone_name, outcome)
             return status
         if status in ('replaced', 'not_found', 'stale_day'):
             self._push_backend_event(
@@ -3459,7 +3871,18 @@ class LiveController:
             self._push_backend_event(
                 '完成', 'success' if retry_status == 'settled' else 'info',
                 f'任务完成（重试后提交）：{zone_name}', notify=False)
-            self._notify_task_complete(zone_name, retry)
+            if retry_status == 'settled' and completion_context is not None:
+                completion_context.clear()
+                completion_context.update({
+                    'zone': zone_name,
+                    'execution_date': str(retry.get('execution_date') or execution_day or ''),
+                    'effective_seconds': int(self._confirmed_elapsed()),
+                    'days_done': retry.get('days_done'),
+                    'task_id': task_id,
+                    'run_id': run_id or '',
+                })
+            elif retry_status == 'settled':
+                self._notify_task_complete(zone_name, retry)
         else:
             self._push_backend_event(
                 '完成', 'danger',
@@ -3544,6 +3967,9 @@ class LiveController:
             self._notify_verification_required(
                 '恢复直播需要人脸验证', stage='resume_blocked',
                 local_stop_requested=True)
+            self._platform_outage_failed(
+                getattr(self, '_current_run_id', '') or
+                getattr(self.state, 'run_id', ''))
         else:
             self._push_backend_event(
                 '错误', 'danger', f'自动恢复暂停：{self._recovery_blocked}')
@@ -3632,8 +4058,7 @@ class LiveController:
             self._push_backend_event(
                 '重连', 'success', '直播间已重新开启，正在恢复本地推流',
                 notify=False)
-            self._notify_recovered(
-                zone, 'platform', '平台 start_live 返回成功',
+            self._platform_outage_recovered(
                 getattr(self.state, 'run_id', '') or self._current_run_id)
             self._extract_and_cache_rtmp(resp)  # 更新推流码缓存
             # CTRL-01：缓存/准备期间同样可能发生停止；stop_monitor 会被下一次
@@ -3659,6 +4084,9 @@ class LiveController:
                     "https://www.bilibili.com/blackboard/live/face-auth-middle.html"
                     f"?source_event=400&mid={uid}")
                 logger.warning(" 重连遇到人脸验证，停止重试等待人工确认")
+                self._platform_outage_failed(
+                    getattr(self, '_current_run_id', '') or
+                    getattr(self.state, 'run_id', ''))
 
     def _monitor_streaming(self):
         """监控直播并按平台确认的有效时长结算任务。
@@ -3722,11 +4150,15 @@ class LiveController:
                                     and live_status in (0, 1))
                     live_ok = success and known_status and live_status == 1
                     if live_ok:
+                        self._platform_outage_recovered(monitor_run_id)
                         self.reconnect_attempts = 0
                         self._retry_cooldown_until = None
                         self._retry_window_start = None
                         self._status_query_failures = 0
                         self._credit_effective_observation(request_start, returned)
+                        rotation = getattr(self, '_task_rotation_context', None)
+                        if rotation and rotation.get('run_id') == monitor_run_id:
+                            self._finish_task_rotation(rotation, 'started')
                         mode, _ = self._get_stream_settings()
                         if mode == 'ffmpeg' and not (
                                 self._ffmpeg_loop_thread and
@@ -3734,7 +4166,14 @@ class LiveController:
                             self._start_ffmpeg_stream(monitor_epoch)
                     elif success and known_status and live_status == 0:
                         logger.warning("直播间已被平台关闭 (live_status=0)")
+                        self._begin_platform_outage(
+                            monitor_run_id,
+                            (self.current_instruction.zone_name
+                             if self.current_instruction else
+                             getattr(self.state, 'current_zone', '') or ''))
+                        self._reset_local_media_confirmation()
                         self._pause_effective_timer(TIMER_PAUSED_CLOSED, returned)
+                        self._platform_outage_maybe_alert()
                         self._handle_live_anomaly_retry(max_retries, cooldown_minutes)
                     else:
                         failure_kind = self.classify_failure(status_resp)
@@ -3794,18 +4233,56 @@ class LiveController:
                 task_id = getattr(instruction, 'task_id', None) if instruction else None
                 execution_day = (getattr(instruction, 'execution_date', None)
                                  or getattr(self.state, 'execution_date', None))
-                self._stop_live_process(preserve_state=False)
+                checkpoint_failed = bool(
+                    getattr(self.state, '_last_save_error', '')
+                    or getattr(self.state, 'resume_checkpoint_failed', False))
+                # If the latest confirmed progress was not durably checkpointed,
+                # stop output but leave the saved task identity/target/progress
+                # untouched. A later successful save must not retroactively turn
+                # this uncheckpointed run into an automatic completion.
+                self._stop_live_process(
+                    preserve_state=False,
+                    persist_state=not checkpoint_failed)
                 self._release_active_task(monitor_run_id)
+                completion_context = {}
                 status = self._settle_natural_completion(
-                    zone_name_done, task_id, execution_day, monitor_run_id)
-                if status in ('settled', 'already'):
+                    zone_name_done, task_id, execution_day, monitor_run_id,
+                    completion_context=completion_context)
+                if status == 'settled':
                     self.current_instruction = None
                     self.state.stop_streaming()
                     self._current_run_id = ''
-                    self.run_next_task(epoch=monitor_epoch)
-                else:
+                    if self._cleanup_confirmed():
+                        try:
+                            self.run_next_task(
+                                epoch=monitor_epoch,
+                                completion_context=completion_context)
+                        except TypeError as exc:
+                            if 'completion_context' not in str(exc):
+                                raise
+                            # Preserve compatibility with pre-port integrations
+                            # that replace run_next_task with the old signature.
+                            self.run_next_task(epoch=monitor_epoch)
+                    else:
+                        self._notify_task_rotation(
+                            completion_context, None, 'paused',
+                            reason='上一场平台或本地资源尚未确认清理')
+                elif status == 'already':
+                    # An earlier commit already owns the completion fact.
+                    # Clear the stale session but do not mail completion A again.
                     self.current_instruction = None
                     self.state.stop_streaming()
+                    self._current_run_id = ''
+                    if self._cleanup_confirmed():
+                        self.run_next_task(epoch=monitor_epoch)
+                elif status == 'blocked':
+                    self.current_instruction = None
+                    self.state.is_streaming = False
+                    self.state.phase = PHASE_IDLE
+                    self._current_run_id = ''
+                else:
+                    self.current_instruction = None
+                    self.state.stop_streaming(preserve=True)
                     self._current_run_id = ''
         logger.info("直播监控线程已退出")
 
@@ -3902,37 +4379,55 @@ class LiveController:
             self._clock().reset(saved_effective, saved_origin)
         self._current_run_id = ''
         self._release_active_task(run_at_stop)
-    def stop_streaming(self, token: str = '') -> bool:
+    def stop_streaming(self, token: str = '',
+                       user_initiated: bool = True) -> bool:
         """Stop once, keeping the cleanup interval exclusive to this intent."""
+        wait_for_existing = False
         with self._start_lock:
             if self._stop_in_progress:
                 logger.info("停止清理已在进行中，重复请求只等待既有结果")
-                return True
-            self._stop_in_progress = True
-            # Freeze the committed-vs-pending decision and invalidate the
-            # current start worker before releasing the same lock used by the
-            # final session commit.  This closes the interval in which a
-            # pending B could commit after stop had decided to preserve A.
-            pending_only = bool(self._is_starting and not self.is_streaming)
-            if pending_only:
-                zone_at_stop = getattr(self.state, 'current_zone', '') or ''
-                elapsed_at_stop = int(
-                    getattr(self.state, 'elapsed_seconds', 0) or 0)
+                wait_for_existing = True
             else:
-                zone_at_stop = (
-                    self.current_instruction.zone_name
-                    if self.current_instruction
-                    else getattr(self.state, 'current_zone', '') or '')
-                elapsed_at_stop = (
-                    self._confirmed_elapsed() if self.is_streaming else 0)
-            self._control_epoch += 1
-            self._start_cancel.set()
+                self._stop_in_progress = True
+                self._stop_completion_event.clear()
+                if user_initiated:
+                    self._last_user_stop_source_epoch = self._control_epoch
+                    # A panel stop cancels the pending B handoff silently; it is
+                    # not a system-generated rotation outcome. Holding
+                    # _start_lock closes the acceptance race with new B intent.
+                    self._suppress_task_rotation()
+                # Freeze the committed-vs-pending decision and invalidate the
+                # current start worker before releasing the same lock used by
+                # the final session commit.
+                pending_only = bool(self._is_starting and not self.is_streaming)
+                if pending_only:
+                    zone_at_stop = getattr(self.state, 'current_zone', '') or ''
+                    elapsed_at_stop = int(
+                        getattr(self.state, 'elapsed_seconds', 0) or 0)
+                else:
+                    zone_at_stop = (
+                        self.current_instruction.zone_name
+                        if self.current_instruction
+                        else getattr(self.state, 'current_zone', '') or '')
+                    elapsed_at_stop = (
+                        self._confirmed_elapsed() if self.is_streaming else 0)
+                self._control_epoch += 1
+                self._start_cancel.set()
+        if wait_for_existing:
+            # 受理语义与服务器/CTRL-02 契约一致：重复停止已被受理，并等待
+            # 既有清理在本预算内收尾。"清理是否确认完成"由 _stop_cleanup_done
+            # 与面板事件（stopped / pending_recycle）单独表达，不得混入本
+            # 返回值——否则回收失败的合法停止会被当成"停止失败"。
+            self._stop_completion_event.wait(
+                max(0.0, float(getattr(self, '_stop_wait_timeout_seconds', 15.0))))
+            return True
         try:
             return self._stop_streaming_impl(
                 token, pending_only, zone_at_stop, elapsed_at_stop)
         finally:
             with self._start_lock:
                 self._stop_in_progress = False
+                self._stop_completion_event.set()
 
     def _stop_streaming_impl(self, token: str, pending_only: bool,
                              zone_at_stop: str, elapsed_at_stop: int) -> bool:
@@ -3984,7 +4479,8 @@ class LiveController:
         logger.info("直播已完全停止")
         return True
 
-    def run_next_task(self, epoch: int = None) -> bool:
+    def run_next_task(self, epoch: int = None,
+                      completion_context: Optional[dict] = None) -> bool:
         """执行下一个直播任务（供 API 调用）。
 
         epoch 来自控制入口的代际快照：等待重置/选任务期间发生停止时，
@@ -3995,21 +4491,63 @@ class LiveController:
         logger.info(" 开始执行新任务")
         logger.info("=" * 70)
 
+        completion = (dict(completion_context)
+                      if isinstance(completion_context, dict)
+                      and completion_context else None)
         instruction = self.task_manager.select_next_instruction() if self.task_manager else None
         if not instruction:
             logger.warning(" 无待执行任务")
+            if completion:
+                identity = (f"{completion.get('task_id', '')}:"
+                            f"{completion.get('execution_date', '')}:"
+                            f"{completion.get('run_id', '')}")
+                self._notify_task_rotation(
+                    completion, None, 'none', identity=identity)
             return False
+
+        next_task = self._rotation_task_summary(instruction)
 
         video_path = self.video_finder.find_video(instruction.zone_name)
         if not video_path:
             stream_mode, _ = self._get_stream_settings()
             if stream_mode == 'ffmpeg':
                 logger.error(f" 未找到视频文件，跳过任务：{instruction.zone_name}")
+                if completion:
+                    identity = (f"{getattr(instruction, 'task_id', '')}:"
+                                f"{getattr(instruction, 'execution_date', '')}:")
+                    self._notify_task_rotation(
+                        completion, next_task, 'failed',
+                        reason='未找到本地视频文件', identity=identity)
                 return False
             video_path = ''  # OBS 外部推流：允许无本地视频
 
-        return self.start_streaming(instruction, video_path, is_task_mode=True,
-                                    epoch=epoch)
+        rotation = None
+        if completion:
+            rotation = {
+                'completion': completion,
+                'next_task': next_task,
+                'instruction': instruction,
+                'preparing_sent': False,
+                'finalized': False,
+                'suppressed': False,
+                'verify_url': '',
+                'confirm_url': '',
+                '_notify_lock': threading.Lock(),
+            }
+            with self._task_rotation_lock:
+                self._task_rotation_pending = rotation
+        accepted = self.start_streaming(
+            instruction, video_path, is_task_mode=True, epoch=epoch)
+        if not accepted and rotation:
+            with self._task_rotation_lock:
+                if self._task_rotation_pending is rotation:
+                    self._task_rotation_pending = None
+            identity = (f"{getattr(instruction, 'task_id', '')}:"
+                        f"{getattr(instruction, 'execution_date', '')}:")
+            self._notify_task_rotation(
+                completion, next_task, 'failed',
+                reason='开播请求未被接受', identity=identity)
+        return accepted
 
     def resolve_resume_target(self) -> Tuple[Optional[LiveInstruction], str]:
         """Resolve the saved session to the same live task identity.
@@ -4121,24 +4659,55 @@ class LiveController:
             return {'success': True, 'data': result}
         return {'success': False, 'message': '获取二维码失败'}
 
-    def shutdown(self, stop_platform: bool = True):
+    def shutdown(self, stop_platform: bool = True) -> bool:
         """关闭直播控制模块。
 
         D2：stop_platform=False 用于"不停止并退出"——保存进度、回收自建
         本地推流进程（FFmpeg/视频播放），**不调用平台下播 API**、不碰
         外部 OBS 推流；平台侧房间保持原状。
         """
-        logger.info(" 正在关闭直播控制模块...")
-        # 取消后台开播/引导线程（A1/A2）
-        self._startup_cancel.set()
-        self._advance_control_epoch()
-        self._start_cancel.set()
-        self._ffmpeg_stop_event.set()
-        self.stop_monitor.set()
-        if self.is_streaming or self._is_starting:
-            if stop_platform:
-                self.stop_streaming()
-            else:
+        lock = getattr(self, '_shutdown_lock', None)
+        if lock is None:
+            lock = threading.Lock()
+            self._shutdown_lock = lock
+        with lock:
+            if getattr(self, '_shutdown_complete', False):
+                logger.info('关闭已完成，忽略重复关闭请求')
+                return True
+            if getattr(self, '_shutdown_in_progress', False):
+                logger.info('关闭仍在进行，报告尚未完成')
+                return False
+            self._shutdown_in_progress = True
+            if getattr(self, '_shutdown_stop_platform', None) is None:
+                self._shutdown_stop_platform = bool(stop_platform)
+            stop_platform = bool(self._shutdown_stop_platform)
+        try:
+            logger.info(" 正在关闭直播控制模块...")
+            # 取消后台开播/引导线程（A1/A2）
+            self._startup_cancel.set()
+            self._advance_control_epoch()
+            self._start_cancel.set()
+            self._ffmpeg_stop_event.set()
+            self.stop_monitor.set()
+            self._suppress_task_rotation()
+            if not self._stop_completion_event.wait(max(
+                    0.0, float(getattr(
+                        self, '_shutdown_wait_timeout_seconds', 15.0)))):
+                logger.error('等待在途停止清理超时，关闭未完成；保留进程以便重试')
+                return False
+            start_thread = getattr(self, '_start_thread', None)
+            if (start_thread and start_thread.is_alive()
+                    and start_thread is not threading.current_thread()):
+                start_thread.join(timeout=3.0)
+            stop_needed = bool(
+                self.is_streaming or self._is_starting
+                or (stop_platform and getattr(
+                    self, '_shutdown_stop_attempted', False)
+                    and not self._cleanup_confirmed()))
+            if stop_platform and stop_needed:
+                self._shutdown_stop_attempted = True
+                self.stop_streaming(user_initiated=True)
+            elif self.is_streaming or self._is_starting:
                 # D2：退出不停播——只回收自建进程 + 保存进度
                 self._kill_ffmpeg()
                 if self._ffmpeg_loop_thread and self._ffmpeg_loop_thread.is_alive():
@@ -4159,6 +4728,28 @@ class LiveController:
                     self.state.save()
                     logger.info(f" 已保存进度（已确认有效时长={elapsed}秒），平台侧未下播")
                 self.is_streaming = False  # 本地控制器视角停止；平台/OBS 不受影响
-        # A5：只回收自建进程（所有权感知），绝不全局 taskkill
-        self._kill_ffmpeg()
-        logger.info(" 直播控制模块已关闭")
+            # A5：只回收自建进程（所有权感知），绝不全局 taskkill
+            self._kill_ffmpeg()
+            logger.info(" 直播控制模块已关闭")
+        finally:
+            local_done = (
+                not self._process_alive(getattr(self, 'video_process', None))
+                and not getattr(self, '_ffmpeg_unrecycled', False)
+                and not (getattr(self, '_ffmpeg_loop_thread', None)
+                         and self._ffmpeg_loop_thread.is_alive())
+                and not (getattr(self, '_start_thread', None)
+                         and self._start_thread.is_alive())
+                and not getattr(self, '_stop_in_progress', False)
+            )
+            if stop_platform:
+                stop_done = (not self._shutdown_stop_attempted
+                             or self._cleanup_confirmed())
+                cleanup_done = (local_done and not self.is_streaming
+                                and not self._is_starting and stop_done)
+            else:
+                cleanup_done = (local_done and not self.is_streaming
+                                and not self._is_starting)
+            with lock:
+                self._shutdown_in_progress = False
+                self._shutdown_complete = bool(cleanup_done)
+        return bool(self._shutdown_complete)

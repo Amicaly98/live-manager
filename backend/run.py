@@ -118,7 +118,8 @@ def main():
     else:
         # 显式持有 Server 句柄：/api/shutdown 通过 should_exit 优雅退出（E2）
         config = uvicorn.Config(fastapi_app, host=args.host, port=args.port,
-                                log_level="info")
+                                log_level="info",
+                                timeout_graceful_shutdown=30)
         server = uvicorn.Server(config)
         fastapi_app.state.uvicorn_server = server
         server.run()

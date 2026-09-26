@@ -241,6 +241,39 @@ test('E2: stop 优雅路径调用 shutdown 且幂等', async () => {
   assert.equal(shutdownCalls, 1, '第二次 stop 无进程，不再调用 shutdown');
 });
 
+test('graceful shutdown response timeout does not kill a backend that is still exiting', async () => {
+  const proc = new FakeProc(90123);
+  const lc = new BackendLifecycle({
+    async spawn() { return proc; },
+    async requestShutdown() {
+      // The HTTP response timed out, but the backend already accepted the
+      // request and completes its own cleanup shortly afterwards.
+      setTimeout(() => { proc._alive = false; }, 40);
+      return false;
+    },
+    async waitReady() { return true; },
+    log: () => {},
+  });
+  await lc.start();
+  assert.equal(await lc.stop(true, 300, false), true);
+  assert.equal(proc.killCalls, 0, 'a late graceful exit must not be force-killed');
+});
+
+test('ambiguous shutdown timeout preserves a live owned backend for retry', async () => {
+  const proc = new FakeProc(90124);
+  const lc = new BackendLifecycle({
+    async spawn() { return proc; },
+    async requestShutdown() { return false; },
+    async waitReady() { return true; },
+    log: () => {},
+  });
+  await lc.start();
+  assert.equal(await lc.stop(true, 50, true), false);
+  assert.equal(proc.killCalls, 0, 'an in-flight state save must not be force-killed');
+  assert.equal(lc.getPid(), 90124, 'retain the owner so another quit can retry');
+  assert.equal(lc.getState(), 'stopping');
+});
+
 test('D2: 退出不停播时 requestShutdown 收到 stopPlatform=false', async () => {
   const seen = [];
   const proc = new FakeProc(1);

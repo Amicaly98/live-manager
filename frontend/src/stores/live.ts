@@ -641,6 +641,7 @@ export const useLiveStore = defineStore('live', () => {
     const ts = String((s as any).timer_state || '')
     if (ts === 'paused_closed') return '已暂停'
     if (ts === 'paused_blocked') return '恢复中'
+    if (ts === 'paused_pusher') return '恢复中'
     if (ts === 'paused_unknown') return '连接中'
     return ''
   })

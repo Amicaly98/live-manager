@@ -18,6 +18,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 # 确保 backend 目录在 sys.path 中
 backend_dir = Path(__file__).resolve().parent.parent
@@ -122,7 +123,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="直播控制系统 API",
     description="面向主播的一站式自动化直播管理工具后端",
-    version="1.1.0",
+    version="1.1.1",
     lifespan=lifespan
 )
 
@@ -182,17 +183,42 @@ async def shutdown(stop_live: bool = True):
     Electron 的强杀进程树只是兜底（优雅路径正常时不会走到）。
     D2：stop_live=false 用于"不停止并退出"——保存进度、回收自建本地
     推流进程，**不调用平台下播 API**（不碰外部 OBS 推流）。
+
+    单次关闭事务协议：本端点独占"停止并退出"的完整事务（Electron 不再
+    先发 /api/live/stop）。控制器清理与状态保存都确认完成后才返回成功
+    并请求 uvicorn 退出；任一步未确认都返回 HTTP 503 + 稳定错误码
+    （``SHUTDOWN_NOT_CONFIRMED``），不设置 should_exit、不提前关闭
+    TaskManager，服务进程保持存活供调用方重试。响应失败或超时后，
+    调用方（Electron BackendLifecycle）保留进程所有权，绝不强杀仍在
+    收尾的后端，也不会收到"已安全关闭"的假成功。
     """
     logger.info("收到关闭请求（stop_live=%s），正在保存状态...", stop_live)
-    tm = get_task_manager()
     lc = get_live_controller()
-    if lc:
-        lc.shutdown(stop_platform=stop_live)
+    if lc is not None:
+        cleanup_done = bool(lc.shutdown(stop_platform=stop_live))
+        state_error = ''
+        if cleanup_done and getattr(lc, 'state', None) is not None:
+            # LiveState.save() 成功会清掉 _last_save_error；非空即最近一次
+            # 落盘失败，最后进度不能确认已持久化。
+            state_error = str(lc.state.snapshot().get('last_save_error') or '')
+            cleanup_done = not state_error
+        if not cleanup_done:
+            reason = (f'状态保存未确认完成：{state_error}' if state_error
+                      else '控制器清理未确认完成（在途停止或进程回收未确认），可稍后重试')
+            logger.error("关闭未确认完成，保持服务运行供重试：%s", reason)
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "status": "error",
+                    "code": "SHUTDOWN_NOT_CONFIRMED",
+                    "message": reason,
+                })
+    tm = get_task_manager()
     if tm:
         tm.shutdown()
     server = getattr(app.state, "uvicorn_server", None)
     if server is not None:
-        logger.info("通知 uvicorn 优雅退出...")
+        logger.info("状态保存确认完成，通知 uvicorn 优雅退出...")
         server.should_exit = True
     else:
         logger.warning("未找到 uvicorn server 句柄，进程将由调用方强杀兜底")

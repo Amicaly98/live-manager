@@ -987,19 +987,26 @@ class TaskManager:
                 self._is_resetting = False
 
     def _top5_snapshot(self) -> List[dict]:
-        """按当前已发布快照取优先度最高的 5 个未完成任务（与统计同源）。"""
+        """按旧调用名返回优先度最高的 5 个未完成任务。"""
         return self._compute_top5_from_rows(self.get_snapshot()[1])
 
     def _compute_top5_from_rows(self, rows: List[dict]) -> List[dict]:
-        """从**冻结行**计算 Top5（纯计算，可复用于同一份快照）。
+        """从冻结行计算兼容用 Top5。"""
+        return self._compute_top_rows(rows, limit=5)
+
+    def _compute_top10_from_rows(self, rows: List[dict]) -> List[dict]:
+        """从**冻结行**计算优先度最高的 Top10（纯计算，可复用快照）。
 
         ``remaining_days`` 用权威派生口径 ``Task.remaining_exec_days``（与
         计算列 I 同义），不再读旧列——旧列默认 1 且从不重算，是"邮件里
         剩余天数全为 1"的根源（2026-09-21 DS1）。
         """
+        return self._compute_top_rows(rows, limit=10)
+
+    def _compute_top_rows(self, rows: List[dict], limit: int) -> List[dict]:
         tasks = [self._row_to_task(r) for r in rows]
         top = sorted([t for t in tasks if t.category > 0],
-                     key=lambda t: t.priority)[:5]
+                     key=lambda t: t.priority)[:limit]
         return [
             {
                 'zone_name': t.zone_name,
@@ -1077,6 +1084,7 @@ class TaskManager:
             with self._mutation_lock:
                 revision, rows = self.get_snapshot()
                 stats = self._compute_stats_from_rows(rows, as_of)
+                top10 = self._compute_top10_from_rows(rows)
                 top5 = self._compute_top5_from_rows(rows)
                 # 完成标记（today_done）属于哪个业务日，必须与数据**同一次**
                 # 冻结（2026-09-21 R2：旧实现只冻结数值、不冻结归属日，
@@ -1094,6 +1102,7 @@ class TaskManager:
             'revision': revision,
             'rows': len(rows),
             'stats': stats,
+            'top10': top10,
             'top5': top5,
             'done_flags': done_flags,
         }
@@ -1173,7 +1182,9 @@ class TaskManager:
                     summary_date, snapshot.get('error'))
                 return
             stats = snapshot.get('stats') or {}
-            top5 = snapshot.get('top5') or []
+            top10 = snapshot.get('top10')
+            if top10 is None:
+                top10 = snapshot.get('top5') or []
             has_content = bool(stats.get('pending_total')) \
                 or bool(stats.get('today_done')) \
                 or bool(stats.get('today_pending'))
@@ -1184,7 +1195,7 @@ class TaskManager:
                     summary_date, snapshot.get('revision'), snapshot.get('rows'))
                 return
             result = sender.send_daily_summary(
-                stats, top5, summary_date=summary_date,
+                stats, top10, summary_date=summary_date, brief=True,
                 snapshot_meta={
                     'as_of': snapshot.get('as_of'),
                     'revision': snapshot.get('revision'),

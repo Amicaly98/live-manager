@@ -48,9 +48,10 @@ class AppSettings(BaseModel):
     email_notify_error: bool = True
     email_notify_complete: bool = True
     email_daily_summary: bool = True
+    email_notify_ffmpeg_retry: bool = False
     email_face_verify_port: int = 19080
     serverchan_sendkey: str = ''
-    # Explicit address for a local confirmation endpoint; empty selects loopback.
+    # Explicit externally reachable host for email confirmation links; empty disables links.
     server_host: str = ''
     duration_distribution: str = 'beta'
     duration_multiplier_min: float = 1.05

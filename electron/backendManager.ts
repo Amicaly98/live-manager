@@ -239,16 +239,29 @@ export class BackendLifecycle {
     const previous = this.state;
     this.state = 'stopping';
     if (graceful) {
+      let delivered = false;
       try {
-        const delivered = await this.deps.requestShutdown(stopPlatform);
-        if (delivered) {
-          // 给后端一点时间自行退出（轮询，有界）
-          const deadline = Date.now() + 3000;
-          while (Date.now() < deadline && proc.isAlive()) {
-            await new Promise(r => setTimeout(r, 200));
-          }
+        delivered = await this.deps.requestShutdown(stopPlatform);
+      } catch { /* The backend may still have accepted the request. */ }
+      // A timed-out or failed HTTP response does not prove that shutdown was
+      // rejected.  It may be saving the task and reclaiming FFmpeg already.
+      if (!delivered) {
+        this.deps.log('warn', '[backend] shutdown response missing; waiting for owned exit');
+      }
+      const deadline = Date.now() + Math.max(0, killTimeoutMs);
+      while (Date.now() < deadline && proc.isAlive()) {
+        await new Promise(r => setTimeout(r, Math.min(200, deadline - Date.now())));
+      }
+      if (!delivered && proc.isAlive()) {
+        // An HTTP timeout or 503 cannot distinguish a rejected request from
+        // a controller still saving state.  Keep the owned process and let
+        // the UI report a failed quit instead of killing it mid-transaction.
+        if (this.generation === generationAtEntry && this.current === proc) {
+          this.state = 'stopping';
         }
-      } catch { /* 优雅关闭失败 → 走强杀 */ }
+        this.deps.log('warn', '[backend] shutdown not confirmed; preserving owned process');
+        return false;
+      }
     }
     let killed = true;
     if (proc.isAlive()) {

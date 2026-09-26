@@ -29,11 +29,6 @@ def shutdown_globals():
     """清理全局单例（由 lifespan 调用）"""
     global _task_manager, _live_controller, _email_sender
     logger.info("正在关闭全局依赖...")
-    if _email_sender:
-        try:
-            _email_sender.shutdown()
-        except Exception as e:
-            logger.error(f"邮件发送器关闭异常: {e}")
     if _live_controller:
         try:
             _live_controller.shutdown()
@@ -44,6 +39,13 @@ def shutdown_globals():
             _task_manager.shutdown()
         except Exception as e:
             logger.error(f"任务管理器关闭异常: {e}")
+    # Controller/task cleanup may enqueue the final outcome.  Drain the
+    # notifier only after those producers have stopped.
+    if _email_sender:
+        try:
+            _email_sender.shutdown()
+        except Exception as e:
+            logger.error(f"邮件发送器关闭异常: {e}")
     _task_manager = None
     _live_controller = None
     _email_sender = None
