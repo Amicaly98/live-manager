@@ -99,7 +99,8 @@ def _ps_output(script: str, timeout: float = 10.0) -> str:
     try:
         r = subprocess.run(
             ["powershell", "-NoProfile", "-Command", script],
-            capture_output=True, text=True, timeout=timeout)
+            capture_output=True, text=True, encoding='utf-8',
+            errors='replace', timeout=timeout)
         return (r.stdout or "").strip()
     except Exception:
         return ""
@@ -268,7 +269,8 @@ def _reclaim_owned_processes(records: list) -> list:
             try:
                 result = subprocess.run(
                     ["taskkill", "/F", "/PID", str(expected["pid"])],
-                    capture_output=True, text=True, timeout=10)
+                    capture_output=True, text=True, encoding='utf-8',
+                    errors='replace', timeout=10)
                 outcome["returncode"] = result.returncode
                 outcome["reclaimed"] = result.returncode == 0
             except Exception as exc:
@@ -554,7 +556,8 @@ def _kill_owned_process(process, timeout: float = 10.0) -> dict:
     try:
         command = subprocess.run(
             ["taskkill", "/F", "/PID", str(pid)],
-            capture_output=True, text=True, timeout=timeout)
+            capture_output=True, text=True, encoding='utf-8',
+            errors='replace', timeout=timeout)
         result["taskkill_returncode"] = command.returncode
         result["taskkill_stdout"] = (command.stdout or "")[-1000:]
         result["taskkill_stderr"] = (command.stderr or "")[-1000:]
