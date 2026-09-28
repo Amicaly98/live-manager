@@ -85,7 +85,9 @@
         <el-table-column label="今日状态" min-width="90" align="center">
           <template #default="{ row }">
             <el-tag v-if="row.is_completed" type="success" size="small">全部完成</el-tag>
-            <el-tag v-else-if="streamingZone === row.zone_name" type="warning" size="small">正在执行</el-tag>
+            <el-tag v-else-if="isExecutingRow(row)" :type="executingTagOf(row)" size="small">
+              {{ executingLabelOf(row) }}
+            </el-tag>
             <el-tag v-else-if="row.today_done === 1" type="success" size="small">今日完成</el-tag>
             <el-tag v-else type="info" size="small">待执行</el-tag>
           </template>
@@ -98,14 +100,14 @@
               type="primary"
               size="small"
               :disabled="liveStore.status.is_streaming"
-              @click="confirmStartLive(row.zone_name)"
+              @click="confirmStartLive(row as TaskItem)"
             >
               {{ liveStore.status.is_streaming ? '直播中' : '立即开播' }}
             </el-button>
             <el-button
               v-if="row.needs_execution"
               size="small"
-              :disabled="streamingZone === row.zone_name"
+              :disabled="isExecutingRow(row)"
               @click="confirmMarkDone(row.zone_name)"
             >
               标记完成
@@ -114,14 +116,14 @@
               v-if="row.needs_execution"
               type="success"
               size="small"
-              :disabled="streamingZone === row.zone_name"
+              :disabled="isExecutingRow(row)"
               @click="confirmMarkAllDone(row.zone_name)"
             >
               全部完成
             </el-button>
             <el-button
               size="small"
-              :disabled="streamingZone === row.zone_name"
+              :disabled="isExecutingRow(row)"
               @click="openEditDialog(row as TaskItem)"
             >
               编辑
@@ -129,7 +131,7 @@
             <el-button
               type="danger"
               size="small"
-              :disabled="streamingZone === row.zone_name"
+              :disabled="isExecutingRow(row)"
               @click="confirmDelete(row.zone_name)"
             >
               删除
@@ -225,20 +227,34 @@ import { useLiveStore } from '@/stores/live'
 import { useAuthStore } from '@/stores/auth'
 import Sidebar from '@/components/Sidebar.vue'
 import type { TaskItem, TaskCreate, TaskUpdate, OverwriteTarget } from '@/types/api'
+import {
+  resolveExecutingTaskId, resolveExecutingLabel, resolveExecutingTagType,
+  type ExecutingStatusView,
+} from '@/utils/executingTask'
+import {
+  runSpecifiedTaskStart, conflictInfoFromState,
+} from '@/utils/startTaskFlow'
 
 const router = useRouter()
 const taskStore = useTaskStore()
 const liveStore = useLiveStore()
 const authStore = useAuthStore()
 
-// 任务模式直播中时禁用管理操作
-const isTaskModeStreaming = computed(() =>
-  liveStore.status.is_streaming && liveStore.status.stream_mode === 'task'
+// ---- "正在执行"按稳定 task_id 判定（2026-09-28 收口，B03） ----
+// 分区名可被删除重建，同名任务会互相冒充；只有任务库主键才是稳定身份。
+// 手动模式没有任务身份（resolveExecutingTaskId 返回 null），任何行都不打标签。
+const executingTaskId = computed(() =>
+  resolveExecutingTaskId(liveStore.status as ExecutingStatusView)
 )
-// 当前正在直播的分区名
-const streamingZone = computed(() =>
-  isTaskModeStreaming.value ? liveStore.status.current_zone : ''
-)
+function isExecutingRow(row: TaskItem): boolean {
+  return executingTaskId.value !== null && row.id === executingTaskId.value
+}
+function executingLabelOf(row: TaskItem): string {
+  return resolveExecutingLabel(liveStore.status as ExecutingStatusView, row.id ?? null)
+}
+function executingTagOf(row: TaskItem) {
+  return resolveExecutingTagType(liveStore.status as ExecutingStatusView, row.id ?? null)
+}
 
 function formatTime(d?: Date) {
   const t = d || new Date()
@@ -269,6 +285,9 @@ let _revisionTimer: ReturnType<typeof setInterval> | null = null
 
 onMounted(async () => {
   await taskStore.fetchTasks()
+  // /tasks 也可能是首个页面：先拉一次状态快照，"正在执行"标签首屏即正确
+  // （此后由全局 30 秒事件轮询驱动更新）。
+  void liveStore.pollStatus()
   _revisionTimer = setInterval(() => { void taskStore.refreshTasksIfStale() }, 5000)
 })
 
@@ -674,12 +693,99 @@ async function startLiveForZone(zoneName: string) {
   }
 }
 
-async function confirmStartLive(zoneName: string) {
+/** 任务库当前业务日（后端 /api/tasks/stats 附带）。 */
+function currentBusinessDate(): string {
+  const bd = (taskStore as unknown as { businessDate?: string }).businessDate
+  if (bd && /^\d{4}-\d{2}-\d{2}$/.test(bd)) return bd
+  const now = new Date()
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`
+}
+
+/**
+ * 从**这一行**开始任务模式开播（2026-09-28 收口：点哪条开哪条）。
+ *
+ * 目标在弹框之前冻结一次（id + 版本 + 业务日），之后的所有确认/重发都复用
+ * 同一个 target；覆盖确认的事实来自服务端状态快照，凭证完整后才发请求。
+ */
+async function startFromRow(row: TaskItem) {
+  const result = await runSpecifiedTaskStart({
+    freezeStartTarget: () => {
+      // 按行内稳定 id 从**当前列表**再取一次（行对象可能是旧渲染），
+      // 版本与业务日也一并冻结——三样一起，弹框之后不再改。
+      const current = taskStore.tasks.find(t => t.id === row.id)
+      if (!current || typeof current.id !== 'number') return null
+      return {
+        id: current.id,
+        expectedRevision: taskStore.tasksRevision,
+        businessDate: currentBusinessDate(),
+      }
+    },
+    fetchSavedState: async () => {
+      try {
+        const { useRequest } = await import('@/api/request')
+        const req = useRequest()
+        const state = await req.get<Record<string, unknown>>('/api/live/state')
+        return conflictInfoFromState(state)
+      } catch {
+        return null
+      }
+    },
+    start: async (target, abandonSaved) =>
+      liveStore.startLive(undefined, undefined, {
+        taskId: target.id,
+        expectedRevision: target.expectedRevision,
+        businessDate: target.businessDate,
+        abandonSaved,
+      }),
+    confirmAbandon: async (info) => {
+      try {
+        await ElMessageBox.confirm(
+          `存在进行中的任务「${info.oldZoneName || '未知分区'}」`
+          + `（已播 ${info.oldElapsedSeconds ?? '?'} 秒）。\n\n`
+          + '开始新任务将在其成功接管后放弃该进度；接管失败则进度原样保留。是否继续？',
+          '进行中的任务',
+          { confirmButtonText: '覆盖并开始', cancelButtonText: '保留原进度', type: 'warning' },
+        )
+        return true
+      } catch {
+        return false
+      }
+    },
+    fetchControlEpoch: async () => {
+      try {
+        const { useRequest } = await import('@/api/request')
+        const req = useRequest()
+        const r = await req.get<{ epoch: number }>('/api/live/operation-ticket')
+        return typeof r?.epoch === 'number' ? r.epoch : null
+      } catch {
+        return null
+      }
+    },
+    newConfirmId: () =>
+      `confirm-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    notify: (message, kind) => {
+      if (kind === 'error') ElMessage.error(message)
+      else if (kind === 'warning') ElMessage.warning(message)
+      else ElMessage.info(message)
+    },
+  })
+  if (result.success) {
+    ElMessage.success(result.message)
+  } else if (result.needFaceVerify) {
+    // 人脸验证弹窗由 Dashboard 感知轮询；这里只提示
+    ElMessage.warning(result.message)
+  } else if (result.message && result.message !== '已取消') {
+    ElMessage.error(result.message)
+  }
+}
+
+async function confirmStartLive(row: TaskItem) {
   // 选择模式
   let mode: 'task' | 'manual' = 'manual'
   try {
     await ElMessageBox.confirm(
-      `在分区「${zoneName}」开播：\n\n【单任务模式】自动执行下一个待完成任务\n【手动模式】手动指定时长，单次开播`,
+      `在分区「${row.zone_name}」开播：\n\n【单任务模式】从这一条任务开始（点哪条开哪条）\n【手动模式】手动指定时长，单次开播`,
       '选择开播模式',
       {
         confirmButtonText: '手动模式',
@@ -698,27 +804,10 @@ async function confirmStartLive(zoneName: string) {
   }
 
   if (mode === 'task') {
-    // 单任务模式：检查是否有进行中的任务
-    try {
-      const { useRequest } = await import('@/api/request')
-      const req = useRequest()
-      const stateRes = await req.get<{ has_active: boolean; current_zone?: string }>('/api/live/state')
-      if (stateRes.has_active && stateRes.current_zone) {
-        try {
-          await ElMessageBox.confirm(
-            `存在进行中的任务「${stateRes.current_zone}」，是否覆盖并开始新任务？`,
-            '进行中的任务',
-            { confirmButtonText: '覆盖', cancelButtonText: '取消', type: 'warning' },
-          )
-        } catch { return }
-      }
-    } catch { /* state check failed, proceed anyway */ }
-    // 单任务模式：不指定分区，后端自动取下一个任务
-    const result = await liveStore.startLive()
-    if (result.success) { ElMessage.success(result.message) }
-    else { ElMessage.error(result.message) }
+    // 单任务模式：从点击的这条任务开始（携带冻结身份，后端逐项核对）。
+    await startFromRow(row)
   } else {
-    await startLiveForZone(zoneName)
+    await startLiveForZone(row.zone_name)
   }
 }
 

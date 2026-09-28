@@ -92,6 +92,22 @@ export interface StartLiveResponse {
   message: string
   need_face_verification?: boolean
   qr_data?: string
+  /** 2026-09-28 收口：受理冻结基线（受理即有界显示；权威值仍以轮询为准）。 */
+  accepted?: AcceptedIntent
+  /** 受理拒绝原因码（失败可见，不静默）。 */
+  refusal?: string
+}
+
+/** 受理冻结基线：受理成功即刻返回，供前端"受理即有界显示"。 */
+export interface AcceptedIntent {
+  run_id?: string
+  task_id?: number | null
+  zone_name?: string
+  confirmed_elapsed_seconds: number
+  duration_seconds: number
+  duration_known: boolean
+  source?: string
+  accepted_epoch?: number
 }
 
 export interface StopLiveResponse {
@@ -250,6 +266,25 @@ export interface ExportResult {
 export interface StartLiveRequest {
   zone_name?: string
   duration_seconds?: number  // 手动模式时长，0=不限时，上限86400
+  // ---- 2026-09-28 收口：指定任务开播（点哪条开哪条） ----
+  task_id?: number
+  /** 确认弹框前冻结的任务库版本。 */
+  expected_revision?: number
+  /** 确认弹框前冻结的业务日。 */
+  business_date?: string
+  /** 放弃旧进度的确认凭证（完整冻结身份）。 */
+  abandon_saved?: AbandonSavedClaim
+}
+
+/** 放弃旧存档进度的确认凭证（确认弹框时刻冻结的完整身份）。 */
+export interface AbandonSavedClaim {
+  old_run_id?: string
+  old_task_id?: number | null
+  old_zone_name?: string
+  old_execution_date?: string
+  old_elapsed_seconds?: number
+  confirm_id?: string
+  stop_epoch?: number
 }
 
 // ==================== Areas 分区 ====================

@@ -908,6 +908,9 @@ class LiveState:
 
     def __init__(self, state_file: str = "live_state.json"):
         self.state_file = Path(state_file) if state_file else state_file_path()
+        # 状态文件的读-改-写互斥：save/load 与交接记录的"锁内重核+落盘"
+        # 共用这一把锁（叶子锁，锁序见控制器 _handover 相关方法）。
+        self._io_lock = threading.RLock()
         self.is_streaming = False
         self.current_zone = ""
         # 先建权威值，再写兼容别名（别名 setter 会同步到权威值）。
@@ -952,9 +955,18 @@ class LiveState:
         # 都必须落到权威值上，否则"写 elapsed、读 effective"会分叉成两份进度。
         self.effective_seconds = _safe_float(value, 0.0)
 
+    @property
+    def io_lock(self) -> threading.RLock:
+        """状态文件读写互斥锁（交接记录在锁内重核+落盘，见控制器）。"""
+        return self._io_lock
+
     # ---------- 持久化 ----------
 
     def _load(self):
+        with self._io_lock:
+            self._load_locked()
+
+    def _load_locked(self):
         if not self.state_file.exists():
             return
         try:
@@ -1084,6 +1096,10 @@ class LiveState:
 
         失败时保留磁盘上的上一个完整状态并显式报错，绝不"假成功"。
         """
+        with self._io_lock:
+            return self._save_locked()
+
+    def _save_locked(self) -> bool:
         data = self.to_dict()
         target = self.state_file
         tmp = target.with_name(target.name + f'.{os.getpid()}.tmp')
@@ -1645,7 +1661,8 @@ class LiveController:
         return not run_id or not current or current == run_id
 
     def _register_active_task(self, instruction: LiveInstruction,
-                              run_id: Optional[str] = None) -> bool:
+                              run_id: Optional[str] = None,
+                              validate=None) -> bool:
         """Atomically reserve the exact task row before committing a session."""
         tm = getattr(self, 'task_manager', None)
         # Manual mode and small controller doubles can run without a task
@@ -1665,19 +1682,8 @@ class LiveController:
                 logger.error('拒绝登记任务直播：TaskManager 缺少原子 reserve_active_task')
                 return False
 
-            execution_day = getattr(instruction, 'execution_date', None)
-            zone_name = getattr(instruction, 'zone_name', None)
-
-            def validate(row):
-                if row.get('id') != task_id:
-                    return '任务身份已变化'
-                if row.get('zone_name') != zone_name:
-                    return '任务分区已变化'
-                if int(row.get('category') or 0) <= 0:
-                    return '任务已完成'
-                if row.get('today_done') == 1:
-                    return '任务今日已完成'
-                return None
+            if validate is None:
+                validate = self._reserved_identity_validator(instruction)
 
             try:
                 ok = reserve(task_id, run_id=target_run, validate=validate)
@@ -1706,6 +1712,485 @@ class LiveController:
                 logger.debug("清理运行中任务标记失败：%s", exc)
         if run_id is None or run_id == getattr(self, '_active_run_id', None):
             self._active_run_id = None
+
+    # ---------------- 2026-09-28 收口：交接状态机（单记录、同锁读-核-写） ----------------
+    #
+    # 交接记录 `.progress_handover.json` 与 live_state.json 同目录，一条记录：
+    #   {handover_id, confirm_id, outcome(pending/abandoned/void/superseded/corrupt),
+    #    created_at, epoch, old{...}, target{...}}
+    # 语义：
+    #   - 旧进度只在"新任务真正接管"（FFmpeg=本地媒体首次确认推进；手动/OBS=
+    #     平台开房）时才记 abandoned；
+    #   - 终态(void/abandoned/superseded)不拦截任何普通恢复或普通开播；
+    #   - 只有**当前意图要求**的那份交接才参与核对（缺失/被换/损坏/已结论拒绝）。
+
+    def _handover_file(self) -> Path:
+        return Path(self.state.state_file).parent / '.progress_handover.json'
+
+    def _load_handover_record(self) -> Optional[dict]:
+        path = self._handover_file()
+        if not path.exists():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding='utf-8'))
+        except Exception:
+            return {'handover_id': '', 'outcome': 'corrupt', '_corrupt': True}
+        if not isinstance(data, dict):
+            return {'handover_id': '', 'outcome': 'corrupt', '_corrupt': True}
+        return data
+
+    def handover_pending(self) -> bool:
+        with self._handover_lock:
+            record = self._load_handover_record()
+            return bool(record) and not record.get('_corrupt') \
+                and record.get('outcome') == 'pending'
+
+    def _atomic_write_handover(self, payload: dict) -> None:
+        """交接文件原子写：临时文件 + fsync + 读回校验 + os.replace。"""
+        path = self._handover_file()
+        tmp = path.with_name(path.name + f'.{os.getpid()}.tmp')
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            with open(tmp, 'r', encoding='utf-8') as f:
+                check = json.load(f)
+            if check.get('handover_id') != payload.get('handover_id'):
+                raise IOError('交接文件读回校验不一致')
+            os.replace(tmp, path)
+        except Exception:
+            try:
+                if tmp.exists():
+                    os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+    def verify_saved_abandon_claim(self, claim: Optional[dict],
+                                   epoch: Optional[int] = None
+                                   ) -> Tuple[bool, str]:
+        """逐项核对"放弃旧进度"的确认凭证；返回 (是否成立, 拒绝码)。"""
+        claim = dict(claim or {})
+        state = self.state
+        if getattr(state, 'corrupt', False) \
+                or getattr(state, 'resume_checkpoint_failed', False) \
+                or getattr(state, '_last_save_error', ''):
+            return False, 'abandon_state_untrusted'
+        if epoch is not None and int(epoch) != int(self._control_epoch):
+            return False, 'abandon_epoch_mismatch'
+        if not (getattr(state, 'current_zone', '') or ''):
+            return False, 'abandon_no_saved_session'
+        identity_checks = (
+            ('old_run_id', getattr(state, 'run_id', '') or ''),
+            ('old_task_id', getattr(state, 'task_id', None)),
+            ('old_zone_name', state.current_zone or ''),
+            ('old_execution_date', getattr(state, 'execution_date', None)),
+        )
+        for field, current in identity_checks:
+            claimed = claim.get(field)
+            if field == 'old_task_id':
+                try:
+                    matched = (claimed is not None
+                               and int(claimed) == int(current))
+                except (TypeError, ValueError):
+                    matched = False
+            else:
+                matched = (claimed or '') == (current or '')
+            if not matched:
+                return False, 'abandon_identity_changed'
+        state_elapsed = int(float(getattr(state, 'effective_seconds', 0) or 0))
+        claimed_elapsed = claim.get('old_elapsed_seconds')
+        if claimed_elapsed is None:
+            return False, 'abandon_missing_elapsed'
+        try:
+            claimed_elapsed = int(claimed_elapsed)
+        except (TypeError, ValueError):
+            return False, 'abandon_invalid_elapsed'
+        if claimed_elapsed != state_elapsed:
+            return False, 'abandon_stale_elapsed'
+        return True, ''
+
+    def record_saved_abandon_handover(self, claim: Optional[dict],
+                                      instruction: LiveInstruction,
+                                      epoch: Optional[int] = None
+                                      ) -> Tuple[bool, str, str]:
+        """登记交接记录（pending）：state 写锁内重核凭证 + _handover_lock 内落盘。
+
+        重核与落盘在同一个 ``state.io_lock`` 区间完成——并发改写旧存档
+        （面板编辑/结算）会被察觉并拒绝，校验与登记成为同一原子区间。
+        返回 ``(ok, 拒绝码, handover_id)``。
+        """
+        if epoch is None:
+            epoch = self._control_epoch
+        confirm_id = str((claim or {}).get('confirm_id') or '')
+        with self.state.io_lock:
+            ok, code = self.verify_saved_abandon_claim(claim, epoch)
+            if not ok:
+                return False, code, ''
+            # 锁内末次重读：凭证比对与落盘之间不允许旧进度漂移。
+            state_elapsed = int(float(getattr(self.state, 'effective_seconds', 0) or 0))
+            claimed_elapsed = (claim or {}).get('old_elapsed_seconds')
+            try:
+                if claimed_elapsed is None or int(claimed_elapsed) != state_elapsed:
+                    return False, 'abandon_stale_elapsed', ''
+            except (TypeError, ValueError):
+                return False, 'abandon_invalid_elapsed', ''
+            with self._handover_lock:
+                record = self._load_handover_record()
+                if record and not record.get('_corrupt') \
+                        and record.get('outcome') == 'pending':
+                    if confirm_id and record.get('confirm_id') == confirm_id:
+                        return False, 'duplicate_handover', \
+                            str(record.get('handover_id') or '')
+                    record['outcome'] = 'superseded'
+                    record['finalized_at'] = datetime.now().isoformat(timespec='seconds')
+                    try:
+                        self._atomic_write_handover(record)
+                    except Exception:
+                        logger.error('旧交接 superseded 落盘失败：拒绝登记新交接',
+                                     exc_info=True)
+                        return False, 'handover_persist_failed', ''
+                handover_id = f'{int(time.time()):x}-{uuid.uuid4().hex[:4]}'
+                payload = {
+                    'handover_id': handover_id,
+                    'confirm_id': confirm_id,
+                    'outcome': 'pending',
+                    'created_at': datetime.now().isoformat(timespec='seconds'),
+                    'epoch': int(epoch),
+                    'old': {
+                        'run_id': str((claim or {}).get('old_run_id') or ''),
+                        'task_id': (claim or {}).get('old_task_id'),
+                        'zone_name': str((claim or {}).get('old_zone_name') or ''),
+                        'execution_date': (claim or {}).get('old_execution_date'),
+                        'elapsed_seconds': state_elapsed,
+                    },
+                    'target': {
+                        'task_id': getattr(instruction, 'task_id', None),
+                        'zone_name': getattr(instruction, 'zone_name', ''),
+                        'duration_seconds': int(
+                            getattr(instruction, 'duration_seconds', 0) or 0),
+                        # 目标 run 在意图冻结后由 _bind_handover_target_run 补记。
+                        'run_id': '',
+                    },
+                }
+                try:
+                    self._atomic_write_handover(payload)
+                except Exception:
+                    logger.error('交接登记落盘失败：拒绝受理（旧进度原样）',
+                                 exc_info=True)
+                    return False, 'handover_persist_failed', ''
+            self._last_handover_id = handover_id
+            self._push_backend_event(
+                '交接', 'info',
+                f'已登记交接 {handover_id}：旧进度（{state_elapsed} 秒）将在新任务接管后放弃',
+                notify=False)
+            return True, '', handover_id
+
+    def _finalize_handover(self, outcome: str,
+                           handover_id: Optional[str] = None,
+                           target_run_id: Optional[str] = None,
+                           epoch: Optional[int] = None) -> bool:
+        """给交接记录下结论；读—核—写在同一把 ``_handover_lock`` 内完成。
+
+        - ``handover_id`` 给定：**接管必要条件**。任何不符（缺失/被换/损坏/
+          已结论/目标 run 不符/代际不符）一律返回 False，调用方必须中止接管；
+        - ``handover_id`` 为 None：尽力而为的收尾路径。返回 True 表示"已结论
+          或本无记录"，失败（写盘异常）返回 False。
+        旧线程在"校验已通过、尚未写盘"的窗口里被新登记插队时，本函数的
+        重读会发现 handover_id/outcome 变化并拒绝——迟到结论改不动新记录。
+        """
+        with self._handover_lock:
+            record = self._load_handover_record()
+            if handover_id is not None:
+                if not record or record.get('_corrupt'):
+                    return False
+                if str(record.get('handover_id') or '') != str(handover_id):
+                    return False
+                if record.get('outcome') != 'pending':
+                    return False
+            if not record or record.get('_corrupt'):
+                return True
+            if record.get('outcome') != 'pending':
+                return handover_id is None
+            target = record.get('target') or {}
+            if target_run_id is not None \
+                    and str(target.get('run_id') or '') != str(target_run_id):
+                return False
+            if epoch is not None:
+                try:
+                    if int(record.get('epoch', -1)) != int(epoch):
+                        return False
+                except (TypeError, ValueError):
+                    return False
+            record['outcome'] = outcome
+            record['finalized_at'] = datetime.now().isoformat(timespec='seconds')
+            try:
+                self._atomic_write_handover(record)
+            except Exception:
+                logger.error('交接结论落盘失败（保持 pending，重启再清理）',
+                             exc_info=True)
+                return False
+            return True
+
+    def _bind_handover_target_run(self, epoch: int, run_id: str,
+                                  expected_handover_id: Optional[str] = None
+                                  ) -> Optional[str]:
+        """把目标 run 补记进交接记录（意图冻结后）；失败返回 None。
+
+        ``expected_handover_id`` 是验证后重试沿用**原确认**的必要条件：
+        记录被换/已结论/代际不符都不再绑定，重试必须拒绝而不是接管新记录。
+        """
+        with self._handover_lock:
+            record = self._load_handover_record()
+            if not record or record.get('_corrupt') \
+                    or record.get('outcome') != 'pending':
+                return None
+            if expected_handover_id is not None \
+                    and str(record.get('handover_id') or '') != str(expected_handover_id):
+                return None
+            try:
+                if int(record.get('epoch', -1)) != int(epoch):
+                    return None
+            except (TypeError, ValueError):
+                return None
+            target = record.get('target') or {}
+            current_target_run = str(target.get('run_id') or '')
+            if current_target_run and current_target_run != str(run_id or ''):
+                if expected_handover_id is None:
+                    return None
+                # 持原 handover_id 的**重试**允许按原交接身份重绑到新 run
+                # （60024/60043 后确认重试延续原交接身份，58af5ab）。
+            target['run_id'] = str(run_id or '')
+            record['target'] = target
+            try:
+                self._atomic_write_handover(record)
+            except Exception:
+                logger.error('交接目标 run 补记失败（拒绝受理）', exc_info=True)
+                return None
+            return str(record.get('handover_id') or '')
+
+    def _active_handover_requirement(self, run_id: str) -> str:
+        """返回仍属于本意图（pending 且目标 run 匹配）的交接 id，否则空串。"""
+        hid = getattr(self, '_pending_handover_id', None)
+        if not hid:
+            return ''
+        with self._handover_lock:
+            record = self._load_handover_record()
+        if record and not record.get('_corrupt') \
+                and record.get('outcome') == 'pending' \
+                and str(record.get('handover_id') or '') == str(hid) \
+                and str((record.get('target') or {}).get('run_id') or '') == str(run_id or ''):
+            return str(hid)
+        return ''
+
+    def _void_pending_handover_if_any(self, epoch: int) -> None:
+        """本意图已绑定交接但开播未能继续（提交前停止/受理后作废）时，把
+        该记录按原身份 void，恢复"无交接要求"的中性状态。写失败留待重启清理。"""
+        hid = getattr(self, '_pending_handover_id', None)
+        if not hid:
+            return
+        try:
+            # 身份凭 handover_id + target run；代际此时可能已推进（停止路径），
+            # 记录上的 epoch 属于受理时刻，不做当前代际核对。
+            self._finalize_handover(
+                'void', handover_id=hid,
+                target_run_id=getattr(self, '_pending_run_id', '') or None)
+        except Exception:
+            logger.debug('交接 void 收尾异常（留待重启清理）', exc_info=True)
+        self._pending_handover_id = None
+
+    # ---------------- 2026-09-28 收口：推迟接管（FFmpeg 媒体三态） ----------------
+
+    def _session_takeover_deferred(self, is_task_mode: bool) -> bool:
+        """FFmpeg 任务模式：平台开房 ≠ 接管，接管推迟到本地媒体首次确认推进。"""
+        if not is_task_mode:
+            return False
+        try:
+            stream_mode, _ = self._get_stream_settings()
+        except Exception:
+            stream_mode = 'ffmpeg'
+        return stream_mode == 'ffmpeg'
+
+    def _reserved_identity_validator(self, instruction: LiveInstruction):
+        """接管时刻的防御性身份复核（不核全局版本）。"""
+
+        def validate(row: dict) -> Optional[str]:
+            if row.get('id') != getattr(instruction, 'task_id', None):
+                return '任务身份已变化'
+            if row.get('zone_name') != getattr(instruction, 'zone_name', ''):
+                return '任务分区已变化'
+            if int(row.get('category') or 0) <= 0:
+                return '任务已完成'
+            if row.get('today_done') == 1:
+                return '任务今日已完成'
+            return None
+
+        return validate
+
+    def _complete_session_takeover(self, epoch: int, run_id: str,
+                                   instruction: LiveInstruction,
+                                   saved_elapsed: int, source: str,
+                                   dur_label: str,
+                                   handover_id: Optional[str] = None) -> bool:
+        """接管会话：预留复核 → 交接结论 → begin_session → 成功通知。
+
+        四步按序执行，任一步失败都不得入账/发成功通知：
+        - 预留复核失败：任务在平台等待期间被改名/结算/完成 → 拒绝；
+        - 交接结论（abandoned）必须**先于** begin_session 落盘，失败则旧存档
+          一个字节未动；
+        - begin_session 落盘失败（_last_save_error）→ 不宣告成功；
+        - 成功事件只属于接管完成，不属于平台开房。
+        """
+        # 1) 预留身份复核（幂等重登记）
+        if not self._register_active_task(
+                instruction, run_id,
+                validate=self._reserved_identity_validator(instruction)):
+            self._push_backend_event(
+                '错误', 'danger',
+                f'任务身份复核失败，放弃接管：{getattr(instruction, "zone_name", "")}',
+                notify=False)
+            return False
+        # 2) 交接结论先于 begin_session
+        if handover_id:
+            try:
+                ok_abandon = self._finalize_handover(
+                    'abandoned', handover_id=handover_id,
+                    target_run_id=run_id, epoch=epoch)
+            except Exception:
+                logger.error('交接 abandoned 结论异常', exc_info=True)
+                ok_abandon = False
+            if not ok_abandon:
+                self._push_backend_event(
+                    '异常', 'warning',
+                    '交接结论落盘失败：接管中止，旧进度原样保留', notify=False)
+                return False
+        # 3) begin_session（落盘失败 = 未接管）
+        try:
+            self.state.begin_session(
+                getattr(instruction, 'zone_name', ''), self.current_room_id,
+                int(getattr(instruction, 'duration_seconds', 0) or 0),
+                duration_known=True, source=source,
+                task_id=getattr(instruction, 'task_id', None),
+                execution_date=getattr(instruction, 'execution_date', None),
+                initial_elapsed=int(saved_elapsed or 0),
+                service_instance=self._boot_id, run_id=run_id)
+            self.state.mark_phase(PHASE_LIVE, persist=True)
+        except Exception:
+            logger.error('会话落盘异常：不宣告成功', exc_info=True)
+            self._recovery_blocked = 'takeover_persist_failed'
+            return False
+        if getattr(self.state, '_last_save_error', ''):
+            logger.error('会话落盘未确认（%s）：不宣告成功',
+                         self.state._last_save_error)
+            self._recovery_blocked = 'takeover_persist_failed'
+            return False
+        # 4) 成功事实：一封开播成功（轮转上下文存在时由合并信收口）
+        mode_label = '任务模式'
+        saved_label = (f'（恢复，已播{int(saved_elapsed or 0) // 60}分钟)'
+                       if int(saved_elapsed or 0) > 0 else '')
+        self._push_backend_event(
+            '开播', 'success',
+            f'{mode_label}开播{saved_label} - {getattr(instruction, "zone_name", "")}，时长{dur_label}')
+        rotation = getattr(self, '_task_rotation_context', None)
+        if rotation and rotation.get('run_id') == run_id:
+            self._finish_task_rotation(rotation, 'started')
+        self._last_takeover_audit = {
+            'run_id': run_id, 'epoch': int(epoch),
+            'task_id': getattr(instruction, 'task_id', None),
+            'handover_id': handover_id or '',
+            'at': datetime.now().isoformat(timespec='seconds'),
+        }
+        return True
+
+    def _complete_deferred_takeover(self, pending: dict) -> bool:
+        """媒体首次确认推进时执行推迟的接管；失败则交由收尾线程关房。"""
+        if not self._owns_current_run(int(pending.get('epoch', 0)),
+                                      str(pending.get('run_id') or '')):
+            self._deferred_takeover = None
+            return False
+        ok = self._complete_session_takeover(
+            int(pending.get('epoch', 0)), str(pending.get('run_id') or ''),
+            pending.get('instruction'),
+            int(pending.get('saved_elapsed') or 0),
+            str(pending.get('source') or SOURCE_NEW),
+            str(pending.get('dur_label') or ''),
+            handover_id=pending.get('handover_id'))
+        self._deferred_takeover = None
+        if not ok:
+            threading.Thread(
+                target=self._abort_open_after_failed_takeover,
+                args=(int(pending.get('epoch', 0)),
+                      str(pending.get('run_id') or ''),
+                      pending.get('handover_id')),
+                name='TakeoverAbort', daemon=True).start()
+        return ok
+
+    def _discard_deferred_takeover(self, run_id: Optional[str] = None) -> None:
+        pending = getattr(self, '_deferred_takeover', None)
+        if pending is None:
+            return
+        if run_id is not None \
+                and str(pending.get('run_id') or '') != str(run_id):
+            return
+        self._deferred_takeover = None
+
+    def _abort_open_after_failed_takeover(self, epoch: int, run_id: str,
+                                          handover_id: Optional[str] = None):
+        """接管失败的归属收尾：停流、关闭本意图打开的平台房、void 交接、释放任务。"""
+        try:
+            with self._start_lock:
+                if not self._is_epoch_current(epoch):
+                    return
+                room = self.current_room_id
+            self.stop_monitor.set()
+            self._discard_deferred_takeover(run_id)
+            self._ffmpeg_stop_event.set()
+            self._kill_ffmpeg()
+            if room and not self._platform_stop_done:
+                try:
+                    csrf = self.api.get_csrf()
+                    if csrf:
+                        self._platform_stop_done = self._platform_stop_ok(
+                            self.api.stop_live(room, csrf))
+                except Exception:
+                    logger.debug('接管失败收尾的平台下播异常', exc_info=True)
+            try:
+                self.state.reload()
+            except Exception:
+                logger.debug('接管失败收尾的状态重载异常', exc_info=True)
+            if handover_id:
+                self._finalize_handover('void', handover_id=handover_id,
+                                        target_run_id=run_id, epoch=epoch)
+            self._release_active_task(run_id)
+            self._push_backend_event(
+                '异常', 'warning',
+                '新任务接管失败：已停止推流并关闭本直播间，原进度保留可恢复')
+        finally:
+            self.is_streaming = False
+            self._current_run_id = ''
+
+    def face_verify_intent(self) -> Optional[dict]:
+        """当前冻结的人脸验证意图（只读副本；None=无待验证意图）。"""
+        intent = getattr(self, '_face_verify_intent', None)
+        return dict(intent) if intent else None
+
+    def _set_pending_face_verify(self, url: str, run_id: Optional[str] = None,
+                                 epoch: Optional[int] = None) -> None:
+        """置位待验证状态并冻结验证意图（含交接身份，58af5ab 语义）。"""
+        with self._start_lock:
+            self._pending_face_verify = True
+            self._face_verify_url = url or ''
+            owner_run = str(run_id or self._pending_run_id
+                            or getattr(self.state, 'run_id', '') or '')
+            self._face_verify_intent = {
+                'epoch': int(epoch if epoch is not None else self._control_epoch),
+                'run_id': owner_run,
+                'room_id': self.current_room_id,
+                'handover_id': self._active_handover_requirement(owner_run),
+                'mode': 'manual' if self._stream_mode == 'manual' else 'task',
+            }
 
     def validate_face_verify_retry_intent(self, intent: Optional[dict] = None) -> bool:
         """Recheck a frozen face-verification retry before dispatching it.
@@ -1786,6 +2271,7 @@ class LiveController:
                                       returned: float) -> str:
         """Credit one trusted live observation, subject to freshness bounds."""
         media_cap = None
+        media_advanced = False
         if getattr(self, '_local_pusher_required', False):
             lock = getattr(self, '_pusher_lock', None)
             if lock is None:
@@ -1837,6 +2323,17 @@ class LiveController:
                     return 'paused_pusher'
                 else:
                     media_cap = current_media - float(previous_media)
+                    media_advanced = True
+
+        # 媒体**首次确认推进**（严格递增）= FFmpeg 模式可观察的就绪事实。
+        # 推迟的会话接管（交接结论/落盘/成功通知）只在此刻发生；首条读数
+        # 只立基线不算接管；接管失败则本次观察不入账，收尾线程关房停流。
+        if media_advanced:
+            pending_takeover = getattr(self, '_deferred_takeover', None)
+            if pending_takeover is not None:
+                if not self._complete_deferred_takeover(pending_takeover):
+                    self._pause_effective_timer(TIMER_PAUSED_PUSHER, returned)
+                    return 'paused_pusher'
 
         clock = self._clock()
         clock.credit_limit = effective_credit_limit(
@@ -1845,7 +2342,10 @@ class LiveController:
         new_anchor, credited, outcome = clock.observe_ok(
             anchor, request_start, returned, max_credit=media_cap)
         self._segment_monotonic = new_anchor
-        if credited > 0 and getattr(self, '_stream_mode', '') != 'manual':
+        # 推迟接管窗口内入账只进内存：live_state 仍是旧会话（或为空），
+        # 没有可持久化的目标；接管完成时 begin_session 以继承量冻结新基线。
+        if (credited > 0 and getattr(self, '_stream_mode', '') != 'manual'
+                and getattr(self, '_deferred_takeover', None) is None):
             self.state.update_progress(clock.confirmed)
         if outcome in ('dropped_gap', 'dropped_stale'):
             logger.info(
@@ -2087,6 +2587,24 @@ class LiveController:
         self._stop_intent_epoch: Optional[int] = None
         self._load_stop_intent()
 
+        # ---------- 2026-09-28 收口：交接状态机 / 推迟接管 / 验证意图 ----------
+        # 锁序：_start_lock → state.io_lock → _handover_lock（叶子锁）；
+        # _finalize_handover 只持 _handover_lock。反向获取不存在。
+        self._handover_lock = threading.RLock()
+        self._pending_handover_id: Optional[str] = None
+        self._last_handover_id: Optional[str] = None
+        self._deferred_takeover: Optional[dict] = None
+        self._face_verify_intent: Optional[dict] = None
+        self._confirmed_face_intent: Optional[dict] = None
+        self._last_start_refusal: str = ''
+        self._last_acceptance: Optional[dict] = None
+        self._last_takeover_audit: Optional[dict] = None
+        try:
+            if self.handover_pending() and self._finalize_handover('void'):
+                logger.info('重启清理：未完成的交接记录已按 void 结束（旧进度可恢复）')
+        except Exception:
+            logger.debug('重启清理交接记录异常（保持 pending）', exc_info=True)
+
         # 后端事件日志（供前端轮询展示）
         self._backend_events: list = []
         self._event_seq = 0
@@ -2132,7 +2650,10 @@ class LiveController:
         try:
             # A pending start has not committed a session yet; its instruction
             # must not replace the zone belonging to the saved resumable run.
-            instruction = self.current_instruction if self.is_streaming else None
+            # 推迟接管窗口同理：平台已开房但会话尚未接管，磁盘上仍是旧存档。
+            deferred = getattr(self, '_deferred_takeover', None) is not None
+            instruction = (self.current_instruction
+                           if self.is_streaming and not deferred else None)
             zone = (instruction.zone_name if instruction
                     else (self.state.current_zone or ''))
             stop_intent_file_path().write_text(json.dumps({
@@ -2320,6 +2841,16 @@ class LiveController:
         payload['status_query_failures_total'] = getattr(self, '_status_query_failures_total', 0)
         payload['ffmpeg_unrecycled'] = getattr(self, '_ffmpeg_unrecycled', False)
         payload['stream_mode'] = self._stream_mode or ''
+        # 当前执行任务的稳定 id（B03：任务页"正在执行"按 id 判定，不按分区名）。
+        # 推迟接管窗口内磁盘存档还是旧会话，执行中的是本意图的目标任务。
+        deferred = getattr(self, '_deferred_takeover', None)
+        if deferred is not None:
+            payload['current_task_id'] = getattr(
+                deferred.get('instruction'), 'task_id', None)
+            payload['takeover_pending'] = True
+        else:
+            payload['current_task_id'] = getattr(self.state, 'task_id', None)
+            payload['takeover_pending'] = False
         # 人脸验证待处理（自动切任务触发时前端轮询感知）
         payload['pending_face_verify'] = self._pending_face_verify
         payload['face_verify_url'] = self._face_verify_url or ''
@@ -2428,29 +2959,44 @@ class LiveController:
     def start_streaming(self, instruction: LiveInstruction, video_path: str,
                         is_task_mode: bool = True, epoch: int = None,
                         source: Optional[str] = None,
-                        inherit_elapsed: Optional[int] = None) -> bool:
+                        inherit_elapsed: Optional[int] = None,
+                        handover_confirmed: bool = False,
+                        expected_handover_id: Optional[str] = None) -> bool:
         """接受开播请求，使用独立后台线程持续等待网络恢复（A1/A2）。
 
         epoch=None 表示这是停止之后（或从未停止时）新发起的请求，取当前代际；
         epoch 为旧代际说明该请求在停止之前挂起，现在必须作废。
         返回 True 仅表示"已接受并开始后台执行"，具体结果通过 /status 轮询。
+
+        2026-09-28 收口：
+        - 受理即完成"任务身份预留 + 交接目标 run 绑定"，平台等待期间任务行的
+          破坏性修改被在播保护拦住；
+        - ``handover_confirmed``（本轮意图要求交接）时绑定失败 = 受理失败；
+        - 拒绝原因记录在 ``_last_start_refusal``，受理基线记录在
+          ``_last_acceptance``（供 /start /resume /run-next 回传）。
         """
         with self._start_lock:
+            self._last_start_refusal = ''
             if epoch is None:
                 epoch = self._control_epoch
             elif not self._is_epoch_current(epoch):
                 logger.info("放弃一次已经过期的开播请求（停止已在其发起后生效）")
                 self._push_backend_event(
                     '停止', 'info', '已放弃停止之前发起的开播请求，未重新开播')
+                self._last_start_refusal = 'epoch_stale'
                 return False
             if (getattr(self, '_shutdown_in_progress', False)
                     or getattr(self, '_shutdown_stop_platform', None) is not None):
                 logger.info('控制器已进入关闭流程，拒绝新的开播意图')
+                self._last_start_refusal = 'shutdown_in_progress'
                 return False
             if self._stop_in_progress:
                 logger.info('停止清理尚未完成，暂不受理新的开播意图')
+                self._last_start_refusal = 'stop_in_progress'
                 return False
             if self._is_starting or self.is_streaming:
+                self._last_start_refusal = ('already_streaming' if self.is_streaming
+                                            else 'start_in_progress')
                 return False
             cancel = threading.Event()
             self._start_cancel = cancel
@@ -2486,6 +3032,7 @@ class LiveController:
                     self._pending_run_id = ''
                     self._is_starting = False
                     self.current_instruction = None
+                    self._last_start_refusal = 'resume_identity_changed'
                     return False
                 if requested_inherit is None:
                     self._pending_inherit = int(self.state.elapsed_seconds or 0)
@@ -2494,12 +3041,118 @@ class LiveController:
                 self._pending_run_id = self.state.run_id or self._new_run_id()
             else:
                 self._pending_run_id = self._new_run_id()
+
+            # ---- 2026-09-28 收口：受理期预留 + 交接绑定 + 冻结基线 ----
+            # 任一步失败都按"受理失败"回滚，不触碰平台、不改写旧存档。
+            rollback = self._make_acceptance_rollback()
+            try:
+                ok_reserve, refusal = self._reserve_task_for_intent(instruction)
+                if not ok_reserve:
+                    self._last_start_refusal = refusal or 'task_identity_changed'
+                    rollback()
+                    return False
+                if handover_confirmed:
+                    bound = self._bind_handover_target_run(
+                        epoch, self._pending_run_id, expected_handover_id)
+                    if not bound:
+                        self._last_start_refusal = 'handover_bind_failed'
+                        rollback()
+                        return False
+                    self._pending_handover_id = bound
+                else:
+                    self._pending_handover_id = None
+                # 已确认的人脸验证意图配对：重试延续原意图身份，旧确认
+                # 不能被别的意图消费（epoch/run 双核对，错配即保留）。
+                confirmed_intent = getattr(self, '_confirmed_face_intent', None)
+                if confirmed_intent:
+                    if (str(confirmed_intent.get('run_id') or '') == str(self._pending_run_id or '')
+                            and int(confirmed_intent.get('epoch', -1)) == int(epoch)):
+                        if confirmed_intent.get('handover_id') \
+                                and not expected_handover_id:
+                            bound = self._bind_handover_target_run(
+                                epoch, self._pending_run_id,
+                                confirmed_intent['handover_id'])
+                            if not bound:
+                                self._last_start_refusal = 'handover_bind_failed'
+                                rollback()
+                                return False
+                            self._pending_handover_id = bound
+                        self._confirmed_face_intent = None
+                self._last_acceptance = {
+                    'run_id': self._pending_run_id,
+                    'task_id': getattr(instruction, 'task_id', None),
+                    'zone_name': getattr(instruction, 'zone_name', ''),
+                    'confirmed_elapsed_seconds': int(self._pending_inherit or 0),
+                    'duration_seconds': int(
+                        getattr(instruction, 'duration_seconds', 0) or 0),
+                    'duration_known': True,
+                    'source': self._pending_source,
+                    'accepted_epoch': int(epoch),
+                }
+            except Exception:
+                rollback()
+                raise
             self._start_thread = threading.Thread(
                 target=self._start_in_background,
                 args=(instruction, video_path, is_task_mode, cancel, epoch),
                 name="LiveStart", daemon=True)
             self._start_thread.start()
         return True
+
+    def _make_acceptance_rollback(self):
+        """受理失败时还原受理段已改写的字段（调用点持 _start_lock）。"""
+        prev_stream_mode = self._pending_previous_stream_mode
+        prev_stop_cleanup = self._stop_cleanup_done
+        prev_platform_done = self._platform_stop_done
+
+        def rollback():
+            self._stop_cleanup_done = prev_stop_cleanup
+            self._platform_stop_done = prev_platform_done
+            self._stream_mode = prev_stream_mode
+            self._pending_source = SOURCE_NEW
+            self._pending_inherit = 0
+            self._pending_run_id = ''
+            self._pending_handover_id = None
+            self._is_starting = False
+            self.current_instruction = None
+            self._last_acceptance = None
+        return rollback
+
+    def _reserve_task_for_intent(self, instruction: LiveInstruction):
+        """受理期预留：在 tm 的 _mutation_lock 临界区内核验并登记在播。
+
+        指定选择（携带冻结前置条件）用 validate_named_selection 全量复核；
+        自动选择/恢复只复核行存在、分区对应与仍待执行。返回 (ok, 拒绝码)。
+        """
+        tm = getattr(self, 'task_manager', None)
+        if tm is None:
+            return True, ''
+        task_id = getattr(instruction, 'task_id', None)
+        if task_id is None:
+            return True, ''  # 手动模式没有任务身份
+        reserve = getattr(tm, 'reserve_active_task', None)
+        if not callable(reserve):
+            return False, 'reserve_unavailable'
+        validator = None
+        if getattr(instruction, 'source_revision', None) is not None \
+                or getattr(instruction, 'source_business_date', None):
+            def validator(row):
+                return tm.validate_named_selection(
+                    task_id, getattr(instruction, 'zone_name', ''),
+                    getattr(instruction, 'source_revision', None),
+                    getattr(instruction, 'source_business_date', None), row)
+        try:
+            ok = reserve(task_id, run_id=self._pending_run_id or None,
+                         validate=validator)
+        except TypeError:
+            return False, 'reserve_unsupported'
+        except Exception as exc:
+            logger.warning('受理期任务预留异常：%s', exc)
+            return False, 'task_identity_changed'
+        if not ok:
+            return False, 'start_stale_selection'
+        self._active_run_id = self._pending_run_id or None
+        return True, ''
 
     def _start_in_background(self, instruction: LiveInstruction, video_path: str,
                              is_task_mode: bool, cancel: threading.Event,
@@ -2525,6 +3178,12 @@ class LiveController:
         finally:
             with self._start_lock:
                 self._is_starting = False
+                # 受理期预留的任务身份只在"会话已提交（含推迟窗口）"时保留；
+                # 开播失败一律释放，在播保护不跨意图残留。人脸验证等待是
+                # 同一意图的合法暂停：预留与交接都保留，供确认后按原身份重试。
+                if not self.is_streaming and not self._pending_face_verify:
+                    self._release_active_task(self._pending_run_id or None)
+                    self._void_pending_handover_if_any(epoch)
 
     def _start_streaming_sync(self, instruction: LiveInstruction, video_path: str,
                               is_task_mode: bool, cancel: threading.Event,
@@ -2603,10 +3262,15 @@ class LiveController:
             # 人脸验证：返回固定 URL 给前端弹窗
             code = resp.get('code')
             logger.warning(f"️ 检测到需要人脸验证 (code={code})")
-            uid = self.api.cookies.get('DedeUserID', '')
+            try:
+                uid = self.api.cookies.get('DedeUserID', '')
+            except Exception:
+                uid = ''
             verify_url = f"https://www.bilibili.com/blackboard/live/face-auth-middle.html?source_event=400&mid={uid}"
-            self._pending_face_verify = True
-            self._face_verify_url = verify_url
+            # 冻结验证意图(含本意图已绑定的交接身份,58af5ab);
+            # 意图冻结在任何后续动作之前,验证等待保留原交接身份。
+            self._set_pending_face_verify(
+                verify_url, run_id=self._pending_run_id, epoch=epoch)
             logger.info(f"人脸验证 URL：{verify_url}")
             self._push_backend_event(
                 '验证', 'warning', f'开播需要人脸验证 (code={code})', notify=False)
@@ -2638,6 +3302,8 @@ class LiveController:
                         self.api.stop_live(self.current_room_id, csrf)
                     except Exception:
                         pass
+                self._release_active_task(self._pending_run_id or None)
+                self._void_pending_handover_if_any(epoch)
                 return False
 
             self.is_streaming = True
@@ -2659,34 +3325,45 @@ class LiveController:
             self.stop_monitor.clear()
             # 任务模式保存 state，手动模式不触碰
             if is_task_mode:
-                if not self._register_active_task(
-                        instruction, self._current_run_id):
-                    logger.error('任务身份预留失败，撤销已开启的平台直播间：%s',
-                                 instruction.zone_name)
-                    try:
-                        self._platform_stop_done = self._platform_stop_ok(
-                            self.api.stop_live(self.current_room_id, csrf))
-                    except Exception:
-                        logger.debug('任务身份预留失败后的补偿下播异常',
-                                     exc_info=True)
-                    self.is_streaming = False
-                    self.current_instruction = None
-                    self._current_run_id = ''
+                # 2026-09-28 收口：FFmpeg 任务模式**推迟接管**——平台房间已
+                # 打开，但本地媒体还没有任何可证明的就绪事实。旧进度被覆盖、
+                # 交接结论、成功通知都推迟到媒体首次确认推进；未就绪时旧进度
+                # 保留可恢复、成功邮件为零。手动/OBS 模式按平台开房接管。
+                if self._session_takeover_deferred(is_task_mode):
+                    self._deferred_takeover = {
+                        'epoch': int(epoch),
+                        'run_id': str(self._current_run_id),
+                        'instruction': instruction,
+                        'saved_elapsed': int(saved_elapsed or 0),
+                        'source': str(source),
+                        'dur_label': str(dur_label),
+                        'handover_id': self._pending_handover_id,
+                    }
+                    logger.info(
+                        " 平台房间已开但本地媒体未就绪：接管推迟到首次媒体确认推进"
+                        "（run=%s，交接=%s）",
+                        self._current_run_id, self._pending_handover_id or '无')
+                elif not self._complete_session_takeover(
+                        int(epoch), str(self._current_run_id), instruction,
+                        int(saved_elapsed or 0), str(source), str(dur_label),
+                        handover_id=self._pending_handover_id):
+                    # 立即接管失败（预留复核/交接结论/落盘任一步）：归属收尾。
+                    threading.Thread(
+                        target=self._abort_open_after_failed_takeover,
+                        args=(int(epoch), str(self._current_run_id),
+                              self._pending_handover_id),
+                        name='TakeoverAbort', daemon=True).start()
+                    self._pending_handover_id = None
                     return False
-                self.state.begin_session(
-                    instruction.zone_name, self.current_room_id,
-                    instruction.duration_seconds, duration_known=True,
-                    source=source, task_id=getattr(instruction, 'task_id', None),
-                    execution_date=getattr(instruction, 'execution_date', None),
-                    initial_elapsed=saved_elapsed,
-                    service_instance=self._boot_id,
-                    run_id=self._current_run_id)
-                self.state.mark_phase(PHASE_LIVE, persist=True)
-
-            # 推送开播事件（触发邮件/Server酱通知）
-            mode_label = '任务模式' if is_task_mode else '手动模式'
-            saved_label = f'（恢复，已播{saved_elapsed // 60}分钟）' if saved_elapsed > 0 else ''
-            self._push_backend_event('开播', 'success', f'{mode_label}开播{saved_label} - {instruction.zone_name}，时长{dur_label}')
+                self._pending_handover_id = None
+            else:
+                # 手动模式：成功事实=平台开房；不触碰任务库与 live_state。
+                mode_label = '手动模式'
+                saved_label = ''
+                self._push_backend_event(
+                    '开播', 'success',
+                    f'{mode_label}开播{saved_label} - {instruction.zone_name}，时长{dur_label}')
+                self._pending_handover_id = None
 
             initial_stream_mode, _ = self._get_stream_settings()
             self._local_pusher_required = initial_stream_mode == 'ffmpeg'
@@ -3375,6 +4052,11 @@ class LiveController:
             self._pending_face_verify = False
             self._face_verify_url = ''
             self._recovery_blocked = ''
+            # 已确认的验证意图保留给"同一意图的重试"配对（epoch/run 双核对）：
+            # 旧确认对任何不匹配的新意图零副作用，也不会被新意图消费。
+            intent = getattr(self, '_face_verify_intent', None)
+            self._confirmed_face_intent = dict(intent) if intent else None
+            self._face_verify_intent = None
             logger.info(' 人脸验证状态已清除，可重试开播')
             return True
 
@@ -3929,9 +4611,8 @@ class LiveController:
             self._status_query_failures_total = getattr(
                 self, '_status_query_failures_total', 0) + 1
             if code in (60024, 60043):
-                self._pending_face_verify = True
                 uid = self.api.cookies.get('DedeUserID', '')
-                self._face_verify_url = (
+                self._set_pending_face_verify(
                     'https://www.bilibili.com/blackboard/live/face-auth-middle.html'
                     f'?source_event=400&mid={uid}')
                 self._push_backend_event(
@@ -3954,9 +4635,8 @@ class LiveController:
 
         self._recovery_blocked = f'{message} (code={code})'
         if code in (60024, 60043):
-            self._pending_face_verify = True
             uid = self.api.cookies.get('DedeUserID', '')
-            self._face_verify_url = (
+            self._set_pending_face_verify(
                 'https://www.bilibili.com/blackboard/live/face-auth-middle.html'
                 f'?source_event=400&mid={uid}')
             self._ffmpeg_stop_event.set()
@@ -4078,9 +4758,8 @@ class LiveController:
         else:
             code = resp.get('code', -1)
             if code in (60024, 60043):
-                self._pending_face_verify = True
                 uid = self.api.cookies.get('DedeUserID', '')
-                self._face_verify_url = (
+                self._set_pending_face_verify(
                     "https://www.bilibili.com/blackboard/live/face-auth-middle.html"
                     f"?source_event=400&mid={uid}")
                 logger.warning(" 重连遇到人脸验证，停止重试等待人工确认")
@@ -4156,9 +4835,9 @@ class LiveController:
                         self._retry_window_start = None
                         self._status_query_failures = 0
                         self._credit_effective_observation(request_start, returned)
-                        rotation = getattr(self, '_task_rotation_context', None)
-                        if rotation and rotation.get('run_id') == monitor_run_id:
-                            self._finish_task_rotation(rotation, 'started')
+                        # 轮转 B 场的"已开始"结论不在这里发：接管完成
+                        # （FFmpeg=媒体首推进；手动/OBS=提交区）统一收口，
+                        # 保证合并信与接管同一事实门槛。
                         mode, _ = self._get_stream_settings()
                         if mode == 'ffmpeg' and not (
                                 self._ffmpeg_loop_thread and
@@ -4200,7 +4879,10 @@ class LiveController:
                                     '监控', 'warning',
                                     f'直播状态查询失败（状态未知，不影响本地推流），已连续 '
                                     f'{self._status_query_failures} 次')
-                if self.current_instruction:
+                # 推迟接管窗口内不结算：confirmed 只是继承的旧进度，
+                # 媒体从未推进就到点结算会把"未接管"误当"已完成"。
+                if self.current_instruction and \
+                        getattr(self, '_deferred_takeover', None) is None:
                     confirmed = self._confirmed_elapsed()
                     duration = int(self.current_instruction.duration_seconds or 0)
                     if duration > 0 and confirmed >= duration:
@@ -4308,6 +4990,8 @@ class LiveController:
         self._pending_source = SOURCE_NEW
         self._pending_inherit = 0
         self._pending_run_id = ''
+        self._pending_handover_id = None
+        self._last_acceptance = None
 
     def _stop_live_process(self, preserve_state: bool = False,
                            persist_state: bool = True,
@@ -4455,14 +5139,36 @@ class LiveController:
                     not previous_platform_stop))
             self._stop_cleanup_done = self._cleanup_confirmed()
             previous_stream_mode = self._pending_previous_stream_mode
+            # 受理期绑定的交接随本次停止作废（目标 run 未接管成功）。
+            self._void_pending_handover_if_any(self._control_epoch)
             self._clear_pending_start_intent()
             self._stream_mode = previous_stream_mode
+        elif getattr(self, '_deferred_takeover', None) is not None:
+            # 2026-09-28 收口：停止落在推迟接管窗口内 —— 平台已开房但会话
+            # 未接管，磁盘上仍是旧存档。归属收尾：丢弃窗口、void 交接、
+            # 停流关房、释放预留；**绝不**把新指令身份写进旧存档。
+            deferred = self._deferred_takeover or {}
+            deferred_run = str(deferred.get('run_id') or '')
+            deferred_handover = deferred.get('handover_id')
+            self._deferred_takeover = None
+            self._stop_live_process(preserve_state=False,
+                                    persist_state=False,
+                                    stop_platform=True)
+            self._stop_cleanup_done = self._cleanup_confirmed()
+            if deferred_handover:
+                self._finalize_handover('void', handover_id=deferred_handover,
+                                        target_run_id=deferred_run or None)
+            self._release_active_task(deferred_run or None)
+            self._pending_handover_id = None
         elif self._stop_cleanup_done and not self.is_streaming:
             logger.info("重复停止只确认既有清理结果")
         else:
             preserve = (self._stream_mode == 'task')
             self._stop_live_process(preserve_state=preserve)
             self._stop_cleanup_done = self._cleanup_confirmed()
+            # 推迟接管窗口之外的正常停止：意图级交接已随接管完成或 void，
+            # 这里只兜底清理可能残留的受理期绑定。
+            self._void_pending_handover_if_any(self._control_epoch)
         self.current_instruction = None
         try:
             stage = 'stopped' if self._stop_cleanup_done else 'pending_recycle'

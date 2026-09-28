@@ -18,13 +18,55 @@ import logging
 import concurrent.futures
 from typing import Optional, Tuple
 from fastapi import APIRouter, Header, HTTPException
+from fastapi.responses import JSONResponse
 
 from app.dependencies import get_live_controller, get_task_manager
-from app.models.schemas import StartLiveRequest, StartLiveResponse, LiveStatusResponse, LiveInstruction
+from app.models.schemas import (StartLiveRequest, StartLiveResponse,
+                                LiveStatusResponse, LiveInstruction,
+                                AcceptedIntent)
 from app.core.live_controller import SOURCE_RESUME
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+# 指定开播/放弃凭证的拒绝码 → 面板可读原因（详情里保留原码，测试与前端据此分类）。
+_ABANDON_REJECT_MESSAGES = {
+    'abandon_state_untrusted': '保存的直播状态当前不可信（最近一次落盘未确认），请先核对任务进度',
+    'abandon_epoch_mismatch': '该确认已过期：期间发生停止或新的操作',
+    'abandon_no_saved_session': '当前没有进行中的任务可放弃',
+    'abandon_identity_changed': '任务身份已变化：确认与当前进度不属于同一场直播',
+    'abandon_missing_elapsed': '确认凭证缺少已播秒数，无法核对放弃进度',
+    'abandon_invalid_elapsed': '确认凭证的已播秒数非法',
+    'abandon_stale_elapsed': '确认已过期：已播进度已变化，请刷新后重新确认',
+    'duplicate_handover': '该确认已受理过，请勿重复提交',
+    'handover_persist_failed': '交接登记落盘失败：旧进度保持原样，未开始新任务',
+}
+
+_SELECTION_REJECT_MESSAGES = {
+    'start_requires_task_id': '指定开播缺少任务标识',
+    'start_requires_business_day': '指定开播缺少业务日，请刷新任务列表后重试',
+    'start_stale_business_day': '确认已跨日：请刷新任务列表后重新确认',
+    'start_requires_revision': '指定开播缺少任务版本，请刷新任务列表后重试',
+    'start_revision_unavailable': '任务版本不可用，请刷新任务列表后重试',
+    'start_stale_revision': '确认已过期：任务列表已更新（改名/编辑/结算），请刷新后重新确认',
+    'task_not_found': '该任务不存在或已被删除重建，请刷新任务列表',
+    'name_mismatch': '任务分区与所选记录不一致，请刷新任务列表',
+    'task_not_executable': '该任务已完成或今日已完成，无需开播',
+    'start_stale_selection': '受理校验未通过：任务刚被修改，请刷新后重试',
+    'reserve_unavailable': '任务管理器缺少预留能力，拒绝指定开播',
+    'reserve_unsupported': '任务管理器不支持原子预留，拒绝指定开播',
+    'task_identity_changed': '任务身份已变化，拒绝开播',
+    'handover_bind_failed': '交接登记不可用：旧进度保持原样，未开始新任务',
+}
+
+_REFUSAL_MESSAGES = {
+    'epoch_stale': '操作已失效（期间发生停止），请重新发起',
+    'shutdown_in_progress': '应用正在退出，不能开始直播',
+    'stop_in_progress': '停止清理尚未完成，请稍后再开始',
+    'already_streaming': '已有直播进行中，不能重复开播',
+    'start_in_progress': '上一个开播请求仍在处理中，请稍候',
+    'resume_identity_changed': '保存的直播状态与当前任务不一致，不能恢复',
+}
 
 # 停止专用执行通道：单线程、独立于默认池（A1）。
 # 注意：max_workers=1 只保证串行执行，不等于提交队列有界——队列语义由
@@ -78,13 +120,31 @@ async def _run_blocking(func, *args, **kwargs):
 
 # ==================== 统一响应构建 ====================
 
+def _accepted_payload(controller) -> Optional[AcceptedIntent]:
+    """受理冻结基线（受理成功即刻返回；显示推算归前端，权威结算归后端）。"""
+    accepted = getattr(controller, '_last_acceptance', None)
+    if not accepted:
+        return None
+    return AcceptedIntent(
+        run_id=accepted.get('run_id'),
+        task_id=accepted.get('task_id'),
+        zone_name=accepted.get('zone_name'),
+        confirmed_elapsed_seconds=int(accepted.get('confirmed_elapsed_seconds') or 0),
+        duration_seconds=int(accepted.get('duration_seconds') or 0),
+        duration_known=bool(accepted.get('duration_known', True)),
+        source=accepted.get('source'),
+        accepted_epoch=accepted.get('accepted_epoch'),
+    )
+
+
 def _build_stream_response(controller, success: bool, success_msg: str = "直播已开始") -> StartLiveResponse:
     """统一构建 start_streaming / run_next_task 后的响应（人脸验证、失败等）"""
     if success:
         return StartLiveResponse(
             success=True,
             room_id=controller.current_room_id,
-            message=success_msg
+            message=success_msg,
+            accepted=_accepted_payload(controller)
         )
     if controller._pending_face_verify:
         return StartLiveResponse(
@@ -93,7 +153,9 @@ def _build_stream_response(controller, success: bool, success_msg: str = "直播
             qr_data=controller._face_verify_url,
             message="需要人脸验证，请扫描二维码完成验证后重试"
         )
-    return StartLiveResponse(success=False, message="开播失败，请查看日志")
+    refusal = getattr(controller, '_last_start_refusal', '') or ''
+    message = _REFUSAL_MESSAGES.get(refusal, '开播失败，请查看日志')
+    return StartLiveResponse(success=False, message=message, refusal=refusal)
 
 
 def _make_instruction(zone_name: str, duration_seconds: int = 7200) -> LiveInstruction:
@@ -176,6 +238,53 @@ async def start_live(request: StartLiveRequest = None,
         ok = await _run_blocking(
             controller.start_streaming, instruction, video_path,
             is_task_mode=False, epoch=epoch)
+    elif request and request.task_id is not None:
+        # ---- 2026-09-28 收口：指定任务开播（点哪条开哪条） ----
+        task_manager = get_task_manager()
+        if not task_manager:
+            raise HTTPException(status_code=500, detail="任务管理器未初始化")
+        select = functools.partial(
+            task_manager.select_task_instruction, request.task_id,
+            request.expected_revision, request.business_date)
+        instruction, reject_code = await _run_blocking(select)
+        if reject_code or instruction is None:
+            code = reject_code or 'task_not_found'
+            text = _SELECTION_REJECT_MESSAGES.get(code, code)
+            raise HTTPException(status_code=409, detail=f'{code}:{text}')
+        claim = request.abandon_saved
+        handover_confirmed = False
+        handover_id = ''
+        if claim is not None:
+            record = functools.partial(
+                controller.record_saved_abandon_handover,
+                claim.model_dump(), instruction, epoch)
+            ok_claim, claim_code, handover_id = await _run_blocking(record)
+            if not ok_claim:
+                text = _ABANDON_REJECT_MESSAGES.get(claim_code, claim_code)
+                raise HTTPException(status_code=409,
+                                    detail=f'{claim_code}:{text}')
+            handover_confirmed = True
+        video_path = controller.video_finder.find_video(instruction.zone_name)
+        if not video_path:
+            stream_mode, _ = controller._get_stream_settings()
+            if stream_mode == 'ffmpeg':
+                return StartLiveResponse(
+                    success=False,
+                    message=f"未找到分区 {instruction.zone_name} 的视频文件，FFmpeg 推流不可用")
+            video_path = ''
+        ok = await _run_blocking(
+            controller.start_streaming, instruction, video_path,
+            is_task_mode=True, epoch=epoch,
+            handover_confirmed=handover_confirmed,
+            expected_handover_id=handover_id or None)
+        if not ok:
+            # 受理失败（含绑定失败已在控制器内 void）；这里兜底确认。
+            hid = getattr(controller, '_pending_handover_id', None)
+            if hid:
+                await _run_blocking(
+                    functools.partial(controller._finalize_handover, 'void',
+                                      handover_id=hid,
+                                      target_run_id=None, epoch=epoch))
     else:
         instruction, video_path, err = await _run_blocking(
             _get_next_task_instruction)
@@ -230,7 +339,6 @@ async def resume_live(x_operation_token: str = Header(default=None, alias='X-Ope
         source=SOURCE_RESUME, inherit_elapsed=inherit_elapsed)
     return _build_stream_response(controller, ok, success_msg="直播已恢复")
 
-
 @router.post("/confirm-face-verify", summary="确认人脸验证完成")
 async def confirm_face_verify(x_operation_token: str = Header(default=None, alias='X-Operation-Token')):
     """前端用户完成人脸验证后调用，清除待验证状态"""
@@ -238,8 +346,12 @@ async def confirm_face_verify(x_operation_token: str = Header(default=None, alia
     if not controller:
         raise HTTPException(status_code=500, detail="直播控制器未初始化")
     _begin_operation(controller, x_operation_token)
+    # 消费前读取冻结意图（确认后意图转入"已确认"槽，供重试配对延续原身份）
+    intent = (getattr(controller, 'face_verify_intent', None) or (lambda: None))()
+    intent = intent or {}
     run_id = (getattr(controller, '_current_run_id', '')
               or getattr(controller, '_pending_run_id', '')
+              or intent.get('run_id')
               or getattr(getattr(controller, 'state', None), 'run_id', '') or '')
     confirmed = controller.confirm_face_verify(
         run_id=run_id,
@@ -248,7 +360,11 @@ async def confirm_face_verify(x_operation_token: str = Header(default=None, alia
     return {
         'success': bool(confirmed),
         'message': '验证状态已确认' if confirmed
-        else '确认链接已过期：该会话已结束或被新的会话取代'}
+        else '确认链接已过期：该会话已结束或被新的会话取代',
+        'run_id': intent.get('run_id', '') if confirmed else '',
+        'handover_id': intent.get('handover_id', '') if confirmed else '',
+        'mode': intent.get('mode', '') if confirmed else '',
+    }
 
 
 def _stop_live_sync(x_operation_token: str = None, target_intent: Optional[int] = None):
@@ -307,11 +423,16 @@ async def get_live_state():
     controller = get_live_controller()
     if not controller:
         raise HTTPException(status_code=500, detail="直播控制器未初始化")
+    s = controller.state
     return {
-        'has_active': bool(controller.state.current_zone),
-        'current_zone': controller.state.current_zone or '',
-        'elapsed_seconds': controller.state.elapsed_seconds,
-        'room_id': controller.state.room_id,
+        'has_active': bool(s.current_zone),
+        'current_zone': s.current_zone or '',
+        'elapsed_seconds': s.elapsed_seconds,
+        'room_id': s.room_id,
+        # 2026-09-28 收口：覆盖确认的冻结凭证来源（放弃旧进度必须核对完整身份）
+        'run_id': getattr(s, 'run_id', '') or '',
+        'task_id': getattr(s, 'task_id', None),
+        'execution_date': getattr(s, 'execution_date', None),
     }
 
 
@@ -352,6 +473,9 @@ async def get_full_live_state():
         'room_id': s.room_id,
         'duration_seconds': getattr(s, 'duration_seconds', 0),
         'start_time': getattr(s, 'start_time', None),
+        'run_id': getattr(s, 'run_id', '') or '',
+        'task_id': getattr(s, 'task_id', None),
+        'execution_date': getattr(s, 'execution_date', None),
     }
 
 
@@ -469,13 +593,15 @@ async def run_next_task(x_operation_token: str = Header(default=None, alias='X-O
 
     success = controller.run_next_task(epoch=epoch)
     if success:
+        accepted = _accepted_payload(controller)
         return {
             'success': True,
             'message': '任务已开始执行',
             'task': {
                 'zone_name': controller.current_instruction.zone_name if controller.current_instruction else '',
                 'duration': controller.current_instruction.duration_seconds if controller.current_instruction else 0
-            }
+            },
+            'accepted': accepted.model_dump() if accepted else None,
         }
     elif controller._pending_face_verify:
         return {
@@ -485,9 +611,13 @@ async def run_next_task(x_operation_token: str = Header(default=None, alias='X-O
             'message': '需要人脸验证，请扫描二维码完成验证后重试'
         }
     else:
+        refusal = getattr(controller, '_last_start_refusal', '') or ''
+        message = _REFUSAL_MESSAGES.get(refusal,
+                                        '执行任务失败（可能无可用任务或找不到视频）')
         return {
             'success': False,
-            'message': '执行任务失败（可能无可用任务或找不到视频）'
+            'message': message,
+            'refusal': refusal,
         }
 
 

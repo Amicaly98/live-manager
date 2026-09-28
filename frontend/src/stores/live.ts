@@ -9,6 +9,12 @@ import type {
   StartLiveRequest,
 } from '@/types/api'
 
+/** 受理冻结基线的最小形状（测试替身也只需给这些字段）。 */
+interface AcceptedIntentLike {
+  run_id?: string
+  confirmed_elapsed_seconds?: number
+}
+
 /**
  * 本地**单调耗时源**（毫秒）——外推有效期的唯一时间来源（2026-09-20 监督 E3）。
  *
@@ -121,6 +127,68 @@ export const useLiveStore = defineStore('live', () => {
   let _startWatchToken = 0
   const startWatching = ref(false)
 
+  // ---- 受理即有界显示（2026-09-28 收口，B01/B02） ----
+  // 受理响应携带冻结基线（confirmed_elapsed_seconds）。首次可信观察到达之前，
+  // 显示从冻结基线起按单调时间**有界**推算（上限 120 秒）；权威观察到达后，
+  // 领先量在 45 秒内线性收敛到 0。乐观值只存在于显示层：它永远不会写入
+  // `_confirmedAtAnchor` / `_sessionConfirmedMax`，失败/停止/换会话立即撤除，
+  // 显示自然回落到权威值——受理永远不冒充"已确认成功"。
+  const OPTIMISTIC_MAX_LEAD_SEC = 120
+  const OPTIMISTIC_CONVERGE_SEC = 45
+  const optimisticRunId = ref('')
+  let _optimisticBaseSec = 0
+  let _optimisticAcceptedMonoMs = 0
+  /** 首次权威观察冻结的领先量与收敛起点（0 = 尚未冻结）。 */
+  let _optimisticLeadSec = 0
+  let _optimisticConvergeStartMs = 0
+
+  function armOptimistic(accepted?: AcceptedIntentLike | null) {
+    clearOptimistic()
+    if (!accepted || !accepted.run_id) return
+    optimisticRunId.value = String(accepted.run_id)
+    _optimisticBaseSec = Math.max(0, Number(accepted.confirmed_elapsed_seconds) || 0)
+    _optimisticAcceptedMonoMs = monoNowMs()
+  }
+
+  function clearOptimistic() {
+    optimisticRunId.value = ''
+    _optimisticBaseSec = 0
+    _optimisticAcceptedMonoMs = 0
+    _optimisticLeadSec = 0
+    _optimisticConvergeStartMs = 0
+  }
+
+  /** 受理起算的乐观地板：冻结基线 + 有界流逝量（封顶 +120 秒）。 */
+  function optimisticFloorSec(): number | null {
+    if (!optimisticRunId.value) return null
+    const elapsedSec = Math.max(0, (monoNowMs() - _optimisticAcceptedMonoMs) / 1000)
+    return _optimisticBaseSec + Math.min(elapsedSec, OPTIMISTIC_MAX_LEAD_SEC)
+  }
+
+  /**
+   * 显示值 = max(权威显示模型, 有界乐观)。
+   * 权威观察（同 run）到达后冻结领先量并在 OPTIMISTIC_CONVERGE_SEC 内线性收敛；
+   * 换会话/停止/失败由调用方 clearOptimistic，显示直接回到权威值。
+   */
+  function boundedDisplaySec(authoritative: number): number {
+    const floor = optimisticFloorSec()
+    if (floor === null) return authoritative
+    if (authoritative >= floor) {
+      // 权威已接管：乐观使命结束（不回写任何权威记账）。
+      clearOptimistic()
+      return authoritative
+    }
+    if (_optimisticLeadSec <= 0) {
+      // 首次权威观察：冻结当前领先量，开始线性收敛。
+      _optimisticLeadSec = Math.max(0, floor - authoritative)
+      _optimisticConvergeStartMs = monoNowMs()
+    }
+    const convergeElapsed = Math.max(0, (monoNowMs() - _optimisticConvergeStartMs) / 1000)
+    const remainingLead = _optimisticLeadSec
+      * Math.max(0, 1 - convergeElapsed / OPTIMISTIC_CONVERGE_SEC)
+    return Math.max(authoritative, Math.min(floor, authoritative + remainingLead))
+  }
+
   const request = useRequest()
 
   // 后台事件轮询（跨页面持续运行）：只负责**驱动** pollStatus；事件的摄取
@@ -228,6 +296,11 @@ export const useLiveStore = defineStore('live', () => {
       sessionId.value = nextSession
       snapshotVersion.value = Number.isFinite(incomingVersion) ? incomingVersion : 0
       _sessionConfirmedMax = 0
+      // 乐观会话只属于受理时的那个 run；换 run 即撤除，显示回落权威值。
+      if (optimisticRunId.value && nextSession
+          && nextSession !== optimisticRunId.value) {
+        clearOptimistic()
+      }
     }
     status.value = res
     statusStale.value = false
@@ -266,11 +339,15 @@ export const useLiveStore = defineStore('live', () => {
       armWindow(status.value, startedMonoMs)
       _confirmedAtAnchor = confirmed
       _displayArmed = true
-      localElapsed.value = _confirmedAtAnchor + _pendingAtAnchor + windowConsumedSec()
+      // 受理即有界显示：权威显示模型与乐观地板取大（领先量有界、可收敛、
+      // 永不写回已确认记账）。换会话的旧响应在上面已被身份门丢弃。
+      localElapsed.value = boundedDisplaySec(
+        _confirmedAtAnchor + _pendingAtAnchor + windowConsumedSec())
       if (!tickActive.value) startLocalTick(true)
       else refreshFromAnchor()
     } else if (!incoming.is_starting) {
       // 真的停了（不是"正在开播"）才清显示；"停止中"保留现场
+      clearOptimistic()
       localElapsed.value = 0
       fixedTotal.value = 0
       sessionId.value = ''
@@ -289,7 +366,8 @@ export const useLiveStore = defineStore('live', () => {
     if (!_displayArmed) return
     const shown = _confirmedAtAnchor + _pendingAtAnchor + windowConsumedSec()
     // 已确认进度不得归零；待确认段允许小幅回退（服务端撤回时）。
-    localElapsed.value = Math.max(_confirmedAtAnchor, shown)
+    // 有界乐观只抬高显示，不抬高已确认锚点。
+    localElapsed.value = Math.max(_confirmedAtAnchor, boundedDisplaySec(shown))
   }
 
   /**
@@ -438,27 +516,46 @@ export const useLiveStore = defineStore('live', () => {
       || candidate?.name === 'AbortError'
   }
 
-  // 开始直播（zoneName 非空=手动模式，空=任务模式）
-  async function startLive(zoneName?: string, durationSeconds?: number) {
+  // 开始直播（zoneName 非空=手动模式；specifiedTask 携带确认时冻结的目标）
+  async function startLive(zoneName?: string, durationSeconds?: number,
+                           specifiedTask?: {
+                             taskId: number
+                             expectedRevision: number
+                             businessDate: string
+                             abandonSaved?: StartLiveRequest['abandon_saved']
+                           }) {
     isStarting.value = true
     const startAbort = _newIntent()
     try {
-      const body: StartLiveRequest = zoneName
-        ? { zone_name: zoneName, duration_seconds: durationSeconds }
-        : {}
+      const body: StartLiveRequest = specifiedTask
+        ? {
+            task_id: specifiedTask.taskId,
+            expected_revision: specifiedTask.expectedRevision,
+            business_date: specifiedTask.businessDate,
+            ...(specifiedTask.abandonSaved
+              ? { abandon_saved: specifiedTask.abandonSaved } : {}),
+          }
+        : zoneName
+          ? { zone_name: zoneName, duration_seconds: durationSeconds }
+          : {}
       const res = await request.post<StartLiveResponse>('/api/live/start', body,
         { signal: startAbort.signal })
       if (res.success) {
+        // 受理即有界显示：先用冻结基线建乐观会话，再拉权威状态
+        // （顺序约束——pollStatus 的权威观察要能冻结乐观领先量）。
+        armOptimistic(res.accepted)
         await pollStatus()
         // "已受理"不等于"已开播"：启动有界短轮询，真正开播后立刻显示进度。
         beginStartWatch()
         return { success: true, message: res.message, needFaceVerify: false, qrData: '' }
       }
+      // 受理失败：不存在任何乐观显示可保留（也从未 arm）。
       return {
         success: false,
         message: res.message,
         needFaceVerify: res.need_face_verification || false,
         qrData: res.qr_data || '',
+        refusal: res.refusal || '',
       }
     } catch (error: unknown) {
       if (isAbortError(error)) {
@@ -480,6 +577,7 @@ export const useLiveStore = defineStore('live', () => {
       const res = await request.post<StartLiveResponse>('/api/live/resume',
         undefined, { signal: abort.signal })
       if (res.success) {
+        armOptimistic(res.accepted)
         await pollStatus()
         beginStartWatch()
         return { success: true, message: res.message, needFaceVerify: false, qrData: '' }
@@ -507,10 +605,15 @@ export const useLiveStore = defineStore('live', () => {
     isStarting.value = true
     const abort = _newIntent()
     try {
-      const res = await request.post<{ success: boolean; message?: string }>(
+      const res = await request.post<StartLiveResponse & { task?: unknown }>(
         '/api/live/run-next', undefined, { signal: abort.signal })
-      await pollStatus()
-      if (res?.success) beginStartWatch()
+      if (res?.success) {
+        armOptimistic(res.accepted)
+        await pollStatus()
+        beginStartWatch()
+      } else {
+        await pollStatus()
+      }
       return res
     } catch (error: unknown) {
       if (isAbortError(error)) {
@@ -533,6 +636,8 @@ export const useLiveStore = defineStore('live', () => {
     cancelPendingIntents('user-stop')
     // 只取消**此前**的启动观察：之后用户新发起的开播会重新 beginStartWatch。
     stopStartWatch()
+    // 停止撤除乐观显示：显示立即回到权威值（受理不冒充成功）。
+    clearOptimistic()
     try {
       const res = await request.post<StopLiveResponse>('/api/live/stop')
       if (res.success) {
@@ -570,7 +675,8 @@ export const useLiveStore = defineStore('live', () => {
       _pendingAtAnchor = Number.isFinite(pending) && pending > 0 ? pending : 0
       armWindow(s)
       _displayArmed = true
-      localElapsed.value = _confirmedAtAnchor + _pendingAtAnchor + windowConsumedSec()
+      localElapsed.value = boundedDisplaySec(
+        _confirmedAtAnchor + _pendingAtAnchor + windowConsumedSec())
       const dur = Number((status.value as any).duration_seconds ?? 0)
       fixedTotal.value = Number.isFinite(dur) && dur > 0 ? dur : 0
     }
@@ -638,6 +744,7 @@ export const useLiveStore = defineStore('live', () => {
     if (!s.is_streaming) return ''
     if (statusStale.value) return '连接中'
     if ((s as any).recovery_blocked || (s as any).phase === 'recovering') return '恢复中'
+    if ((s as any).takeover_pending === true) return '开播确认中'
     const ts = String((s as any).timer_state || '')
     if (ts === 'paused_closed') return '已暂停'
     if (ts === 'paused_blocked') return '恢复中'
@@ -673,6 +780,9 @@ export const useLiveStore = defineStore('live', () => {
     resumeLive,
     runNext,
     stopLive,
+    optimisticRunId,
+    armOptimistic,
+    clearOptimistic,
     cancelPendingIntents,
     startLocalTick,
     stopLocalTick,

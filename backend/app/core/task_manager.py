@@ -552,6 +552,91 @@ class TaskManager:
         logger.warning(" 无待执行任务")
         return None
 
+    # ---------- 指定任务选择（2026-09-28 收口：点哪条开哪条） ----------
+
+    def select_task_instruction(self, task_id: Optional[int] = None,
+                                expected_revision: Optional[int] = None,
+                                business_date: Optional[str] = None
+                                ) -> Tuple[Optional[LiveInstruction], Optional[str]]:
+        """按稳定 id 生成**指定任务**的开播指令，并冻结前置条件。
+
+        返回 ``(instruction, 拒绝码)``；拒绝码为 None 表示受理。所有校验都在
+        ``_mutation_lock`` 内完成：选择与版本/名称/资格核对之间没有窗口，
+        改名/删除重建/结算只能排在校验之前（被看到）或之后（被 409 拒绝）。
+
+        拒绝码（与前端/测试共用）：``start_requires_task_id`` /
+        ``start_requires_business_day`` / ``start_stale_business_day`` /
+        ``start_requires_revision`` / ``start_revision_unavailable`` /
+        ``start_stale_revision`` / ``task_not_found`` / ``name_mismatch`` /
+        ``task_not_executable``。
+        """
+        if task_id is None:
+            return None, 'start_requires_task_id'
+        if not business_date:
+            return None, 'start_requires_business_day'
+        if business_date != date.today().isoformat():
+            return None, 'start_stale_business_day'
+        with self._mutation_lock:
+            revision, _rows = self.get_snapshot()
+            if revision is None:
+                return None, 'start_revision_unavailable'
+            if expected_revision is None:
+                return None, 'start_requires_revision'
+            try:
+                frozen_revision = int(expected_revision)
+            except (TypeError, ValueError):
+                return None, 'start_requires_revision'
+            if frozen_revision != int(revision):
+                return None, 'start_stale_revision'
+            row = self.db.get_task_by_id(task_id)
+            if not row:
+                logger.warning(f" 指定开播被拒：任务 id={task_id} 不存在")
+                return None, 'task_not_found'
+            task = next((t for t in self.tasks if t.id == task_id), None)
+            if task is None:
+                logger.warning(f" 指定开播被拒：任务 id={task_id} 不在内存清单")
+                return None, 'task_not_found'
+            instruction = task.to_instruction()
+            # 冻结确认时刻的前置条件：预留临界区与接管复核都以它们为准。
+            instruction.source_revision = frozen_revision
+            instruction.source_business_date = business_date
+            logger.info(f"→ 指定任务指令：{instruction}（revision={frozen_revision}，"
+                        f"business_date={business_date}）")
+            return instruction, None
+
+    def validate_named_selection(self, task_id: Optional[int],
+                                 zone_name: Optional[str],
+                                 expected_revision: Optional[int],
+                                 business_date: Optional[str],
+                                 row: Optional[dict]) -> Optional[str]:
+        """复核一次"指定选择"是否仍然成立；返回拒绝码，None 表示成立。
+
+        必须在 ``reserve_active_task`` 的 ``_mutation_lock`` 临界区内调用
+        （row 由同一临界区解析），使校验与登记成为同一原子区间。
+        """
+        if not business_date:
+            return 'start_requires_business_day'
+        if business_date != date.today().isoformat():
+            return 'start_stale_business_day'
+        if expected_revision is None:
+            return 'start_requires_revision'
+        revision, _rows = self.get_snapshot()
+        if revision is None:
+            return 'start_revision_unavailable'
+        if int(expected_revision) != int(revision):
+            return 'start_stale_revision'
+        if not row:
+            return 'task_not_found'
+        if row.get('id') != task_id:
+            return 'task_not_found'
+        if zone_name is not None and row.get('zone_name') != zone_name:
+            return 'name_mismatch'
+        if int(row.get('category') or 0) <= 0:
+            return 'task_not_executable'
+        if row.get('today_done') == 1:
+            return 'task_not_executable'
+        return None
+
     # ---------- 结算身份 ----------
 
     def set_active_task(self, task_id: Optional[int], run_id: Optional[str] = None) -> None:

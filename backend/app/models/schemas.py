@@ -19,6 +19,9 @@ class LiveInstruction(BaseModel):
       id 才是稳定身份——结算与"运行中任务保护"都以它为准；
     - run_id：本场直播的唯一标识，用于区分"同一场的不同阶段"与"另一场"；
     - execution_date：开播时捕获的业务日，跨日之后到达的旧结算不会记到新的一天。
+    - source_revision / source_business_date：**指定选择**时在确认弹框前冻结的
+      前置条件（任务库版本与业务日）。两者同时为 None 表示非指定选择（自动
+      下一任务/手动模式），预留临界区不做版本复核。
     旧调用方不传这些字段时行为完全不变。
     """
     zone_name: str
@@ -26,6 +29,8 @@ class LiveInstruction(BaseModel):
     task_id: Optional[int] = None
     run_id: Optional[str] = None
     execution_date: Optional[str] = None
+    source_revision: Optional[int] = None
+    source_business_date: Optional[str] = None
 
     class Config:
         # 允许使用原有 dataclass 属性
@@ -127,13 +132,50 @@ class LoginStatusResponse(BaseModel):
     need_scan: bool = False
 
 
+class AbandonSavedClaim(BaseModel):
+    """放弃旧存档进度的确认凭证（前端确认弹框时刻冻结的完整身份）。
+
+    服务端在受理时逐项核对：任一项与 live_state.json 当前事实不符即 409，
+    绝不"降级成下一个任务"或清空进度。
+    """
+    old_run_id: Optional[str] = None
+    old_task_id: Optional[int] = None
+    old_zone_name: Optional[str] = None
+    old_execution_date: Optional[str] = None
+    old_elapsed_seconds: Optional[int] = None
+    confirm_id: Optional[str] = None
+    stop_epoch: Optional[int] = None
+
+
+class AcceptedIntent(BaseModel):
+    """受理冻结基线：受理成功即刻返回，供前端"受理即有界显示"。
+
+    ``confirmed_elapsed_seconds`` 是受理时刻冻结的继承进度；此后平台/媒体
+    的任何进展都以后续 /status 轮询为准，前端不得把显示量回写为权威值。
+    """
+    run_id: Optional[str] = None
+    task_id: Optional[int] = None
+    zone_name: Optional[str] = None
+    confirmed_elapsed_seconds: int = 0
+    duration_seconds: int = 0
+    duration_known: bool = True
+    source: Optional[str] = None
+    accepted_epoch: Optional[int] = None
+
+
 class StartLiveRequest(BaseModel):
     """开始直播请求（zone_name 非空=手动模式，空=任务模式自动取下一任务）
     duration_seconds: 手动模式时长，0=不限时，上限86400(24h)
+    task_id 非空=指定该条任务开播，必须携带确认时冻结的
+    expected_revision + business_date；abandon_saved 为放弃旧进度的凭证。
     """
     room_id: Optional[int] = None
     zone_name: Optional[str] = None
     duration_seconds: Optional[int] = None
+    task_id: Optional[int] = None
+    expected_revision: Optional[int] = None
+    business_date: Optional[str] = None
+    abandon_saved: Optional[AbandonSavedClaim] = None
 
 
 class StartLiveResponse(BaseModel):
@@ -144,6 +186,8 @@ class StartLiveResponse(BaseModel):
     message: str = ""
     need_face_verification: bool = False
     qr_data: Optional[str] = None
+    accepted: Optional[AcceptedIntent] = None
+    refusal: str = ""
 
 
 class StopLiveResponse(BaseModel):
