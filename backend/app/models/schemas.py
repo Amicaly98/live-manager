@@ -19,9 +19,6 @@ class LiveInstruction(BaseModel):
       id 才是稳定身份——结算与"运行中任务保护"都以它为准；
     - run_id：本场直播的唯一标识，用于区分"同一场的不同阶段"与"另一场"；
     - execution_date：开播时捕获的业务日，跨日之后到达的旧结算不会记到新的一天。
-    - source_revision / source_business_date：**指定选择**时在确认弹框前冻结的
-      前置条件（任务库版本与业务日）。两者同时为 None 表示非指定选择（自动
-      下一任务/手动模式），预留临界区不做版本复核。
     旧调用方不传这些字段时行为完全不变。
     """
     zone_name: str
@@ -29,6 +26,10 @@ class LiveInstruction(BaseModel):
     task_id: Optional[int] = None
     run_id: Optional[str] = None
     execution_date: Optional[str] = None
+    # "点哪条开哪条"在**用户确认那一刻**冻结的前置条件（工作包 B 监督返修）：
+    # select_task_instruction 填写，与任务 CRUD 共用的 _mutation_lock 内的
+    # 预留/接管复核据此再核一遍。None = 非指定任务选择（轮转/手动），不做
+    # 该复核。旧调用方不传这些字段时行为完全不变。
     source_revision: Optional[int] = None
     source_business_date: Optional[str] = None
 
@@ -132,42 +133,18 @@ class LoginStatusResponse(BaseModel):
     need_scan: bool = False
 
 
-class AbandonSavedClaim(BaseModel):
-    """放弃旧存档进度的确认凭证（前端确认弹框时刻冻结的完整身份）。
-
-    服务端在受理时逐项核对：任一项与 live_state.json 当前事实不符即 409，
-    绝不"降级成下一个任务"或清空进度。
-    """
-    old_run_id: Optional[str] = None
-    old_task_id: Optional[int] = None
-    old_zone_name: Optional[str] = None
-    old_execution_date: Optional[str] = None
-    old_elapsed_seconds: Optional[int] = None
-    confirm_id: Optional[str] = None
-    stop_epoch: Optional[int] = None
-
-
-class AcceptedIntent(BaseModel):
-    """受理冻结基线：受理成功即刻返回，供前端"受理即有界显示"。
-
-    ``confirmed_elapsed_seconds`` 是受理时刻冻结的继承进度；此后平台/媒体
-    的任何进展都以后续 /status 轮询为准，前端不得把显示量回写为权威值。
-    """
-    run_id: Optional[str] = None
-    task_id: Optional[int] = None
-    zone_name: Optional[str] = None
-    confirmed_elapsed_seconds: int = 0
-    duration_seconds: int = 0
-    duration_known: bool = True
-    source: Optional[str] = None
-    accepted_epoch: Optional[int] = None
-
-
 class StartLiveRequest(BaseModel):
     """开始直播请求（zone_name 非空=手动模式，空=任务模式自动取下一任务）
     duration_seconds: 手动模式时长，0=不限时，上限86400(24h)
-    task_id 非空=指定该条任务开播，必须携带确认时冻结的
-    expected_revision + business_date；abandon_saved 为放弃旧进度的凭证。
+
+    任务身份（2026-09-28 工作包 B）：任务列表点哪一行就从哪一行开始。
+    - ``task_id``：被点任务的稳定身份（DB 主键）。有值时**只**启动这一条任务，
+      不再按优先度自动另选；没有值时沿用既有自动选择（控制台「下一任务」）。
+    - ``expected_revision`` / ``business_date``：确认那一刻冻结的任务列表版本与
+      业务日。缺任何一个都不受理带 task_id 的请求——否则"用户在弹框里看到的
+      那一条"与"真正被启动的那一条"之间就没有可核对的约束。
+    - ``abandon_saved``：用户对"放弃本次未结算旧进度"的确认凭证。只有它存在且
+      冻结身份全部核对通过时才绕过旧存档保护（见 ``AbandonSavedRequest``）。
     """
     room_id: Optional[int] = None
     zone_name: Optional[str] = None
@@ -175,7 +152,72 @@ class StartLiveRequest(BaseModel):
     task_id: Optional[int] = None
     expected_revision: Optional[int] = None
     business_date: Optional[str] = None
-    abandon_saved: Optional[AbandonSavedClaim] = None
+    abandon_saved: Optional['AbandonSavedRequest'] = None
+
+
+class AbandonSavedRequest(BaseModel):
+    """受控放弃旧进度的确认凭证（每一项都是**确认时冻结**的事实）。
+
+    服务端在启动新任务之前逐个核对：
+    - 旧会话身份（``old_run_id``/``old_task_id``/``old_zone_name``/
+      ``old_execution_date``/``old_elapsed_seconds``）必须与**当前**存档一致：
+      期间任何一次面板操作、后台结算、另一个标签页的停止/恢复都会让它失效；
+    - ``stop_epoch`` 是确认时的控制代际，用来识别"停止之后的迟到确认"；
+    - ``confirm_id`` 是一次性标识：同一张票的重放不能第二次触发同一次放弃。
+
+    这里**不**clean任何东西，真正的"丢弃"发生在新任务被平台确认开播之后。
+    """
+    old_run_id: str = ''
+    old_task_id: Optional[int] = None
+    old_zone_name: str = ''
+    old_execution_date: str = ''
+    # 已播秒数是确认的主体本身：None = 凭证没带（直接拒绝），0 只代表
+    # "确认时旧进度确实是 0"。
+    old_elapsed_seconds: Optional[int] = None
+    stop_epoch: int = 0
+    confirm_id: str = ''
+
+
+class SavedProgressConflict(BaseModel):
+    """旧存档仍然持有一份未结算进度时的冲突资料（供前端生成确认文案）。
+
+    只描述**已存在的事实**：旧会话身份、已确认秒数、目标时长、执行日，以及
+    这份进度现在能不能恢复。前端必须原样展示，不得自行推断将要丢弃多少。
+    """
+    run_id: str = ''
+    task_id: Optional[int] = None
+    zone_name: str = ''
+    execution_date: str = ''
+    elapsed_seconds: int = 0
+    duration_seconds: int = 0
+    duration_known: bool = False
+    resumable: bool = False
+    reason: str = ''
+
+
+class AcceptedIntent(BaseModel):
+    """一次**受理**的控制意图的显示基线。
+
+    面板拿到它就可以立刻显示乐观推进的秒数，不必等第一次平台观察；它与
+    权威计时是两件事：这里全是受理时刻冻结的值，不含任何推测，也不参与
+    结算、邮件与跨日判定。
+
+    - ``run_id``：本次会话身份。后续所有状态都以它为准，另一场的迟到响应
+      不得拿来改写本场的显示。
+    - ``task_id``：受理时实际选中的任务（手动模式为 null）。
+    - ``confirmed_elapsed_seconds``：受理时**已确认**的进度。恢复场景下它是
+      继承值（例如 3590），新开播为 0；它不是"预计"，是服务端已有的事实。
+    """
+    run_id: str = ''
+    task_id: Optional[int] = None
+    zone_name: str = ''
+    duration_seconds: int = 0
+    duration_known: bool = False
+    confirmed_elapsed_seconds: int = 0
+    stream_mode: str = ''
+    source: str = ''
+    epoch: int = 0
+    accepted_at: str = ''
 
 
 class StartLiveResponse(BaseModel):
@@ -186,13 +228,30 @@ class StartLiveResponse(BaseModel):
     message: str = ""
     need_face_verification: bool = False
     qr_data: Optional[str] = None
+    #: 受理成功时才给出；数据全部是受理时刻的冻结值（见 ``AcceptedIntent``）。
     accepted: Optional[AcceptedIntent] = None
-    refusal: str = ""
+    #: 旧存档仍有未结算进度时需要用户显式确认（见 ``SavedProgressConflict``）。
+    saved_progress_conflict: Optional[SavedProgressConflict] = None
+
+
+class RunNextTaskResponse(BaseModel):
+    """执行下一个任务的响应（含受理意图，前端可立即乐观显示）。"""
+    success: bool
+    message: str = ""
+    need_face_verification: bool = False
+    qr_data: Optional[str] = None
+    zone_name: str = ''
+    duration_seconds: int = 0
+    accepted: Optional[AcceptedIntent] = None
+
+
+StartLiveRequest.model_rebuild()
 
 
 class StopLiveResponse(BaseModel):
     success: bool
     message: str = ""
+
 
 class TaskListResponse(BaseModel):
     """任务列表响应"""
@@ -228,23 +287,43 @@ class UserInfo(BaseModel):
 
 # ==================== 任务 CRUD 模型 ====================
 
+class CreatePreview(BaseModel):
+    """创建预检时**冻结**的那份状态（M1）。
+
+    用户在弹框里确认的是"他当时看到的那一条记录 + 那一刻的列表版本与业务日"，
+    不是"这个名字"、也不是"现在的最新状态"。三样必须在**弹框之前**一起取，
+    提交时由服务端在同一事务里逐项复核；任何一项不符就是明确冲突，绝不自动换
+    最新版本后重试。
+    """
+    task_id: Optional[int] = None            # 预检时该分区的当前行 id（无则 None）
+    revision: Optional[int] = None           # 预检时的 tasks_revision
+    business_day: Optional[str] = None       # 预检时的业务日（YYYY-MM-DD）
+    existing_is_unfinished: Optional[bool] = None
+
+
 class TaskCreate(BaseModel):
     """创建任务请求（category: 0=已完成, >0=时/天）
 
-    ``id`` 只有 ``overwrite=true`` 时才需要：它是**被覆盖那一条记录**的稳定
-    身份（用户在确认框里看到的那一条）。旧模型没有这个字段，Pydantic 会把
-    客户端发来的 id 直接丢掉，服务端只能退回按分区名匹配——删除重建同名任务
-    之后，旧覆盖就落到了新记录上。
+    **M1 起，创建一律产生新身份**：新 task_id、进度 0；同分区已有的任务留在
+    历史与账本里（未完成时终结为"被新任务覆盖"）。旧 ``overwrite=true`` 的
+    UPDATE 旧 id 语义已退役（见 ``M1-MIGRATION-REGISTER.md``）。
 
-    ``expected_revision`` / ``business_date`` 是覆盖请求的**前置条件**：用户在
-    确认框里看到的那份列表的版本与业务日。只有 id 还不够——同一条记录在确认
-    之后可能已经被结算/编辑过（别的面板或后台任务），此时旧载荷仍然是"同一个
-    id"，照写就会抹掉刚提交的完成进度。旧模型同样会丢弃这两个字段，服务端只
-    能无保护地照写，因此这里显式建模并交给事务内的条件检查。
+    三个新字段都是**可选**的，旧载荷不带时走"服务端自行判定"的兼容分支：
+
+    - ``preview``：弹框之前冻结的预检（身份 + 版本 + 业务日 + 未完成标志）；
+    - ``confirm_replace``：用户对"替换这一条未完成任务"的明确确认语义；
+    - ``operation_token``：客户端生成的一次性令牌；回包丢失后凭它取回原来那份
+      已提交结果，不再执行第二次创建。
+
+    ``id`` / ``expected_revision`` / ``business_date`` 保留为**旧调用形状**：
+    带 ``overwrite=true`` 与 id 时，服务端用它们组装出同一份预检，走同一条事务。
     """
     id: Optional[int] = None
     expected_revision: Optional[int] = None      # 确认时的 tasks_revision
     business_date: Optional[str] = None          # 确认时的业务日（YYYY-MM-DD）
+    preview: Optional[CreatePreview] = None      # 弹框前冻结的完整预检
+    confirm_replace: Optional[bool] = None       # 对未完成旧任务的明确替换确认
+    operation_token: Optional[str] = None        # 创建回执的操作令牌
     zone_name: str
     category: int = 1                           # 0=已完成, >0=时/天
     total_days: int = 1

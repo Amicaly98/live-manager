@@ -254,7 +254,7 @@ def import_legacy_cache(target: Optional[Path] = None,
     return actions
 
 
-
+# ==================== 桌面适配点：打包种子分区表 ====================
 # Desktop build input compatibility: seed data lives in the packaged bundle and
 # is copied only when the user cache is absent.
 def copy_seed_if_missing(target: Path, seed: Path) -> str:

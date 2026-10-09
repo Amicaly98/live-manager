@@ -181,9 +181,20 @@ async function ensurePortAvailable(): Promise<string | null> {
 
 // ==================== 后端路径（E5/D4） ====================
 
+/**
+ * 账号数据根（桌面移植阶段 1）：任务/进度/历史按 UID 归属，后端需要显式传入。
+ * 已有明确配置（环境变量 ACCOUNT_DATA_ROOT）优先；缺省用 userData/account-data，
+ * 与后端 run.py 的默认推导一致。不改 userData 路径，也不扫描或接管服务器数据。
+ */
+function getAccountRoot(): string {
+  const configured = process.env.ACCOUNT_DATA_ROOT;
+  if (configured && configured.trim()) return configured;
+  return path.join(app.getPath('userData'), 'account-data');
+}
+
 function getBackendCommand(): { cmd: string; args: string[] } {
   const dataDir = getDataDir();
-  const dataArgs = ['--data-dir', dataDir];
+  const dataArgs = ['--data-dir', dataDir, '--account-root', getAccountRoot()];
   if (isDev) {
     const script = path.join(__dirname, '..', 'backend', 'run.py');
     return { cmd: process.platform === 'win32' ? 'python' : 'python3', args: [script, ...dataArgs] };

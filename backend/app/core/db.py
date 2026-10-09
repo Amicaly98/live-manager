@@ -23,6 +23,20 @@ def _default_db_path():
 
 DEFAULT_DB_PATH = None  # 延迟初始化，避免模块加载时 config 未初始化
 
+
+class ProgressGuardError(RuntimeError):
+    """人工进度凭据**存在但不可用**（损坏 / 非法 / SQL 读取失败）。
+
+    "没有这个键"与"这个键坏了"是两件事：前者是旧库的兼容默认（代数 0），
+    后者必须让调用方**明确失败并回滚**，不能被读成"从没人工改过"。
+    """
+
+    def __init__(self, reason: str, detail: str = '') -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.detail = detail
+
+
 # ==================== Schema ====================
 
 CREATE_TASKS_TABLE = """
@@ -63,6 +77,110 @@ value TEXT NOT NULL
 
 #: 版本元数据的键。
 META_REVISION_KEY = 'tasks_revision'
+
+#: 账号库归属登记键（M0A）：该库属于哪个 UID。
+#:
+#: 它与任务版本同住 ``tasks_meta``，因此"这份库是谁的"和任务数据在**同一份
+#: SQLite** 里，不需要第二份权威文件；写入走本表既有的 OR REPLACE 能力，不新增
+#: 表、不改既有列。**只登记**归属，不参与任何排序/结算/日切判据。
+META_ACCOUNT_OWNER_KEY = 'account_owner_uid'
+
+#: **创建**操作回执在 tasks_meta 里的键前缀（M1）。
+#:
+#: 与导入回执 ``task_import:`` 同表不同键空间：一次创建留一行已提交事实，
+#: 供回包丢失后按同一令牌取回原结果。任务创建是人手驱动的低频操作，因此这里
+#: **不设容量上限** —— 导入回执的 ``_IMPORT_OPERATION_MAX`` 是"防重放的容量
+#: 预算"，把它复制过来会让普通创建变成有终身次数上限的操作（交办 §5.2）。
+META_CREATE_OPERATION_PREFIX = 'task_create:'
+
+#: 逐任务**人工进度变更代数**在 tasks_meta 里的键前缀。
+#:
+#: 它与 ``tasks_revision`` 是两件事：版本覆盖全库（日切、别的任务、派生值重算
+#: 都会前进），拿它当"这个任务的进度有没有被人工改过"的凭据会误伤合法完成。
+#: 这个代数只在该任务的**进度相关事实**真的被改动时前进，且与任务变更同事务。
+META_PROGRESS_GUARD_PREFIX = 'task_progress_guard:'
+
+#: 完成账本：``(task_id, business_day)`` 最多一行。
+#:
+#: 承重的是**数据库级唯一约束**，不是 Python 查重或一把实例内锁：两个独立连接
+#: 争抢同一天的首次提交也最多 +1。记录是**已落定的事实**（业务日、稳定回执、
+#: 来源、达标确认时间、入账时间、本次计入后的进度），不是待执行命令，因此没有
+#: pending/发送/重试状态。它不随任务删除级联消失，也不随日切/重启/导入被清掉。
+CREATE_TASK_COMPLETION_LEDGER = """
+CREATE TABLE IF NOT EXISTS task_completion_ledger (
+id INTEGER PRIMARY KEY AUTOINCREMENT,
+task_id INTEGER NOT NULL,
+business_day TEXT NOT NULL,
+run_id TEXT NOT NULL DEFAULT '',
+receipt TEXT NOT NULL,
+source TEXT NOT NULL DEFAULT 'auto',
+zone_name TEXT NOT NULL DEFAULT '',
+area_id INTEGER,
+target_seconds REAL NOT NULL DEFAULT 0,
+effective_seconds REAL NOT NULL DEFAULT 0,
+completed_at TEXT,
+committed_at TEXT NOT NULL,
+days_done_after INTEGER NOT NULL DEFAULT 0,
+total_days_after INTEGER NOT NULL DEFAULT 0,
+UNIQUE (task_id, business_day)
+);
+"""
+
+CREATE_INDEX_LEDGER_DAY = """
+CREATE INDEX IF NOT EXISTS idx_ledger_business_day
+ON task_completion_ledger(business_day);
+"""
+
+#: 窄任务历史：只记录**事实**（创建、参数变更、人工进度调整、播满、不可完成移出、
+#: 删除），没有 pending/处理/重试状态，不参与任何直播决策。
+#:
+#: 与 tasks 表**没有外键**：任务删除不得带走历史。前后快照至少保留分区、每日要求
+#: 时长（category）、总天数、当时进度与截止日；任务起始日没有可靠来源，不伪造。
+CREATE_TASK_HISTORY = """
+CREATE TABLE IF NOT EXISTS task_history (
+id INTEGER PRIMARY KEY AUTOINCREMENT,
+task_id INTEGER NOT NULL,
+event TEXT NOT NULL,
+at TEXT NOT NULL,
+zone_name TEXT NOT NULL DEFAULT '',
+area_id INTEGER,
+category_before INTEGER,
+total_days_before INTEGER,
+days_done_before INTEGER,
+deadline_before TEXT,
+category_after INTEGER,
+total_days_after INTEGER,
+days_done_after INTEGER,
+deadline_after TEXT,
+source TEXT NOT NULL DEFAULT '',
+detail TEXT NOT NULL DEFAULT ''
+);
+"""
+
+CREATE_INDEX_HISTORY_TASK = """
+CREATE INDEX IF NOT EXISTS idx_task_history_task ON task_history(task_id);
+"""
+
+#: 分区历史入口按**分区快照**关联历次 task_id（M1）。历史表与账本都保留
+#: 事件发生时的分区名，因此这是"该分区的历次身份"的可靠来源，不靠名字模糊匹配。
+CREATE_INDEX_HISTORY_ZONE = """
+CREATE INDEX IF NOT EXISTS idx_task_history_zone ON task_history(zone_name);
+"""
+
+CREATE_INDEX_LEDGER_ZONE = """
+CREATE INDEX IF NOT EXISTS idx_ledger_zone ON task_completion_ledger(zone_name);
+"""
+
+#: 账本与历史里出现的来源标记。
+LEDGER_SOURCE_AUTO = 'auto'                    # 新核心的可信 End（唯一自动入口）
+LEDGER_SOURCE_LEGACY = 'legacy_observed'       # 迁移时吸收的、有日期证据的旧完成
+LEDGER_SOURCE_MANUAL = 'mark_done'             # 既有"标记今日完成"入口（人工确认）
+
+HISTORY_SOURCE_USER = 'user'
+HISTORY_SOURCE_IMPORT = 'import'
+HISTORY_SOURCE_AUTO = 'auto'
+HISTORY_SOURCE_NEGATIVE = 'negative_priority'
+HISTORY_SOURCE_MIGRATION = 'migration'
 
 
 class TaskDB:
@@ -122,6 +240,13 @@ class TaskDB:
             self._ensure_columns(conn)
             # 版本元数据表（旧库升级路径：CREATE TABLE IF NOT EXISTS）。
             conn.execute(CREATE_TASKS_META)
+            # 阶段 2 的两张窄表：同样只追加，不动既有数据、不 DROP 任何列。
+            conn.execute(CREATE_TASK_COMPLETION_LEDGER)
+            conn.execute(CREATE_INDEX_LEDGER_DAY)
+            conn.execute(CREATE_TASK_HISTORY)
+            conn.execute(CREATE_INDEX_HISTORY_TASK)
+            conn.execute(CREATE_INDEX_HISTORY_ZONE)
+            conn.execute(CREATE_INDEX_LEDGER_ZONE)
             conn.commit()
             cols = [r[1] for r in conn.execute(
                 "PRAGMA table_info(tasks)").fetchall()]
@@ -218,6 +343,214 @@ class TaskDB:
             logger.warning(f"保存版本元数据失败（下次启动按数据重新对齐）：{e}")
             return False
 
+    # ==================== 账号库归属（与任务数据同库） ====================
+
+    def claim_account_owner(self, uid: int) -> None:
+        """把这份库登记为某个 UID 的账号资料。
+
+        只写一条元数据并提交：不改任务行、不建表、不动历史与账本。调用方
+        （``session_runtime.accounts``）已经**只读地**核验过形状与既有归属，
+        这里只负责落登记。
+        """
+        with self._get_conn() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO tasks_meta(key, value) VALUES (?, ?)",
+                (META_ACCOUNT_OWNER_KEY, str(int(uid))))
+            conn.commit()
+
+    # ==================== 逐任务人工进度代数（与 tasks 同库、同事务） ====================
+
+    @staticmethod
+    def _progress_guard_key(task_id) -> str:
+        return f'{META_PROGRESS_GUARD_PREFIX}{int(task_id)}'
+
+    def read_progress_guard(self, conn, task_id) -> int:
+        """读该任务的**人工进度变更代数**。
+
+        三种情形**必须**互相区分（复核 R2）：
+
+        - **键不存在**（旧库 / 旧版本从未写过这个键）→ 返回 0，等价于
+          "没有记录过人工改动"，这是唯一的兼容默认值；
+        - **键存在但不合法**（JSON 坏了、不是整数、负数、读不出 guard）→
+          抛 :class:`ProgressGuardError`，绝不静默降级成 0 —— 把损坏的凭据读成
+          "从没改过"正好会让一份人工更正之后的旧自动完成重新生效；
+        - **SQL 读取失败** → 同样抛 :class:`ProgressGuardError`（读不出事实
+          不等于"事实是 0"）。
+
+        "是整数"按 JSON 类型判定，**不做数字转换**：``0.5`` 被 ``int()`` 截成
+        0 之后，一份损坏的凭据就重新变成了一次合法授权（复核 A2）。
+        ``True``/``False`` 在 JSON 里是布尔值，同样不是代数；字符串也不强制
+        转换。只有真正的非负整数（以及"键不存在"这个唯一的兼容默认）有效。
+
+        读取路径是只读的：不存在的键**不会**被建出来，因此"缺凭据"与
+        "凭据为 0"不会被写成同一件事的两种说法。
+        """
+        if task_id is None:
+            raise ProgressGuardError('no_task_identity',
+                                     '没有任务身份，无法读取人工进度代数')
+        try:
+            row = conn.execute(
+                "SELECT value FROM tasks_meta WHERE key = ?",
+                (self._progress_guard_key(task_id),)).fetchone()
+        except sqlite3.Error as e:
+            raise ProgressGuardError('guard_read_failed', str(e)) from e
+        if row is None:
+            return 0
+        raw = row['value']
+        try:
+            guard = json.loads(raw)['guard']
+        except Exception as e:
+            raise ProgressGuardError('guard_corrupt', repr(raw)) from e
+        if isinstance(guard, bool) or not isinstance(guard, int) or guard < 0:
+            raise ProgressGuardError('guard_corrupt', repr(raw))
+        return guard
+
+    def bump_progress_guard(self, conn, task_id) -> int:
+        """在同一事务里推进该任务的人工进度代数，返回新值。
+
+        只有**真实的人工进度改动**才调用它；自然结算靠账本防重，不冒充人工更正
+        （否则同一天的另一笔合法完成会被误伤）。
+
+        现存凭据损坏时**明确失败**（异常沿调用方的事务回滚），不 `INSERT OR
+        REPLACE` 把它覆盖成"从 1 开始"：那样等于用一次编辑抹掉"这里曾经有过
+        一份读不出来的凭据"，之后任何旧确认都会被重新授权。
+        """
+        current = self.read_progress_guard(conn, task_id)
+        value = current + 1
+        conn.execute(
+            "INSERT OR REPLACE INTO tasks_meta(key, value) VALUES (?, ?)",
+            (self._progress_guard_key(task_id),
+             json.dumps({'guard': value,
+                         'updated_at': datetime.now().isoformat()},
+                        ensure_ascii=False)))
+        return value
+
+    # ==================== 完成账本 ====================
+
+    @staticmethod
+    def lookup_completion(conn, task_id, business_day) -> Optional[Dict[str, Any]]:
+        """查该 (task_id, business_day) 是否已经记过。**只读**，不做任何写。"""
+        row = conn.execute(
+            "SELECT * FROM task_completion_ledger WHERE task_id = ? "
+            "AND business_day = ?", (int(task_id), str(business_day))).fetchone()
+        return dict(row) if row else None
+
+    @staticmethod
+    def insert_completion(conn, record: Dict[str, Any]) -> None:
+        """写入一条完成事实。唯一约束由数据库承重，不在 Python 里查重。"""
+        conn.execute(
+            """INSERT INTO task_completion_ledger
+            (task_id, business_day, run_id, receipt, source, zone_name, area_id,
+             target_seconds, effective_seconds, completed_at, committed_at,
+             days_done_after, total_days_after)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (int(record['task_id']), str(record['business_day']),
+             str(record.get('run_id') or ''), str(record['receipt']),
+             str(record.get('source') or LEDGER_SOURCE_AUTO),
+             str(record.get('zone_name') or ''), record.get('area_id'),
+             float(record.get('target_seconds') or 0.0),
+             float(record.get('effective_seconds') or 0.0),
+             record.get('completed_at'), str(record['committed_at']),
+             int(record.get('days_done_after') or 0),
+             int(record.get('total_days_after') or 0)))
+
+    @staticmethod
+    def completion_receipt(task_id, business_day) -> str:
+        """稳定回执：同一个 (task_id, business_day) 在任何进程/重启后都一样。"""
+        return f'L{int(task_id)}-{str(business_day)}'
+
+    # ==================== 任务历史 ====================
+
+    @staticmethod
+    def insert_history(conn, record: Dict[str, Any]) -> None:
+        """写一条任务历史事实。与它所属的任务变更**同事务**提交或回滚。"""
+        conn.execute(
+            """INSERT INTO task_history
+            (task_id, event, at, zone_name, area_id,
+             category_before, total_days_before, days_done_before, deadline_before,
+             category_after, total_days_after, days_done_after, deadline_after,
+             source, detail)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (int(record['task_id']), str(record['event']), str(record['at']),
+             str(record.get('zone_name') or ''), record.get('area_id'),
+             record.get('category_before'), record.get('total_days_before'),
+             record.get('days_done_before'), record.get('deadline_before'),
+             record.get('category_after'), record.get('total_days_after'),
+             record.get('days_done_after'), record.get('deadline_after'),
+             str(record.get('source') or ''), str(record.get('detail') or '')))
+
+    @staticmethod
+    def history_task_ids(conn) -> set:
+        """已经有历史记录的 task_id 集合（"现状收录"只做一次的判据）。"""
+        return {int(r['task_id']) for r in conn.execute(
+            "SELECT DISTINCT task_id FROM task_history").fetchall()}
+
+    @staticmethod
+    def completion_ledger_task_ids(conn) -> set:
+        return {int(r['task_id']) for r in conn.execute(
+            "SELECT DISTINCT task_id FROM task_completion_ledger").fetchall()}
+
+    @staticmethod
+    def read_meta_json(conn, key: str) -> Optional[dict]:
+        """按元数据键读一份 JSON 事实；键不存在返回 None。
+
+        **键不存在**与**键存在但读不出来**必须分开：前者是"没有这件事"（正常），
+        后者交给调用方明确失败，绝不静默当成"没有"。
+        """
+        row = conn.execute(
+            "SELECT value FROM tasks_meta WHERE key = ?", (key,)).fetchone()
+        if not row:
+            return None
+        return json.loads(row['value'])
+
+    @staticmethod
+    def write_meta_json(conn, key: str, record: dict) -> None:
+        """在**调用方的事务连接**里写一份 JSON 事实（不自行提交）。"""
+        conn.execute(
+            "INSERT OR REPLACE INTO tasks_meta(key, value) VALUES (?, ?)",
+            (key, json.dumps(record, ensure_ascii=False, sort_keys=True,
+                             separators=(',', ':'), default=str)))
+
+    # ==================== 分区历史（只读窄查询） ====================
+
+    @staticmethod
+    def zone_history_task_ids(conn, zone_name: str) -> List[int]:
+        """该分区关联的**历次** task_id：当前行 ∪ 历史 ∪ 每日账本。
+
+        每个来源都带各自的可靠分区快照：历史行记的是事件发生时的分区名（改名前的
+        旧名会留在更早的事件里），账本记的是入账时的分区名，当前行记的是现状。
+        不按名字模糊匹配，也不合并别的账号的同数值 id（各账号一份库）。
+        """
+        ids = set()
+        for sql, args in (
+                ("SELECT DISTINCT task_id FROM task_history WHERE zone_name = ?",
+                 (zone_name,)),
+                ("SELECT DISTINCT task_id FROM task_completion_ledger "
+                 "WHERE zone_name = ?", (zone_name,)),
+                ("SELECT id FROM tasks WHERE zone_name = ?", (zone_name,))):
+            for row in conn.execute(sql, args).fetchall():
+                if row[0] is not None:
+                    ids.add(int(row[0]))
+        return sorted(ids)
+
+    @staticmethod
+    def history_rows_for_tasks(conn, task_ids: List[int]) -> List[dict]:
+        if not task_ids:
+            return []
+        marks = ','.join('?' for _ in task_ids)
+        return [dict(r) for r in conn.execute(
+            f"SELECT * FROM task_history WHERE task_id IN ({marks}) ORDER BY id",
+            [int(i) for i in task_ids]).fetchall()]
+
+    @staticmethod
+    def ledger_rows_for_tasks(conn, task_ids: List[int]) -> List[dict]:
+        if not task_ids:
+            return []
+        marks = ','.join('?' for _ in task_ids)
+        return [dict(r) for r in conn.execute(
+            f"SELECT * FROM task_completion_ledger WHERE task_id IN ({marks}) "
+            f"ORDER BY id", [int(i) for i in task_ids]).fetchall()]
+
     @contextmanager
     def _get_conn(self):
         """获取数据库连接（线程安全）"""
@@ -248,6 +581,30 @@ class TaskDB:
             with conn:
                 yield conn
         finally:
+            conn.close()
+
+    @contextmanager
+    def coherent_read(self):
+        """一个**真正的一致性读取**：同一连接、同一读快照里读任务行与人工代数。
+
+        为什么不能只"把两条 SELECT 放到同一连接上"：Python 的 ``sqlite3`` 默认
+        不为 SELECT 开事务，两条语句各自取一次快照，中间可以被另一个连接（另一个
+        TaskManager / 另一个实例的进程）改写。这里显式 ``BEGIN`` 一个 deferred 读
+        事务 —— WAL 模式下第一条 SELECT 建立快照，后续读取都看同一份数据。
+
+        只读：结束一律 ROLLBACK，不写任何库。
+        """
+        conn = sqlite3.connect(str(self.db_path), timeout=15.0)
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("BEGIN")
+            yield conn
+        finally:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
             conn.close()
 
     @staticmethod

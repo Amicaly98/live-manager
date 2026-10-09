@@ -23,6 +23,7 @@ import json
 import math
 import os
 import queue
+import re
 import smtplib
 import logging
 import threading
@@ -40,6 +41,42 @@ import requests as _requests
 logger = logging.getLogger(__name__)
 
 
+def _normalize_public_host(value: str) -> str:
+    """Accept a domain or IP only; never turn a URL/path into a confirmation link."""
+    host = str(value or '').strip()
+    if not host or re.search(r'[\s/?#@\\]', host) or '://' in host:
+        return ''
+    try:
+        address = ipaddress.ip_address(host.strip('[]'))
+        # A confirmation endpoint must be reachable from the email recipient's
+        # network. Reject private, reserved, documentation and other non-global
+        # literals; hostnames are accepted without synchronous DNS resolution.
+        if not address.is_global:
+            return ''
+        return f'[{address.compressed}]' if address.version == 6 else address.compressed
+    except ValueError:
+        pass
+    # A colon in a non-IP value is a port or malformed IPv6 literal. Ports belong
+    # to API_PORT so the link always targets the actual instance listener.
+    if ':' in host or host.startswith('[') or host.endswith(']'):
+        return ''
+    try:
+        ascii_host = host.encode('idna').decode('ascii').lower().rstrip('.')
+    except UnicodeError:
+        return ''
+    if len(ascii_host) > 253:
+        return ''
+    labels = ascii_host.split('.')
+    if ascii_host == 'localhost' or ascii_host.endswith('.localhost'):
+        return ''
+    if not labels or any(
+            len(label) > 63
+            or not re.fullmatch(r'[a-z0-9](?:[a-z0-9-]*[a-z0-9])?', label)
+            for label in labels):
+        return ''
+    return ascii_host
+
+
 # ==================== 事件分类 ====================
 
 EVENT_START_ACCEPTED = 'start_accepted'      # 控制请求受理，未证明媒体输出
@@ -49,7 +86,7 @@ EVENT_RECOVERED = 'recovered'                # 本轮恢复条件确实达成
 EVENT_ACTION_REQUIRED = 'action_required'    # 需人工处理：验证/登录失效/明确拒绝
 EVENT_STOPPED = 'stopped'                    # 真实停止结果
 EVENT_TASK_COMPLETE = 'task_complete'        # 结算已提交
-EVENT_TASK_ROTATION = 'task_rotation'        # A 完成与 B 轮转结果合并
+EVENT_TASK_ROTATION = 'task_rotation'        # 自然完成后与下一任务结果合并
 EVENT_DAILY_SUMMARY = 'daily_summary'        # 指定统计日的一致快照
 EVENT_TEST = 'test'                          # 仅渠道测试
 EVENT_LOCAL_FAIL = 'local_stream_fail'       # 本地推流（FFmpeg）持续故障
@@ -66,7 +103,7 @@ EVENT_SWITCH = {
     EVENT_TASK_ROTATION: 'notify_complete',
     EVENT_DAILY_SUMMARY: 'daily_summary',
     EVENT_TEST: None,
-    EVENT_LOCAL_FAIL: 'notify_ffmpeg_retry',
+    EVENT_LOCAL_FAIL: 'notify_error',
 }
 
 #: 事件 → 限频秒数（按事件+去重键分别计算，不同错误互不压制）。
@@ -105,6 +142,8 @@ class _NotificationJob:
     created_at: float = field(default_factory=time.time)
     done: threading.Event = field(default_factory=threading.Event)
     results: Dict[str, str] = field(default_factory=dict)
+    ordering_key: str = ''
+    predecessor: Optional[threading.Event] = None
 
 
 # ==================== EmailSender ====================
@@ -123,6 +162,10 @@ class EmailSender:
         self._face_verify_tokens: Dict[str, dict] = {}
         self._token_lock = threading.Lock()
         self._queue: 'queue.Queue[_NotificationJob]' = queue.Queue(maxsize=self.MAX_QUEUE)
+        self._enqueue_lock = threading.Lock()
+        self._ordering_lock = threading.Lock()
+        self._ordered_tails: Dict[str, threading.Event] = {}
+        self._accepting = True
         self._workers: list = []
         self._closing = threading.Event()
         self._counters = {
@@ -134,34 +177,84 @@ class EmailSender:
             'serverchan': {'sent': 0, 'failed': 0},
         }
         self._counter_lock = threading.Lock()
-        # Desktop confirmation links require an explicitly reachable host;
-        # never probe cloud metadata from a notification worker.
+        # 主机地址显式配置优先；元数据探测只在后台做一次，不阻塞主直播路径。
+        self._host_cache: Optional[str] = None
+        self._host_probe_started = False
+        self._host_resolution_error = ''
         self._start_workers()
 
     # ---------- 配置读取 ----------
 
     def _get_server_host(self) -> str:
-        """Return an explicitly configured externally reachable host, if any.
+        """服务器公网地址（settings → 环境变量 → 缓存的元数据 → localhost）。
 
-        Desktop mail can be opened on another device. A loopback link would
-        point to that device rather than the desktop backend, so an unset host
-        means there is no email confirmation URL. Never probe cloud metadata.
+        云元数据探测**不在调用线程**上做：主机事件可能是监控/控制线程，
+        一次 2 秒的探测会连带拖住控制器（历史缺陷）。
         """
         try:
             from app.api.settings import load_settings
-            h = getattr(load_settings(), 'server_host', '')
-            if h:
-                configured = h.strip()
-                probe = (configured if '://' in configured
-                         else f'http://{configured}')
-                return '' if self._is_loopback_url(probe) else configured
+            configured = str(getattr(load_settings(), 'server_host', '') or '').strip()
+            if configured:
+                # 显式配置错误时 fail closed；不能悄悄拼出假 URL 或绕过配置。
+                host = _normalize_public_host(configured)
+                self._host_resolution_error = '' if host else 'invalid_config'
+                return host
         except Exception:
             pass
-        env_host = os.environ.get('SERVER_PUBLIC_HOST', '').strip()
-        if env_host:
-            probe = env_host if '://' in env_host else f'http://{env_host}'
-            return '' if self._is_loopback_url(probe) else env_host
-        return ''
+        env_value = os.environ.get('SERVER_PUBLIC_HOST', '').strip()
+        if env_value:
+            host = _normalize_public_host(env_value)
+            self._host_resolution_error = '' if host else 'invalid_config'
+            return host
+        if self._host_cache:
+            host = _normalize_public_host(self._host_cache)
+            self._host_resolution_error = '' if host else 'invalid_config'
+            return host
+        self._schedule_host_probe()
+        self._host_resolution_error = 'missing'
+        return 'localhost'
+
+    def warmup_host(self) -> None:
+        """启动时预热公网地址解析（消除"首封验证邮件没有确认链接"的竞态）。
+
+        确认链接由 :meth:`_confirm_url` 依赖 :meth:`_get_server_host` 的结果。
+        缓存为空时该方法**不阻塞**：它把探测丢到后台线程后立刻返回 localhost，
+        于是"正文已拼好、探测才刚成功"的窗口必然存在。
+
+        2026-09-25 现场（instance-8000，重启后第一次需要验证链接）：
+        19:27:43,714 拿到验证 URL → 正文在 43,714–43,727 之间构建（缓存此刻为空）
+        → 19:27:43,727 探测才完成 → 邮件里没有确认链接。该日志每进程只出现一次，
+        即**重启后的第一封验证邮件必然缺链接**。
+
+        启动时调用一次，把竞态前移到进程初始化阶段；探测仍在后台线程，
+        不拖慢启动。失败不影响启动——后续调用仍会重新调度探测。
+        """
+        try:
+            self._get_server_host()
+        except Exception as exc:            # 预热失败不得影响服务启动
+            logger.debug('公网地址预热失败（不影响启动）：%s', exc)
+
+    def _schedule_host_probe(self) -> None:
+        if self._host_probe_started or self._closing.is_set():
+            return
+        self._host_probe_started = True
+        threading.Thread(target=self._probe_host, daemon=True,
+                         name='HostProbe').start()
+
+    def _probe_host(self) -> None:
+        for path in ('eipv4', 'public-ipv4'):
+            try:
+                resp = _requests.get(
+                    f'http://100.100.100.200/latest/meta-data/{path}', timeout=2)
+                if resp.ok and resp.text.strip() and '404' not in resp.text:
+                    host = _normalize_public_host(resp.text.strip())
+                    if host:
+                        self._host_cache = host
+                        logger.info('已缓存服务器公网地址（后台探测）')
+                        return
+            except Exception:
+                continue
+        logger.debug('后台探测公网地址无结果，继续按配置/localhost 生成链接')
 
     def _load_config(self) -> dict:
         """读取推送配置"""
@@ -194,7 +287,8 @@ class EmailSender:
             }
         except Exception:
             return {'channel': 'email', 'email_enabled': False,
-                    'master_enabled': True}
+                    'master_enabled': True,
+                    'notify_ffmpeg_retry': False}
 
     def _use_email(self, config: dict) -> bool:
         if not config.get('master_enabled', True):
@@ -209,36 +303,32 @@ class EmailSender:
         return ch in ('serverchan', 'both') and bool(config.get('serverchan_sendkey'))
 
     def _instance_label(self) -> str:
-        """Return the locally cached Bilibili name, or the desktop app label.
+        """稳定的实例标识：多实例共用收件人时能区分来源。
 
-        This intentionally reads only the controller's in-memory auth cache.
-        Rendering an email must never trigger a Bilibili request or expose the
-        UID/cookies kept by the local credential cache.
+        旧实现取数据目录的 **parent** 名，而多实例的数据目录都叫 `.../data`，
+        于是所有实例在通知里都显示成 `data`，等于没有区分度。
+        优先级：显式 INSTANCE_LABEL → API_PORT（`instance-8001`）→ 数据目录自身的名字。
         """
+        explicit = os.environ.get('INSTANCE_LABEL', '').strip()
+        if explicit:
+            return explicit
+        port = os.environ.get('API_PORT', '').strip()
+        if port:
+            return f'instance-{port}'
         try:
-            # Delayed import avoids the dependencies → email_sender import cycle.
-            from app.dependencies import get_live_controller
-
-            controller = get_live_controller()
-            user_info = getattr(controller, 'cached_user_info', None)
-            uname = user_info.get('uname') if isinstance(user_info, dict) else None
-            if isinstance(uname, str):
-                # Names are user supplied. Keep the email header single-line.
-                label = ' '.join(
-                    uname.replace('\r', ' ').replace('\n', ' ').split())[:48]
-                if label:
-                    return label
+            from app.core import config as _config
+            data_dir = Path(_config.get_data_path('')).resolve()
+            return data_dir.name or data_dir.parent.name or 'default'
         except Exception:
-            # A missing controller/cache must not block a notification.
-            pass
-        return '桌面直播控制'
+            return 'default'
 
     # ---------- 事件入口 ----------
 
     def notify_event(self, event_id: str, subject: str, body: str,
                      html: bool = False, dedup_key: str = '',
                      wait: bool = False,
-                     timeout: float = TEST_DELIVERY_TIMEOUT) -> str:
+                     timeout: float = TEST_DELIVERY_TIMEOUT,
+                     _ordering_key: str = '') -> str:
         """按事件分类发送一条通知，返回真实状态。
 
         返回值：``disabled`` / ``coalesced`` / ``dropped`` / ``queued`` /
@@ -250,10 +340,13 @@ class EmailSender:
             logger.debug('推送总开关已关闭，跳过 [%s]', event_id)
             return 'disabled'
         switch = EVENT_SWITCH.get(event_id)
-        if switch and not config.get(
-                switch, False if event_id == EVENT_LOCAL_FAIL else True):
+        if switch and not config.get(switch, True):
             logger.debug('事件开关关闭，跳过 [%s]（%s=%s）',
                          event_id, switch, config.get(switch))
+            return 'disabled'
+        if (event_id == EVENT_LOCAL_FAIL
+                and not config.get('notify_ffmpeg_retry', False)):
+            logger.debug('FFmpeg 短断流通知开关关闭，跳过 [%s]', event_id)
             return 'disabled'
         if not self._use_email(config) and not self._use_serverchan(config):
             logger.debug('没有可用渠道，跳过 [%s]', event_id)
@@ -261,9 +354,15 @@ class EmailSender:
 
         key = (event_id, dedup_key or '')
         window = EVENT_COALESCE_SECONDS.get(event_id, 0)
-        now = time.time()
+        job = _NotificationJob(event_id=event_id, subject=subject, body=body,
+                               html=html, dedup_key=dedup_key,
+                               ordering_key=_ordering_key)
         if window > 0:
+            # Check, enqueue and reserve as one operation. If admission fails,
+            # no rate slot is left behind; concurrent same-key callers cannot
+            # pass the check while this job is being admitted.
             with self._rate_lock:
+                now = time.time()
                 self._prune_rate_table(now)
                 last = self._last_send.get(key, 0.0)
                 if now - last < window:
@@ -271,16 +370,10 @@ class EmailSender:
                     logger.debug('限频合并 [%s/%s]（距上次 %.0fs）',
                                  event_id, dedup_key, now - last)
                     return 'coalesced'
-                self._last_send[key] = now
-
-        job = _NotificationJob(event_id=event_id, subject=subject, body=body,
-                               html=html, dedup_key=dedup_key)
-        try:
-            self._queue.put_nowait(job)
-        except queue.Full:
-            # 队列满：丢弃并计数，绝不无限堆积，也绝不阻塞直播线程。
-            self._bump('dropped')
-            logger.warning('通知队列已满，丢弃一条 [%s]', event_id)
+                if not self._try_enqueue(job):
+                    return 'dropped'
+                self._last_send[key] = time.time()
+        elif not self._try_enqueue(job):
             return 'dropped'
         self._bump('queued')
         if not wait:
@@ -316,6 +409,31 @@ class EmailSender:
         with self._counter_lock:
             self._counters[name] = self._counters.get(name, 0) + 1
 
+    def _try_enqueue(self, job: _NotificationJob) -> bool:
+        """Queue a job without blocking; return False when admission is closed/full."""
+        if job.ordering_key:
+            with self._ordering_lock:
+                job.predecessor = self._ordered_tails.get(job.ordering_key)
+                if not self._put_job_nowait(job):
+                    job.predecessor = None
+                    return False
+                self._ordered_tails[job.ordering_key] = job.done
+            return True
+        return self._put_job_nowait(job)
+
+    def _put_job_nowait(self, job: _NotificationJob) -> bool:
+        with self._enqueue_lock:
+            if not self._accepting:
+                self._bump('dropped')
+                return False
+            try:
+                self._queue.put_nowait(job)
+            except queue.Full:
+                self._bump('dropped')
+                logger.warning('通知队列已满，丢弃一条 [%s]', job.event_id)
+                return False
+        return True
+
     def _start_workers(self) -> None:
         for index in range(self.WORKERS):
             thread = threading.Thread(target=self._worker_loop, daemon=True,
@@ -330,13 +448,35 @@ class EmailSender:
             except queue.Empty:
                 continue
             try:
-                self._deliver(job)
+                if self._wait_for_predecessor(job):
+                    self._deliver(job)
+                else:
+                    job.results['shutdown'] = 'dropped'
+                    self._bump('dropped')
             except Exception as exc:
                 logger.error('通知投递异常：%s', exc)
                 job.results['error'] = 'failed'
             finally:
                 job.done.set()
+                self._retire_ordered_job(job)
                 self._queue.task_done()
+
+    def _wait_for_predecessor(self, job: _NotificationJob) -> bool:
+        """Wait off the caller thread, and cancel a wait when shutdown begins."""
+        predecessor = job.predecessor
+        if predecessor is None:
+            return True
+        while not self._closing.is_set():
+            if predecessor.wait(0.1):
+                return True
+        return False
+
+    def _retire_ordered_job(self, job: _NotificationJob) -> None:
+        if not job.ordering_key:
+            return
+        with self._ordering_lock:
+            if self._ordered_tails.get(job.ordering_key) is job.done:
+                self._ordered_tails.pop(job.ordering_key, None)
 
     def _deliver(self, job: _NotificationJob) -> None:
         config = self._load_config()
@@ -413,7 +553,8 @@ class EmailSender:
         try:
             resp = _requests.post(
                 f"https://sctapi.ftqq.com/{sendkey}.send",
-                data={'title': f'[直播控制] {title}', 'desp': body},
+                # 主题不再叠加旧前缀：分类前缀（[开播]/[异常]/…）已在 title 里。
+                data={'title': title, 'desp': body},
                 timeout=10)
             result = resp.json()
             if result.get('code') == 0:
@@ -445,7 +586,8 @@ class EmailSender:
         """实际 SMTP 发送"""
         try:
             msg = MIMEMultipart("alternative")
-            msg["Subject"] = f"[直播控制] {subject}"
+            # 主题的分类前缀由事件方法自己给出（见 SUBJECT_*），这里不再叠加。
+            msg["Subject"] = subject
             msg["From"] = config['smtp_user']
             msg["To"] = config['recipients']
             msg.attach(MIMEText(body, "html" if html else "plain", "utf-8"))
@@ -465,348 +607,434 @@ class EmailSender:
             return False
 
     # ---------- 便捷发送方法（结构化事件） ----------
+    #
+    # 2026-09-28 文案收口：**一个事件只发送一个最终有用的结果**。
+    #   - 主题前缀即类别：`[开播]` `[轮转]` `[停止]` `[恢复]` `[异常]`
+    #     `[简报]` `[人脸]`，另有 `[测试]` 只用于人工渠道测试；不再叠加旧的
+    #     `[直播控制]`，也不再出现"请以直播间为准""系统仍会继续尝试"这类把
+    #     未验证事实写给用户的过程话术。
+    #   - 除日报外，正文首行给**事件发生**的本地时间（精确到秒），不是队列送达
+    #     时间；轮转里 A/B 各冻结自己的时间。
+    #   - 凡是时长就写明人读格式**并**附总秒数，例如 `2小时6分35秒（7595秒）`；
+    #     未知不写成 0，0 目标只写"不限时"。
+
+    SUBJECT_START = '[开播]'
+    SUBJECT_ROTATION = '[轮转]'
+    SUBJECT_STOP = '[停止]'
+    SUBJECT_RECOVERED = '[恢复]'
+    SUBJECT_ABNORMAL = '[异常]'
+    SUBJECT_SUMMARY = '[简报]'
+    SUBJECT_FACE = '[人脸]'
+    SUBJECT_TEST = '[测试]'
 
     @staticmethod
-    def _facts_lines(facts: Dict[str, Any], order=None) -> str:
-        keys = order or [k for k in facts if facts.get(k) not in (None, '')]
-        return '\n'.join(f"{k}：{facts[k]}" for k in keys if facts.get(k) not in (None, ''))
+    def _duration_label(seconds) -> str:
+        """统一时长口径：人读格式 + 总秒数。未知写成"未知"，绝不冒充 0。"""
+        try:
+            total = max(0, int(seconds))
+        except (TypeError, ValueError, OverflowError):
+            return '未知'
+        hours, remainder = divmod(total, 3600)
+        minutes, secs = divmod(remainder, 60)
+        if hours:
+            readable = f'{hours}小时{minutes}分{secs}秒'
+        elif minutes:
+            readable = f'{minutes}分{secs}秒'
+        else:
+            readable = f'{secs}秒'
+        return f'{readable}（{total}秒）'
 
-    def _instance_facts(self) -> Dict[str, Any]:
-        return {}
+    @staticmethod
+    def _event_time_line(when=None) -> str:
+        """事件发生时间（调用方此刻 = 事实成立时刻），精确到秒。"""
+        stamp = when if when is not None else datetime.now()
+        return f'时间：{stamp.strftime("%Y-%m-%d %H:%M:%S")}'
+
+    def _summary_account_name(self, frozen: Optional[str] = None) -> str:
+        """署名：优先用**事实里冻结**的账号显示名，其次已验证登录时缓存的昵称。
+
+        阶段 4B 起，已确认事实自带 ``account_name``（形成点冻结）。晚投递（用户
+        已退出/换账号）必须仍然署名**原账号**，因此这里绝不回读当前登录状态——
+        ``frozen`` 给了就只用它。没有事实上下文时（旧调用方/日报）才退回实例标识。
+        """
+        name = frozen
+        if not name:
+            try:
+                from app.dependencies import get_account_display_name
+                name = get_account_display_name()
+            except Exception:
+                name = ''
+        # 邮件主题不能包含换行或其他控制字符；未知账号保留简短实例标识，
+        # 避免多个实例汇入同一收件箱时再被误认成重复发送。
+        name = re.sub(r'[\x00-\x1f\x7f]+', ' ', str(name or '')).strip()[:32]
+        return name or self._instance_label()
+
+    def _mail_subject(self, prefix: str, zone: str = '',
+                      account: Optional[str] = None) -> str:
+        """`[类别] 用户名 · 分区`（轮转另传 `A → B` 作为 zone）。"""
+        parts = [prefix, self._summary_account_name(account)]
+        if zone:
+            parts.append(zone)
+        return ' · '.join(parts)
 
     def notify_start_accepted(self, zone: str, duration_label: str = '',
                               mode: str = '', room_id=None) -> str:
-        """开播请求已受理——**未**证明媒体输出，措辞不得写成"画面正常"。
+        """受理阶段**不发邮件**：结果还没有任何事实可写。
 
-        注意：本方法产出**纯文本**正文，分区名等用户可控内容不做 HTML 转义
-        （旧实现把 ``&amp;`` 直接写进纯文本/主题，2026-09-21 N4）。转义只在
-        HTML 模板（每日简报表格）里做。
+        这条统一: 受理/准备/一次失败后马上重试只留在面板事件；短 FFmpeg 断流
+        由单独开关控制。这里保留方法只是为了让旧调用方不必改签名——它明确返回
+        `suppressed`，绝不静默排队。
         """
-        facts = self._instance_facts()
-        facts.update({'分区': zone, '模式': mode or '任务模式',
-                      '时长': duration_label or '未知'})
-        if room_id:
-            facts['房间'] = room_id
-        body = ('开播请求已受理，正在启动（尚未确认媒体输出）\n\n'
-                + self._facts_lines(facts)
-                + f"\n时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        return self.notify_event(EVENT_START_ACCEPTED, f'[开播受理] {zone}',
-                                 body, dedup_key=str(zone))
+        logger.debug('受理阶段不发送邮件（等待真实结果）：%s', zone)
+        return 'suppressed'
 
     def notify_stream_running(self, zone: str, source: str, elapsed_label: str = '',
                               duration_label: str = '', remaining_label: str = '',
-                              room_id=None, run_id: str = '') -> str:
-        """已进入运行阶段：区分新开/恢复/手动，带已播/目标/剩余与实例。"""
-        source_label = {'new': '新开播', 'resume': '恢复续播',
-                        'reconnect': '自动重连后继续', 'manual': '手动开播'}.get(
-                            source, '直播任务')
-        facts = self._instance_facts()
-        facts.update({'分区': zone, '来源': source_label,
-                      '已播': elapsed_label or '0 分钟',
-                      '目标': duration_label or '未知',
-                      '剩余': remaining_label or '未知'})
-        if room_id:
-            facts['房间'] = room_id
-        body = ('直播已进入运行阶段（房间已开启，画面以实际推流为准）\n\n'
-                + self._facts_lines(facts)
-                + f"\n时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        return self.notify_event(EVENT_STREAM_RUNNING, f'[{source_label}] {zone}',
-                                 body, dedup_key=f'{zone}:{run_id}')
+                              room_id=None, run_id: str = '',
+                              when=None, elapsed_seconds=None,
+                              duration_seconds=None,
+                              duration_known: bool = True,
+                              account_name: Optional[str] = None) -> str:
+        """平台房间已开启且推流方式已进入运行态的一次确认结果。
+
+        ``source`` 决定类别与首句：
+        - ``resume``/``reconnect`` → `[恢复]`（同一会话继续，不是新的一场）；
+        - 其余 → `[开播]`。
+
+        已计时只报**已确认的有效秒数**；目标时长未知时如实写"未知"，不冒充 0。
+        """
+        if source in ('resume', 'reconnect'):
+            prefix = self.SUBJECT_RECOVERED
+            if source == 'resume':
+                lead = f'{zone}已从原进度继续，直播间已开启，任务继续计时。'
+            else:
+                lead = f'{zone}的直播已恢复，任务继续计时，无需操作。'
+        else:
+            prefix = self.SUBJECT_START
+            lead = f'{zone}已开播。'
+        lines = [self._event_time_line(when), lead]
+        target = (self._duration_label(duration_seconds) if duration_seconds is not None
+                  else ('不限时' if duration_label in ('', None) else str(duration_label)))
+        if not duration_known:
+            target = '不限时'
+        lines.append(f'目标时长：{target}。')
+        counted = (self._duration_label(elapsed_seconds) if elapsed_seconds is not None
+                   else (str(elapsed_label) if elapsed_label else '0秒（0秒）'))
+        lines.append(f'已计时：{counted}。')
+        return self.notify_event(EVENT_STREAM_RUNNING,
+                                 self._mail_subject(prefix, zone, account_name),
+                                 '\n'.join(lines), dedup_key=f'{zone}:{run_id}')
 
     def notify_recovering(self, zone: str, attempt: int = 0,
                           reason: str = '', run_id: str = '') -> str:
-        """持续恢复中：同一故障按身份合并，不是每次重试一封。
+        """持续恢复的**过程**不发邮件。
 
-        合并键只含**稳定的故障身份**（分区+场次）：旧实现把可变的 reason
-        拼进键里，"第 1 次/第 20 次"文案一变就成了新故障（2026-09-21 N3）。
-        新一场直播有新的 run_id，不会被前一场压掉。
+        恢复尝试期间没有任何"最终结果"可言；真正的结论只有两种——恢复成功
+        （`[恢复]`）或达到人工处理条件（`[异常]`），分别由
+        :meth:`notify_recovered` 与 :meth:`notify_platform_outage_result` 发出。
         """
-        facts = self._instance_facts()
-        facts.update({'分区': zone, '范围': '平台直播间'})
-        body = ('直播间暂时中断，系统仍在恢复。\n\n'
-                + self._facts_lines(facts)
-                + f"\n时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        return self.notify_event(EVENT_RECOVERING, f'[持续恢复中] {zone}',
-                                 body, dedup_key=f'{zone}:{run_id}')
+        logger.debug('恢复过程不发送邮件（等待结果）：zone=%s attempt=%s',
+                     zone, attempt)
+        return 'suppressed'
 
     def notify_local_stream_fail(self, zone: str, reason: str = '',
                                  run_id: str = '') -> str:
         """本地推流（FFmpeg）故障的有界合并提醒——与平台房间故障**分范围**。
 
-        复用既有失败信号（``推流`` warning 事件），不新增网络探针、不改重试
-        节奏。合并键只含稳定身份。入口没有本地 FFmpeg 循环的结构化阶段，
-        因此统一使用中性"正在重试"，不拿平台房间的重连计数推断本地次数
-        或长间隔阶段；也**不做无生产触发点的恢复承诺**——本地重建成功
-        目前没有配对的通知调用，恢复状态以面板为准。
+        默认由 `notify_ffmpeg_retry` 关闭（本轮保持默认关闭）。文案只写已确认的
+        事实，不做"会立即恢复"的承诺。
         """
-        stage_line = '本地推流遇到问题，正在重试。'
-        stage_fact = '正在重试，恢复状态以面板为准'
-        facts = self._instance_facts()
-        facts.update({'分区': zone,
-                      '范围': '本地推流输出（FFmpeg）；平台房间状态以面板为准',
-                      '处置': stage_fact})
-        body = (stage_line
-                + '平台房间是否正常、是否已恢复，以面板状态为准。\n\n'
-                + self._facts_lines(facts)
-                + f"\n时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        return self.notify_event(EVENT_LOCAL_FAIL, f'[本地推流异常] {zone}',
+        body = '\n'.join([
+            self._event_time_line(),
+            f'{zone}的推流遇到问题，尚未确认恢复。',
+        ])
+        return self.notify_event(EVENT_LOCAL_FAIL,
+                                 self._mail_subject(self.SUBJECT_ABNORMAL, zone),
                                  body, dedup_key=f'{zone}:{run_id}:local-fail')
-
-    def notify_recovered(self, zone: str, scope: str = 'platform',
-                         evidence: str = '', run_id: str = '') -> str:
-        """恢复成功：必须指明恢复的是平台房间还是本地输出，附证据。"""
-        scope_label = {'platform': '平台直播间已重新开启',
-                       'local': '本地推流已重新启动'}.get(
-                           scope, '直播连接已恢复')
-        facts = self._instance_facts()
-        facts.update({'分区': zone, '恢复内容': scope_label})
-        body = ('恢复成功；画面请以直播间为准。\n\n'
-                + self._facts_lines(facts)
-                + f"\n时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        return self.notify_event(EVENT_RECOVERED, f'[已恢复] {zone}',
-                                 body, dedup_key=f'{zone}:{run_id}:{scope}')
-
-    def notify_action_required(self, title: str, reason: str,
-                               still_streaming: bool = False,
-                               action: str = '', identity: str = '') -> str:
-        """Report an action item while leaving technical detail in the panel.
-
-        Reason, action, and raw status detail are intentionally omitted from
-        email. The identity is used only as a deduplication key.
-        """
-        label = '推流需要处理' if '推流' in str(title) else '直播需要处理'
-        body = ('请打开面板查看原因并处理。\n'
-                '当前直播间状态请以面板为准。')
-        return self.notify_event(EVENT_ACTION_REQUIRED, label,
-                                 body, dedup_key=f'{title}:{identity}')
-
-    def notify_start_failed(self, zone: str, identity: str = '') -> str:
-        """Report a start attempt only after it is known not to have started."""
-        return self.notify_event(
-            EVENT_ACTION_REQUIRED, f'开播未成功 · {zone}',
-            (f'{zone}尚未确认直播间开启。'
-             '请先在面板核对状态，再决定是否重试。'),
-            dedup_key=f'start-failed:{identity or zone}')
 
     def notify_local_stream_action_required(self, zone: str,
                                             run_id: str = '') -> str:
-        """Escalate repeated local FFmpeg failures while the panel owns details."""
+        """短窗口内多次异常退出时的一次提醒；不宣称平台直播间停播，也不写承诺话术。"""
+        body = '\n'.join([
+            self._event_time_line(),
+            f'{zone}的推流已连续多次中断，请打开面板查看推流日志并处理。',
+        ])
         return self.notify_event(
-            EVENT_ACTION_REQUIRED, f'推流需要处理 · {zone}',
-            (f'{zone}的推流已连续多次中断，系统仍会继续尝试。\n'
-             '请打开面板查看推流日志并处理。\n'
-             '直播间当前状态请以面板为准。'),
-            dedup_key=f'{zone}:{run_id}:local-action-required')
+            EVENT_ACTION_REQUIRED,
+            self._mail_subject(self.SUBJECT_ABNORMAL, zone),
+            body,
+            dedup_key=f'{zone}:{run_id}:ffmpeg-rapid-fail')
 
-    def notify_stopped(self, zone: str, stage: str = 'stopped',
-                       elapsed_label: str = '', reason: str = '') -> str:
-        """真实停止结果：停止中/已停止/结果待确认分别表述。
+    def notify_recovered(self, zone: str, scope: str = 'platform',
+                         evidence: str = '', run_id: str = '',
+                         when=None) -> str:
+        """已确认的一次恢复结果（`[恢复]`），不是"正在恢复"的过程信。"""
+        lead = (f'{zone}的直播间已重新开启，任务继续计时。' if scope == 'platform'
+                else f'{zone}的推流程序已重新启动。')
+        return self.notify_event(
+            EVENT_RECOVERED, self._mail_subject(self.SUBJECT_RECOVERED, zone),
+            '\n'.join([self._event_time_line(when), lead]),
+            dedup_key=f'{zone}:{run_id}:{scope}')
 
-        ``pending_recycle``（清理未确认）**不得**写"已停止"——那个时刻可能
-        仍持有活的推流进程（2026-09-21 R3 监督反例：枚举正确但邮件/面板
-        都写了"已停止"）。用户能区分：停止请求已受理 ≠ 停止结果已确认。
+    def notify_platform_outage_result(self, zone: str, result: str,
+                                      run_id: str, episode_id: int) -> str:
+        """仅对平台**已确认**断播的一次故障给出结论。
+
+        - ``recovered``：`[恢复]`，一次而已（同一故障身份去重）；
+        - ``failed``：`[异常]`，明确到了需要人工处理的程度；
+        - ``still_retrying``：`[异常]`，但只写**已确认的事实**——"持续无法确认
+          直播状态"，不写"已断播/已恢复"，也不写"仍会继续尝试"。
         """
-        stage_label = {'stopping': '停止中（正在清理）',
-                       'stopped': '已停止',
-                       'pending_recycle': '停止处理中（结果待确认）',
-                       'checkpoint_failed': '已停止（进度保存未确认）'}.get(
-                           stage, '结果待确认')
-        lead = ('直播停止结果' if stage == 'stopped'
-                else '直播停止进展（结果尚待确认）' if stage == 'pending_recycle'
-                else '直播停止结果')
-        facts = self._instance_facts()
-        facts.update({'分区': zone, '状态': stage_label,
-                      '已播': elapsed_label or '-'})
-        if stage == 'pending_recycle':
-            facts['说明'] = '仍有资源未确认回收，可再次点击停止重试'
-        body = (lead + '\n\n' + self._facts_lines(facts)
-                + f"\n时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        event_id = (EVENT_ACTION_REQUIRED
-                    if stage in ('pending_recycle', 'checkpoint_failed')
-                    else EVENT_STOPPED)
-        if stage == 'checkpoint_failed':
-            body = (f'{zone}的直播已停止，但进度未能确认保存。\n'
-                    '请在面板核对任务进度。')
-        subject = (f'停止未确认 · {zone}' if stage == 'pending_recycle'
-                   else f'直播进度保存失败 · {zone}'
-                   if stage == 'checkpoint_failed'
-                   else f'[{stage_label}] {zone}')
-        return self.notify_event(event_id, subject,
-                                 body, dedup_key=f'{zone}:{stage}')
-
-    def notify_task_complete(self, zone: str, business_date: str,
-                             scope: str = 'today', result: str = 'settled',
-                             progress: str = '') -> str:
-        """结算已提交之后才发；结果决定**事件类别与标题**。
-
-        - ``failed``：结算失败是"需人工确认"的异常——走 action_required、
-          服从**异常开关**，标题写"任务结算失败"。旧实现失败也发
-          task_complete、标题"[今日完成]"，用户关掉成功通知连失败提醒
-          一起消失（2026-09-21 N1）。
-        - ``already``：此前已结算——不冒充新完成，标题明确区分。
-        - ``settled``：真正的成功提交，才用"今日完成/全部完成"。
-        """
-        scope_label = {'today': '今日完成', 'all': '全部完成',
-                       'expired': '超期按规则结束'}.get(scope, '任务完成')
-        result_label = {'settled': '已提交', 'already': '此前已结算（未重复计天）',
-                        'failed': '结算失败，需人工确认'}.get(
-                            result, '结果待确认')
-        facts = self._instance_facts()
-        facts.update({'分区': zone, '业务日期': business_date,
-                      '完成类型': scope_label, '结果': result_label})
-        if progress:
-            facts['进度'] = progress
-        body = ('任务结算\n\n' + self._facts_lines(facts)
-                + f"\n时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        key = f'{run_id}:{episode_id}:platform-outage'
+        if result == 'recovered':
+            return self.notify_event(
+                EVENT_RECOVERED,
+                self._mail_subject(self.SUBJECT_RECOVERED, zone),
+                '\n'.join([self._event_time_line(),
+                            f'{zone}的直播间已重新开启，任务继续计时，无需操作。']),
+                dedup_key=key)
+        if result == 'still_retrying':
+            return self.notify_event(
+                EVENT_ACTION_REQUIRED,
+                self._mail_subject(self.SUBJECT_ABNORMAL, zone),
+                '\n'.join([self._event_time_line(),
+                            f'持续无法确认{zone}的直播状态，请在面板查看并处理。']),
+                dedup_key=f'{key}:pending')
         if result == 'failed':
             return self.notify_event(
                 EVENT_ACTION_REQUIRED,
-                f'[任务结算失败] {zone}',
-                body, dedup_key=f'{zone}:{business_date}:{scope}:failed')
-        if result == 'already':
-            subject = f'[此前已结算] {zone}'
-        else:
-            subject = f'[{scope_label}] {zone}'
+                self._mail_subject(self.SUBJECT_ABNORMAL, zone),
+                '\n'.join([self._event_time_line(),
+                            f'{zone}的直播未能恢复，请在面板查看并处理。']),
+                dedup_key=key)
+        raise ValueError(f'unsupported platform outage result: {result}')
+
+    def notify_action_required(self, title: str, reason: str,
+                               still_streaming: bool = False,
+                               action: str = '', identity: str = '',
+                               zone: str = '', when=None) -> str:
+        """需人工处理：`[异常]` + 处置方向；技术细节留在面板事件与日志。"""
+        lead = ('自动恢复未成功。' if title.startswith('自动恢复')
+                else '直播需要处理。')
+        body = '\n'.join([self._event_time_line(when), lead,
+                           '请打开面板查看原因并处理。'])
+        return self.notify_event(EVENT_ACTION_REQUIRED,
+                                 self._mail_subject(self.SUBJECT_ABNORMAL, zone),
+                                 body, dedup_key=f'{title}:{identity}')
+
+    def notify_start_failed(self, zone: str, identity: str = '',
+                            when=None, account_name: Optional[str] = None) -> str:
+        """首次开播的单一失败结果；平台错误详情留在面板。"""
         return self.notify_event(
-            EVENT_TASK_COMPLETE, subject,
-            body, dedup_key=f'{zone}:{business_date}:{scope}')
+            EVENT_ACTION_REQUIRED,
+            self._mail_subject(self.SUBJECT_ABNORMAL, zone, account_name),
+            '\n'.join([self._event_time_line(when),
+                        f'{zone}尚未确认直播间开启。',
+                        '请先在面板核对状态，再决定是否重试。']),
+            dedup_key=f'start-failed:{identity}')
+
+    def notify_stopped(self, zone: str, stage: str = 'stopped',
+                       elapsed_label: str = '', reason: str = '',
+                       elapsed_seconds=None, when=None,
+                       account_name: Optional[str] = None) -> str:
+        """真实停止结果：停止中/已停止/结果待确认分别表述。
+
+        ``pending_recycle``（清理未确认）与 ``checkpoint_failed``（进度落盘失败）
+        是独立的已确认问题，按 `[异常]` 发送——不能让正文既说"已停止"又说
+        "结果未确认"。
+        """
+        if stage == 'stopped':
+            subject = self._mail_subject(self.SUBJECT_STOP, zone, account_name)
+            lines = [self._event_time_line(when), f'{zone}的直播已停止。']
+            counted = (self._duration_label(elapsed_seconds)
+                       if elapsed_seconds is not None
+                       else (str(elapsed_label) if elapsed_label else '0秒（0秒）'))
+            lines.append(f'本次已计时：{counted}。')
+            body = '\n'.join(lines)
+        elif stage == 'pending_recycle':
+            subject = self._mail_subject(self.SUBJECT_ABNORMAL, zone, account_name)
+            body = '\n'.join([
+                self._event_time_line(when),
+                f'{zone}的停止请求已受理，但结果待确认。',
+                '请在面板核对直播状态；若仍在播，可再次点击停止。'])
+        elif stage == 'checkpoint_failed':
+            subject = self._mail_subject(self.SUBJECT_ABNORMAL, zone, account_name)
+            body = '\n'.join([
+                self._event_time_line(when),
+                f'{zone}的直播已停止，但本次进度未能确认保存。',
+                '请在面板核对任务进度。'])
+        else:
+            subject = self._mail_subject(self.SUBJECT_STOP, zone, account_name)
+            body = '\n'.join([self._event_time_line(when),
+                               f'{zone}正在停止。'])
+        event_id = (EVENT_ACTION_REQUIRED if stage in (
+            'pending_recycle', 'checkpoint_failed') else EVENT_STOPPED)
+        return self.notify_event(event_id, subject, body,
+                                 dedup_key=f'{zone}:{stage}')
+
+    def notify_task_complete(self, zone: str, business_date: str,
+                             scope: str = 'today', result: str = 'settled',
+                             progress: str = '', when=None,
+                             effective_seconds=None,
+                             account_name: Optional[str] = None) -> str:
+        """结算**已提交**之后才发；结果决定类别与标题。
+
+        - ``failed``：结算失败是需要人工确认的异常 → `[异常]`，服从异常开关；
+        - ``already``：此前已结算，不冒充新完成；
+        - 其余按 `[轮转]`："今天的当天完成/全部完成/已到期" 都属于一次任务推进。
+        """
+        if result == 'failed':
+            return self.notify_event(
+                EVENT_ACTION_REQUIRED,
+                self._mail_subject(self.SUBJECT_ABNORMAL, zone, account_name),
+                '\n'.join([self._event_time_line(when),
+                            f'{zone}本次直播的有效天数尚未确认计入。',
+                            '请到面板核对进度。']),
+                dedup_key=f'{zone}:{business_date}:{scope}:failed')
+        lines = [self._event_time_line(when)]
+        if result == 'already':
+            body_tail = (f'{zone}在 {business_date} 的完成记录此前已计入，'
+                         '本次未重复计天。')
+        elif scope == 'all':
+            body_tail = f'{zone}需要的直播天数已全部完成。'
+        elif scope == 'expired':
+            body_tail = f'{zone}的任务截止日已到，本次直播已结束。'
+        else:
+            body_tail = f'{business_date} 的直播已计入{zone}的任务进度。'
+        lines.append(body_tail)
+        if effective_seconds is not None:
+            lines.append(f'本次有效时长：{self._duration_label(effective_seconds)}。')
+        if progress and result == 'settled':
+            lines.append(f'{progress}。')
+        return self.notify_event(
+            EVENT_TASK_COMPLETE,
+            self._mail_subject(self.SUBJECT_ROTATION, zone, account_name),
+            '\n'.join(lines), dedup_key=f'{zone}:{business_date}:{scope}')
 
     @staticmethod
     def _task_duration_label(duration_seconds) -> str:
         try:
-            seconds = max(0, int(duration_seconds))
+            seconds = int(duration_seconds or 0)
         except (TypeError, ValueError, OverflowError):
             return '未知'
-        hours, remainder = divmod(seconds // 60, 60)
-        if hours and remainder:
-            return f'{hours} 小时 {remainder} 分钟'
-        if hours:
-            return f'{hours} 小时'
-        return f'{remainder} 分钟'
-
-    def _rotation_verification_body(self, zone: str, verify_url: str,
-                                    confirm_url: str) -> str:
-        lines = [f'{zone or "下一任务"}：开播需要人脸验证。']
-        if verify_url:
-            lines.extend(['验证页面：', verify_url])
-        if confirm_url and not self._is_loopback_url(confirm_url):
-            lines.extend(['验证完成入口：', confirm_url])
-        else:
-            lines.append('验证完成入口：请在系统面板点击“验证完成”。')
-        return '\n'.join(lines)
+        if seconds <= 0:
+            return '不限时'
+        return EmailSender._duration_label(seconds)
 
     @staticmethod
-    def _is_loopback_url(url: str) -> bool:
-        from urllib.parse import urlsplit
+    def _effective_duration_label(effective_seconds) -> str:
         try:
-            host = (urlsplit(str(url)).hostname or '').strip().lower()
-        except Exception:
-            return True
-        if host == 'localhost' or host.endswith('.localhost'):
-            return True
-        try:
-            return ipaddress.ip_address(host).is_loopback
-        except ValueError:
-            return not bool(host)
+            seconds = max(0, int(effective_seconds))
+        except (TypeError, ValueError, OverflowError):
+            return '未知'
+        return EmailSender._duration_label(seconds)
 
-    def notify_task_rotation(self, completion: Optional[dict] = None,
-                             next_task: Optional[dict] = None,
-                             result: Optional[str] = None,
+    def notify_task_rotation(self, completion: Optional[dict],
+                             next_task: Optional[dict],
+                             next_result: str,
                              verify_url: str = '',
                              confirm_url: str = '',
                              reason: str = '',
                              late_update: bool = False,
                              identity: str = '',
-                             next_result: Optional[str] = None) -> str:
-        """Combine a frozen A completion with B's observed rotation result.
+                             when=None,
+                             account_name: Optional[str] = None) -> str:
+        """一封冻结 A 完成事实与 B 实际开播结果的 `[轮转]` 邮件。
 
-        A started result means the platform confirmed the room is live. A
-        queued background start must use preparing until its real outcome
-        arrives. next_result is also accepted for server-compatible callers.
+        ``next_result`` 只接受由开播线程确认的 ``started``、``failed``、
+        ``verification``、``preparing`` 或无待办 ``none``。B 尚在等待而结果未知
+        时不发"准备中"邮件；B 需人脸验证时发 `[人脸]`，明确失败时发 `[异常]`，
+        两种情况都如实带上 A 已确认的完成事实。
         """
         completion = completion or {}
         next_task = next_task or {}
-        outcome = next_result or result or 'failed'
-        supported = {
-            'started', 'failed', 'verification', 'preparing', 'none',
-            'paused', 'cancelled', 'started_then_stopped',
-        }
-        if outcome not in supported:
-            raise ValueError(f'unsupported task rotation result: {outcome}')
-
         zone_a = str(completion.get('zone') or '上一任务')
         zone_b = str(next_task.get('zone') or '')
+        # 署名取**冻结**的账号显示名：晚投递（已退出/换账号）仍署名原账号。
+        account = self._summary_account_name(account_name)
+        time_line = self._event_time_line(when)
+
         if late_update:
-            if outcome == 'started':
-                event_id = EVENT_STREAM_RUNNING
-                subject = f'下一任务已开播 · {zone_b or "任务"}'
-                body = (f'{zone_b or "下一任务"}：直播间已开启。\n'
-                        '画面与持续推流请以面板为准。')
-            elif outcome == 'verification':
-                event_id = EVENT_ACTION_REQUIRED
-                subject = f'下一任务需要验证 · {zone_b or "任务"}'
-                body = self._rotation_verification_body(
-                    zone_b, verify_url, confirm_url)
-            elif outcome == 'preparing':
+            event_id = (EVENT_STREAM_RUNNING if next_result == 'started'
+                        else EVENT_ACTION_REQUIRED)
+            if next_result == 'started':
+                subject = self._mail_subject(self.SUBJECT_ROTATION,
+                                             zone_b or '下一任务', account_name)
+                body = '\n'.join([time_line,
+                                   f'{zone_b or "下一任务"}已开播。'])
+            elif next_result == 'verification':
+                subject = self._mail_subject(self.SUBJECT_FACE,
+                                             zone_b or '下一任务', account_name)
+                body = self._face_lines(time_line, zone_b or '下一任务',
+                                        verify_url, confirm_url)
+            elif next_result == 'preparing':
+                # B 的结果还未知：不替它下结论，也不发送过程邮件。
+                logger.debug('轮转 B 仍在准备，暂不发送结果邮件：%s', zone_b)
+                return 'suppressed'
+            elif next_result == 'cancelled':
+                subject = self._mail_subject(self.SUBJECT_ROTATION, zone_a, account_name)
+                body = '\n'.join([time_line,
+                                   f'{zone_b or "下一任务"}的开播等待已取消；'
+                                   f'当前未确认直播间开启。'])
                 event_id = EVENT_TASK_ROTATION
-                subject = f'下一任务仍在准备 · {zone_b or "任务"}'
-                body = f'{zone_b or "下一任务"}尚未开播，系统继续尝试。'
-            elif outcome == 'cancelled':
-                event_id = EVENT_TASK_ROTATION
-                subject = f'下一任务等待已取消 · {zone_b or "任务"}'
-                body = (f'{zone_b or "下一任务"}的开播等待已取消；'
-                        '当前未确认直播间开启。')
-            elif outcome == 'started_then_stopped':
+            elif next_result == 'started_then_stopped':
+                subject = self._mail_subject(self.SUBJECT_STOP,
+                                             zone_b or '下一任务', account_name)
+                body = '\n'.join([time_line,
+                                   f'{zone_b or "下一任务"}已确认开启，随后收到停止请求。'])
                 event_id = EVENT_STOPPED
-                subject = f'下一任务开播后收到停止请求 · {zone_b or "任务"}'
-                body = (f'{zone_b or "下一任务"}已确认开启，随后收到停止请求；'
-                        '最终状态请以面板为准。')
             else:
-                event_id = EVENT_ACTION_REQUIRED
-                subject = f'下一任务开播未成功 · {zone_b or "任务"}'
-                body = (f'{zone_b or "下一任务"}：开播未成功，系统未确认直播间开启。'
-                        '请查看面板与日志。')
+                subject = self._mail_subject(self.SUBJECT_ABNORMAL,
+                                             zone_b or '下一任务', account_name)
+                body = '\n'.join([time_line,
+                                   f'{zone_b or "下一任务"}开播未成功，未确认直播间开启。',
+                                   '请查看面板与日志。'])
+            # 晚投递同样署名**冻结**的账号（见本函数开头）：主题与正文一致，
+            # 用户已退出/换号之后才投出去的结果不会被误读成新账号的动作。
+            body = '\n'.join([body, f'账号：{account}。'])
         else:
+            duration_label = self._task_duration_label(
+                next_task.get('duration_seconds')) if next_task else '未知'
             lines = []
             if completion:
-                lines.extend([
-                    f'已完成任务：{zone_a}',
-                    f'执行日：{completion.get("execution_date") or "未取得"}',
-                    '有效时长：' + self._task_duration_label(
-                        completion.get('effective_seconds')),
-                ])
+                lines.append(
+                    f'{zone_a}已完成（执行日 {completion.get("execution_date") or "未取得"}）。')
+                effective = completion.get('effective_seconds')
+                lines.append('有效时长：' + (self._duration_label(effective)
+                                            if effective is not None else '未知'))
                 days_done = completion.get('days_done')
-                lines.append(f'累计完成：{days_done} 天'
-                             if days_done is not None
+                lines.append(f'累计完成：{days_done} 天' if days_done is not None
                              else '累计完成天数：未取得')
-            if outcome == 'none':
+            if next_result == 'none':
                 lines.append('没有下一个待执行任务。')
                 event_id = EVENT_TASK_ROTATION
-                subject = f'任务完成 · {zone_a}'
+                subject = self._mail_subject(self.SUBJECT_ROTATION, zone_a, account_name)
             elif not next_task:
-                if outcome == 'paused':
+                if next_result == 'paused':
+                    reason_label = f'（{reason}）' if reason else ''
                     lines.append(
-                        '自动轮转已暂停；状态核对未通过，下一任务尚未启动。')
+                        f'自动轮转已暂停{reason_label}；下一任务尚未启动。')
                     event_id = EVENT_TASK_ROTATION
-                    subject = f'任务完成，自动轮转暂停 · {zone_a}'
-                elif outcome == 'cancelled':
+                    subject = self._mail_subject(self.SUBJECT_ROTATION, zone_a, account_name)
+                elif next_result == 'cancelled':
                     lines.append('轮转已停止；下一任务尚未确认开播。')
                     event_id = EVENT_TASK_ROTATION
-                    subject = f'任务轮转已停止 · {zone_a}'
+                    subject = self._mail_subject(self.SUBJECT_ROTATION, zone_a, account_name)
                 else:
+                    reason_label = f'（{reason}）' if reason else ''
                     lines.append(
-                        '下一任务未能选出或启动（状态核对未通过），'
-                        '当前没有确认开播结果；请查看面板。')
+                        f'下一任务未能选出或启动{reason_label}；'
+                        f'当前没有确认开播结果，请查看面板。')
                     event_id = EVENT_ACTION_REQUIRED
-                    subject = f'任务轮转需处理 · {zone_a}'
+                    subject = self._mail_subject(self.SUBJECT_ABNORMAL, zone_a, account_name)
             else:
-                lines.extend([
-                    f'下一个任务：{zone_b or "未取得"}',
-                    '目标时长：' + self._task_duration_label(
-                        next_task.get('duration_seconds')),
-                ])
-                if outcome == 'started':
-                    lines.append('结果：直播间已开启；画面与持续推流请以面板为准。')
+                lines.append(f'下一个任务：{zone_b or "未取得"}')
+                lines.append(f'目标时长：{duration_label}')
+                if next_result == 'started':
+                    lines.append(
+                        f'结果：{zone_b or "下一任务"}已开播。')
+                    # 合并信同时承载 A 完成与 B 开播。若用户关闭了完成邮件，
+                    # 但保留开播邮件，仍按开播开关送出这封结果邮件。
                     try:
                         config = self._load_config()
                     except Exception:
@@ -815,82 +1043,85 @@ class EmailSender:
                                 if config.get('notify_complete', True)
                                 or not config.get('notify_start', True)
                                 else EVENT_STREAM_RUNNING)
-                    subject = f'任务轮转完成 · {zone_a} → {zone_b or "下一任务"}'
-                elif outcome == 'verification':
-                    lines.append('结果：开播需要人脸验证，尚未确认直播间开启。')
-                    lines.extend(self._rotation_verification_body(
-                        zone_b, verify_url, confirm_url).splitlines())
+                    subject = self._mail_subject(
+                        self.SUBJECT_ROTATION,
+                        f'{zone_a} → {zone_b or "下一任务"}' if zone_a else zone_b,
+                        account_name)
+                elif next_result == 'verification':
+                    # 不在这里提前 return：下面还有"异常开关关闭但完成通知打开"
+                    # 的保护，提前返回会把 A 已结算的事实一起静默吞掉。
+                    lines.append(
+                        f'结果：{zone_b or "下一任务"}开播需要人脸验证，'
+                        f'尚未确认直播间开启。')
+                    lines.append(
+                        f'请先打开 B 站验证页面：{verify_url or "未取得"}')
+                    lines.append(
+                        f'验证完成入口：{confirm_url or "请在面板点击“验证完成”"}')
                     event_id = EVENT_ACTION_REQUIRED
-                    subject = f'任务轮转需验证 · {zone_b or "下一任务"}'
-                elif outcome == 'preparing':
-                    lines.append(f'结果：{zone_b or "下一任务"}尚未开播，系统继续尝试。')
-                    event_id = EVENT_TASK_ROTATION
-                    subject = f'下一任务准备中 · {zone_b or "任务"}'
-                elif outcome == 'cancelled':
+                    subject = self._mail_subject(self.SUBJECT_FACE,
+                                                 zone_b or '下一任务', account_name)
+                elif next_result == 'preparing':
+                    # B 的结果未知：不发"准备中"，等结果确定后再报。
+                    logger.debug('轮转 B 仍在准备，暂不发送合并结果邮件：%s', zone_b)
+                    return 'suppressed'
+                elif next_result == 'cancelled':
                     lines.append('结果：轮转已停止；下一任务尚未确认开播。')
                     event_id = EVENT_TASK_ROTATION
-                    subject = f'任务轮转已停止 · {zone_a} → {zone_b or "下一任务"}'
-                elif outcome == 'started_then_stopped':
-                    lines.append('结果：直播间已确认开启，随后收到停止请求；最终状态请以面板为准。')
+                    subject = self._mail_subject(
+                        self.SUBJECT_ROTATION,
+                        f'{zone_a} → {zone_b or "下一任务"}' if zone_a else zone_b,
+                        account_name)
+                elif next_result == 'started_then_stopped':
+                    lines.append('结果：已确认开启，随后收到停止请求。')
                     event_id = EVENT_TASK_ROTATION
-                    subject = f'任务轮转后收到停止请求 · {zone_a} → {zone_b or "下一任务"}'
+                    subject = self._mail_subject(
+                        self.SUBJECT_STOP,
+                        f'{zone_a} → {zone_b or "下一任务"}' if zone_a else zone_b,
+                        account_name)
                 else:
-                    lines.append('结果：开播未成功，系统未确认直播间开启。请查看面板与日志。')
+                    lines.append('结果：开播未成功，未确认直播间开启。请查看面板与日志。')
                     event_id = EVENT_ACTION_REQUIRED
-                    subject = f'任务轮转需处理 · {zone_b or "下一任务"}'
+                    subject = self._mail_subject(self.SUBJECT_ABNORMAL,
+                                                 zone_b or '下一任务', account_name)
+            lines.insert(0, time_line)
+            lines.append(f'账号：{account}。')
             body = '\n'.join(lines)
 
-            # Keep A's committed completion visible when the error channel is
-            # disabled but completion mail remains enabled.
-            if completion and outcome in ('failed', 'verification'):
-                try:
-                    config = self._load_config()
-                except Exception:
-                    config = {}
-                if (not config.get('notify_error', True)
-                        and config.get('notify_complete', True)):
-                    event_id = EVENT_TASK_ROTATION
+        if (not late_update and completion
+                and next_result in ('failed', 'verification')):
+            # B 的异常邮件默认走异常开关；若异常通知关闭而 A 的完成通知打开，
+            # 仍送出这封合并结果，避免 A 已结算的事实被一起静默吞掉。
+            try:
+                config = self._load_config()
+            except Exception:
+                config = {}
+            if (not config.get('notify_error', True)
+                    and config.get('notify_complete', True)):
+                event_id = EVENT_TASK_ROTATION
 
-        stage = 'late' if late_update else 'initial'
-        dedup = f'task-rotation:{identity or zone_a}:{stage}:{outcome}'
+        stage_key = 'late' if late_update else 'initial'
+        dedup = f'task-rotation:{identity or zone_a}:{stage_key}:{next_result}'
         return self.notify_event(
-            event_id, subject, body, dedup_key=dedup)
+            event_id, subject, body, dedup_key=dedup,
+            _ordering_key=f'task-rotation:{identity or zone_a}')
 
-    def notify_platform_outage_result(self, zone: str, result: str,
-                                      run_id: str, episode_id: int) -> str:
-        """Send one episode-scoped outcome for a confirmed room outage."""
-        key = f'{run_id}:{episode_id}:platform-outage'
-        if result == 'recovered':
-            return self.notify_event(
-                EVENT_RECOVERED, f'直播连接已恢复 · {zone}',
-                f'{zone}的直播间已重新开启。\n画面请以直播间为准。',
-                dedup_key=key)
-        if result == 'still_retrying':
-            return self.notify_event(
-                EVENT_ACTION_REQUIRED, f'直播仍未恢复 · {zone}',
-                (f'{zone}的直播间中断已持续一段时间，系统仍在重试。\n'
-                 '若之后收到恢复结果，请以结果邮件为准。'),
-                dedup_key=f'{key}:pending')
-        if result == 'failed':
-            return self.notify_event(
-                EVENT_ACTION_REQUIRED, f'直播连接未能恢复 · {zone}',
-                f'{zone}的自动恢复已停止，需要你在面板查看并处理。',
-                dedup_key=key)
-        raise ValueError(f'unsupported platform outage result: {result}')
+    def _face_lines(self, time_line: str, zone: str, verify_url: str,
+                    confirm_url: str) -> str:
+        """人脸验证的统一正文段（不含年月日之外的夸大承诺）。"""
+        lines = [time_line,
+                 f'{zone}开播需要人脸验证。',
+                 f'请先打开 B 站验证页面：{verify_url or "未取得"}']
+        if confirm_url:
+            lines.append(f'验证后打开确认链接，点击“验证完成”：{confirm_url}')
+        else:
+            lines.append('验证后请在面板点击“验证完成”。')
+        return '\n'.join(lines)
 
     def send_daily_summary(self, stats: dict, top5: list,
-                           summary_date=None,
-                           snapshot_meta: Optional[dict] = None,
-                           brief: bool = False) -> str:
-        """Render a daily summary from one frozen task snapshot.
-
-        Production uses the short brief with Top10 priorities. The compatibility
-        format remains available to offline callers and also omits local
-        instance details, capture timestamps, and revisions.
-        """
-        if brief:
-            return self._send_brief_daily_summary(
-                stats, top5, summary_date, snapshot_meta)
+                           summary_date=None, snapshot_meta: Optional[dict] = None,
+                           account_name: Optional[str] = None
+                           ) -> str:
+        """简短汇报冻结快照；统计日完成数不与当前待办混为一日。"""
         stats = stats or {}
         top5 = top5 or []
         meta = snapshot_meta or {}
@@ -898,11 +1129,9 @@ class EmailSender:
             datetime.now().strftime('%Y-%m-%d')
         instance = self._instance_label()
 
-        def field(key, default='未取得'):
+        def field(key):
             value = stats.get(key)
-            if value is None:
-                return default
-            return escape_html(value)
+            return '未取得' if value is None else escape_html(value)
 
         # 完成标记的归属窗口（R2）：只有窗口 == 统计日时，完成数才能写成
         # "当日已完成 N"。窗口是别的日子（多日未重置/延迟重置）或未知
@@ -913,143 +1142,62 @@ class EmailSender:
         done_confident = bool(done_flags.get('confident'))
         window_matches_day = (done_confident and summary_date is not None
                               and done_window == summary_date)
-        done_value = field('today_done') if window_matches_day else '未取得'
-        if window_matches_day:
-            day_note = ''
-        elif done_confident and done_window is not None:
-            if not done_flags.get('done_rows'):
-                day_note = (f'自 {escape_html(done_window.strftime("%Y-%m-%d"))} '
-                            '的重置以来无完成记录；该口径不按统计日拆分，'
-                            '不并入本简报')
-            else:
-                day_note = (f'最近完成标记日为 '
-                            f'{escape_html(done_window.strftime("%Y-%m-%d"))}'
-                            '（非统计日），完成结果不并入本简报')
-        else:
-            day_note = '完成标记缺少可归属的业务日（字段缺失或与重置边界不一致）'
+        done_available = window_matches_day and stats.get('today_done') is not None
+        done_value = (f"{field('today_done')} 项" if done_available else '待确认')
+        done_note = ('' if done_available else
+                     '<p>完成数暂未核实，请以面板记录为准。</p>')
 
-        day_note_row = (f'<tr><td colspan="2" style="color:#909399">'
-                        f'{escape_html(day_note)}</td></tr>') if day_note else ''
-
-        rows = ''
-        for i, t in enumerate(top5, 1):
-            remaining = t.get('remaining_exec_days', t.get('remaining_days'))
-            remaining_label = remaining if remaining is not None else '未取得'
-            rows += (
-                f"<tr><td>{i}</td><td>{escape_html(t.get('zone_name', ''))}</td>"
-                f"<td>{escape_html(t.get('priority', ''))}</td>"
-                f"<td>{escape_html(t.get('days_done', ''))}/"
-                f"{escape_html(t.get('actual_days', ''))}</td>"
-                f"<td>{escape_html(remaining_label)}</td></tr>")
-
-        body = f"""<html><body>
-<h2>每日直播简报</h2>
-<p><b>统计日期：</b>{escape_html(day_label)}</p>
-<hr>
-<h3>统计日（{escape_html(day_label)}）执行结果</h3>
-<table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse">
-<tr><td><b>当日已完成</b></td><td>{done_value}</td></tr>
-<tr><td><b>待执行任务（当前口径）</b></td><td>{field('today_pending')}</td></tr>
-{day_note_row}
-</table>
-<hr>
-<h3>当前待办</h3>
-<table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse">
-<tr><td><b>待完成任务</b></td><td>{field('pending_total')}</td></tr>
-<tr><td><b>剩余时间</b></td><td>{field('remaining_time')} 小时</td></tr>
-<tr><td><b>平均剩余</b></td><td>{field('avg_remaining')} 天（截止松弛 + 待执行天数，既有公式）</td></tr>
-<tr><td><b>紧迫率</b></td><td>{field('urgency')}（剩余时间 ÷ (平均剩余×20)，仅参考）</td></tr>
-</table>
-<h4>优先度最高 Top5（"剩余"为还需执行天数，已完成任务为 0）</h4>
-<table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse">
-<tr><th>#</th><th>分区</th><th>优先度</th><th>进度</th><th>剩余待执行天数</th></tr>
-{rows}
-</table>
-<p style="color:#909399;font-size:12px">桌面直播控制 · 实际直播时长以有效时长统计为准</p>
-</body></html>"""
-        return self.notify_event(
-            EVENT_DAILY_SUMMARY,
-            f"每日简报 · {instance} · {day_label}",
-            body, html=True,
-            dedup_key=f'{instance}:{day_label}')
-
-    def _send_brief_daily_summary(self, stats: dict, top_tasks: list,
-                                  summary_date=None,
-                                  snapshot_meta: Optional[dict] = None) -> str:
-        """Render the approved short brief from the same frozen snapshot."""
-        stats = stats or {}
-        top_tasks = top_tasks or []
-        meta = snapshot_meta or {}
-        day_label = summary_date.strftime('%Y-%m-%d') if summary_date else \
-            datetime.now().strftime('%Y-%m-%d')
-        instance = self._instance_label()
-
-        def plain(value, default='未取得'):
-            if value is None:
-                return default
-            return str(value).replace('\r', ' ').replace('\n', ' ').strip()
-
-        done_flags = meta.get('done_flags') or {}
-        done_window = done_flags.get('window')
-        done_confident = bool(done_flags.get('confident'))
-        done_is_for_day = (done_confident and summary_date is not None
-                           and done_window == summary_date)
-        if done_is_for_day and stats.get('today_done') is not None:
-            completed = f'{plain(stats.get("today_done"))} 项'
-        else:
-            completed = '待确认'
-
-        pending = plain(stats.get('pending_total'))
         remaining = stats.get('remaining_time')
-        remaining_label = ('未取得' if remaining is None
-                           else f'约 {plain(remaining)} 小时')
+        remaining_label = ('未取得' if remaining is None else
+                           f'约 {escape_html(remaining)} 小时')
         try:
             urgency = float(stats.get('urgency'))
-            if not math.isfinite(urgency) or urgency < 0:
-                raise ValueError('invalid urgency')
-            urgency_label = (
-                f'{urgency * 100:.2f}'.rstrip('0').rstrip('.') + '%')
+            urgency_label = ('未取得' if not math.isfinite(urgency) or urgency < 0
+                             else f'{urgency * 100:.2f}'.rstrip('0').rstrip('.') + '%')
         except (TypeError, ValueError, OverflowError):
             urgency_label = '未取得'
 
-        lines = [
-            f'{day_label} 直播简报',
-            '',
-            f'当日完成：{completed}',
-            f'当前待办：{pending} 项',
-            f'计划剩余直播：{remaining_label}',
-            f'紧迫率：{urgency_label}',
-        ]
-        priorities = []
-        for task in top_tasks[:10]:
-            name = plain(task.get('zone_name'), '')
-            priority = plain(task.get('priority'))
-            days_done = task.get('days_done')
-            actual_days = task.get('actual_days')
-            remaining_days = task.get(
-                'remaining_exec_days', task.get('remaining_days'))
-            if days_done is not None and actual_days is not None:
-                progress = (f'已完成 {plain(days_done)}/{plain(actual_days)} 天')
-            else:
-                progress = '进度待确认'
-            if remaining_days is not None:
-                progress += f'，还需 {plain(remaining_days)} 天'
-            priorities.append(
-                f'{len(priorities) + 1}. {name}：优先度 {priority}，{progress}')
-        if priorities:
-            lines.extend(['', '接下来优先', *priorities])
+        priority_rows = ''
+        for t in top5[:10]:
+            remaining = t.get('remaining_exec_days', t.get('remaining_days'))
+            done = t.get('days_done')
+            total = t.get('actual_days')
+            priority = t.get('priority')
+            priority_label = ('未取得' if priority is None else
+                              escape_html(priority))
+            progress = (f'已完成 {escape_html(done)}/{escape_html(total)} 天'
+                        if done is not None and total is not None else '进度待确认')
+            if remaining is not None:
+                progress += f'，还需 {escape_html(remaining)} 天'
+            priority_rows += (f'<li>{escape_html(t.get("zone_name", ""))}：'
+                              f'优先度 {priority_label}，{progress}</li>')
+        priority_section = (f'<h3>接下来优先</h3><ol>{priority_rows}</ol>'
+                            if priority_rows else '')
 
-        body = '\n'.join(lines)
+        body = f"""<html><body>
+<h2>{escape_html(day_label)} 直播简报</h2>
+<p>当日完成：{done_value}</p>
+{done_note}
+<p>当前待办：{field('pending_total')} 项<br>
+计划剩余直播：{remaining_label}<br>
+紧迫率：{urgency_label}</p>
+{priority_section}
+</body></html>"""
         return self.notify_event(
             EVENT_DAILY_SUMMARY,
-            f'每日简报 · {instance} · {day_label}',
-            body, dedup_key=f'{instance}:{day_label}')
+            self._mail_subject(self.SUBJECT_SUMMARY, day_label, account_name),
+            body, html=True,
+            dedup_key=f'{instance}:{day_label}')
 
     def send_test(self) -> str:
         """渠道测试：等待真实投递结果（排队不等于已发送）。"""
-        body = (f"这是一封来自 直播控制系统的测试邮件。\n\n"
-                f"时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        return self.notify_event(EVENT_TEST, '[测试] 推送测试', body, wait=True)
+        return self.notify_event(
+            EVENT_TEST,
+            self._mail_subject(self.SUBJECT_TEST),
+            '\n'.join([self._event_time_line(),
+                        '这是一封人工触发的渠道测试邮件，'
+                        '用于确认通知可以送达此邮箱。']),
+            wait=True)
 
     # ---------- 兼容旧调用名 ----------
 
@@ -1198,7 +1346,10 @@ class EmailSender:
                          epoch: int = None, still_streaming: bool = False,
                          stage: str = 'start_blocked',
                          local_stop_requested: bool = False,
-                         **intent) -> str:
+                         defer_notification: bool = False,
+                         when=None,
+                         account_name: Optional[str] = None,
+                         **intent) -> Any:
         """发送人脸验证邮件（一封、带阶段事实与确认入口）。
 
         ``stage`` 冻结触发背景：``start_blocked``（首次开播被拦）/
@@ -1217,65 +1368,55 @@ class EmailSender:
                                              stage=stage,
                                              **intent)
         stage_label = self._FACE_VERIFY_STAGE_LABELS.get(stage, '需要人脸验证')
+        zone = re.sub(r'[\x00-\x1f\x7f]+', ' ',
+                      str(intent.get('zone') or '')).strip()[:40]
+        account = self._summary_account_name(account_name)
+        # 同一封邮件只解析一次 host；避免后台探测刚好在两次读取之间完成，
+        # 让可用判断与最终链接使用不同地址。
         server_host = self._get_server_host()
-        # A confirmation link is included only when an externally reachable
-        # host was configured. The panel remains the desktop fallback.
-        host_usable = bool(server_host)
-        lines = [stage_label, '']
+        host_usable = bool(server_host) and server_host != 'localhost'
+        # 人脸邮件同样要带事件发生时间到秒（除日报外每封都带）。
+        lines = [self._event_time_line(when),
+                 f'{zone}：{stage_label}。' if zone else f'{stage_label}。',
+                 '', '请先打开 B 站验证页面：', verify_url]
         if host_usable:
-            confirm_url = self._confirm_url(token)
-            lines += ['请点击以下链接确认验证完成：',
-                      confirm_url,
-                      '',
-                      '或在系统面板的验证弹窗中点击"验证完成"。']
+            confirm_url = self._confirm_url(token, server_host=server_host)
+            lines += ['', '验证后打开以下链接，点击“验证完成”：',
+                      confirm_url]
         else:
-            # 公共确认地址缺失时不生成 localhost 假链接（外部点了打不开，
-            # 还像钓鱼邮件）：给出明确的面板替代指引（2026-09-21 N4）。
-            lines += ['当前未配置公网访问地址，无法生成可点击的确认链接。',
-                      '请打开系统面板，在验证弹窗中点击"验证完成"。']
-        lines += ['', 'B站验证页面：', verify_url, '']
+            # 地址不可用时不暴露配置细节，更不能拼出 localhost 假链接。
+            lines += ['', '邮件确认链接暂不可用。',
+                      '验证后请在面板点击“验证完成”。']
         if stage == 'status_query':
-            lines.append('处置说明：本路径仅提示验证，未停止推流；'
-                         '实际是否在播以面板状态为准。')
+            lines += ['', '系统未停止推流。']
         elif local_stop_requested:
-            lines.append('处置说明：本路径已请求停止本地推流；'
-                         '完成验证后可在面板重试开播。')
-        else:
-            lines.append('处置说明：本路径未停止推流；'
-                         '如需中断请先在面板点停止。')
-        lines += ['', f'时间：{datetime.now().strftime("%Y-%m-%d %H:%M:%S")}']
+            lines += ['', '系统已请求停止推流。']
+        if defer_notification:
+            return {
+                'verify_url': verify_url,
+                'confirm_url': confirm_url if host_usable else '',
+            }
         return self.notify_event(
             EVENT_ACTION_REQUIRED,
-            f'[需要人脸验证] {stage_label}',
+            self._mail_subject(self.SUBJECT_FACE, zone, account_name),
             '\n'.join(lines),
             dedup_key=f'face_verify:{stage}:{run_id or room_id or ""}',
         )
 
-    def _confirm_url(self, token: str) -> str:
-        server_host = self._get_server_host()
+    def _confirm_url(self, token: str, server_host: Optional[str] = None) -> str:
+        server_host = _normalize_public_host(
+            server_host if server_host is not None else self._get_server_host())
         if not server_host:
             return ''
-        from urllib.parse import urlsplit
-        if '://' in server_host:
-            base = server_host.rstrip('/')
-        else:
-            scheme = 'https' if os.environ.get('API_SSL') else 'http'
-            parsed = urlsplit(f'//{server_host}')
-            host_port = server_host
-            if not parsed.port:
-                host_port = f"{server_host}:{os.environ.get('API_PORT', '8000')}"
-            base = f'{scheme}://{host_port}'
-        return (f'{base}/api/email/confirm-face-verify'
-                f'?token={token}')
-
-    def start_face_verify_server(self):
-        """Compatibility no-op: desktop FastAPI owns the confirmation route.
-
-        The old desktop sender opened a second HTTP listener.  Keeping the
-        method lets the existing lifespan call remain harmless while ensuring
-        there is exactly one local confirmation service.
-        """
-        return None
+        try:
+            port = int(os.environ.get('API_PORT', '8000'))
+        except (TypeError, ValueError):
+            port = 8000
+        if not 1 <= port <= 65535:
+            port = 8000
+        # Match run.py exactly: only the value set when TLS is configured enables https.
+        scheme = 'https' if os.environ.get('API_SSL') == '1' else 'http'
+        return f"{scheme}://{server_host}:{port}/api/email/confirm-face-verify?token={token}"
 
     # ---------- 人脸验证确认后的重试 ----------
 
@@ -1315,15 +1456,14 @@ class EmailSender:
                 return
             # 房间也是身份的一部分：同一 run 名在不同房间号下不代表同一场。
             frozen_room = intent.get('room_id')
-            if frozen_room is not None \
-                    and getattr(lc, 'current_room_id', None) is not None:
-                try:
-                    if int(frozen_room) != int(lc.current_room_id):
-                        logger.info("人脸验证确认属于另一个房间，不再重试开播")
-                        return
-                except (TypeError, ValueError):
-                    logger.info("人脸验证确认的房间号不可比对，不再重试开播")
+            try:
+                if (frozen_room is None or int(frozen_room) <= 0
+                        or int(frozen_room) != int(getattr(lc, 'current_room_id', 0) or 0)):
+                    logger.info("人脸验证确认属于另一个或不可核对的房间，不再重试开播")
                     return
+            except (TypeError, ValueError):
+                logger.info("人脸验证确认的房间号不可比对，不再重试开播")
+                return
             # 身份冻结：本场会话必须是确认时那一场（不能重新读"当前"代际复活旧意图）
             current_run = (getattr(lc, '_current_run_id', '')
                            or getattr(lc, '_pending_run_id', '')
@@ -1336,7 +1476,25 @@ class EmailSender:
                     and not checker(frozen_epoch):
                 logger.info("人脸验证确认的控制代际已过期，不再重试开播")
                 return
-            instruction = getattr(lc, 'current_instruction', None)
+            instruction = None
+            frozen_instruction = intent.get('instruction')
+            if isinstance(frozen_instruction, dict):
+                try:
+                    from app.models.schemas import LiveInstruction
+                    instruction = LiveInstruction(**frozen_instruction)
+                except Exception:
+                    logger.info("冻结的人脸验证指令无效，不再重试开播")
+                    return
+                current_instruction = getattr(lc, 'current_instruction', None)
+                if (not current_instruction
+                        or current_instruction.zone_name != instruction.zone_name
+                        or current_instruction.task_id != instruction.task_id
+                        or current_instruction.execution_date != instruction.execution_date
+                        or current_instruction.duration_seconds != instruction.duration_seconds):
+                    logger.info("人脸验证确认时的开播指令已变化，不再重试开播")
+                    return
+            else:
+                instruction = getattr(lc, 'current_instruction', None)
             if not instruction:
                 logger.info("人脸验证确认到达时已无待开播指令，不再重试")
                 return
@@ -1344,37 +1502,40 @@ class EmailSender:
             is_task_mode = saved_mode != 'manual'
             source = intent.get('source') or ('new' if is_task_mode else 'manual')
             inherit = intent.get('inherit_elapsed')
-            # A resume instruction is a saved task identity, not merely a
-            # matching run/epoch.  Recheck the current task while the task
-            # mutation lock is held before dispatching the platform request;
-            # the start path performs the final atomic reservation again after
-            # the platform response to close the remaining race.
-            if source == 'resume':
-                validator = getattr(lc, 'validate_face_verify_retry_intent', None)
-                if not callable(validator) or not validator(intent):
-                    logger.info("人脸验证恢复目标已删除、完成或被替换，不再重试开播")
-                    return
             logger.info("人脸验证已确认，重试开播（模式：%s，来源：%s，继承：%s 秒）",
                         '任务' if is_task_mode else '手动', source, inherit)
             lc.start_streaming(instruction, '',
                                is_task_mode=is_task_mode, epoch=frozen_epoch,
-                               source=source, inherit_elapsed=inherit)
+                               source=source, inherit_elapsed=inherit,
+                               expected_face_run_id=(frozen_run or None),
+                               expected_face_room_id=frozen_room)
         except Exception as e:
             logger.error(f"人脸验证后重试失败：{e}")
 
     def shutdown(self) -> None:
-        """关闭 worker：停止受理、**丢弃排队通知**，再等在途投递结束。
+        """停止受理，给已排队通知三秒投递机会，再丢弃未完成部分。
 
-        为什么必须显式清空队列：worker 一旦退出，队列里剩下的任务既不会被
+        为什么必须最终清空队列：worker 一旦退出，队列里剩下的任务既不会被
         投递、也不会被回收，却仍然"存在"——任何后续再装/卸 SMTP 替身的顺序
         变化都会让它们打到真实渠道（测试收尾时曾出现对真实 SMTP 的连接尝试）。
         丢弃量计入 dropped 计数，不静默。
         """
+        deadline = time.monotonic() + 3.0
+        with self._enqueue_lock:
+            self._accepting = False
+        # Worker must stay alive while the existing queue drains. A service
+        # shutdown notice cannot be silently discarded merely because it was
+        # queued a moment before lifespan cleanup.
+        while self._queue.unfinished_tasks and time.monotonic() < deadline:
+            time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
         self._closing.set()
         dropped = 0
         while True:
             try:
-                self._queue.get_nowait()
+                job = self._queue.get_nowait()
+                job.results['shutdown'] = 'dropped'
+                job.done.set()
+                self._retire_ordered_job(job)
                 self._queue.task_done()
                 dropped += 1
             except queue.Empty:
@@ -1382,5 +1543,8 @@ class EmailSender:
         if dropped:
             self._bump("dropped")
             logger.info("关闭通知器：丢弃 %d 条排队中的通知", dropped)
+        # 全部 worker 共用 3 秒预算；逐个各等 3 秒会把直播控制器的
+        # 20 秒退出预算与 systemd 30 秒窗口叠加到 SIGKILL。
         for thread in self._workers:
-            thread.join(timeout=3.0)
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+

@@ -1,12 +1,22 @@
 """
-run.py - 后端启动脚本
+run.py - 后端启动脚本（桌面版）
 
 支持两种模式：
 1. 直接运行：python run.py
-2. 从 Electron 启动：python run.py --mode service (隐藏控制台)
+2. 从 Electron 启动：python run.py --data-dir <userData/data>
 
-E3：Electron 通过 --data-dir 传入统一数据目录（userData/data）；
-    该参数必须在导入 app 业务模块之前解析并初始化。
+启动顺序（必须保持）：
+    解析参数 → 迁移旧数据目录 → ``config.init(data_dir, account_root)``
+    → 导入 ``app.main`` → uvicorn.run
+
+E3：Electron 通过 --data-dir 传入统一数据目录（userData/data）；该参数必须在导入
+app 业务模块之前解析并初始化。
+
+账号根（桌面是单实例、单账号客户端，任务/进度/历史仍按 UID 归属）：
+- 显式 ``--account-root`` 或环境变量 ``ACCOUNT_DATA_ROOT`` 优先；
+- 都没有时按既有推导规则取 ``<data-dir 的父目录>/account-data`` —— 桌面场景即
+  ``userData/account-data``。**由本启动入口显式传入** config，不在 config 里偷偷
+  推导默认值（隔离夹具与旧测试仍可用 config 的兼容模式）。
 """
 
 import sys
@@ -50,7 +60,7 @@ def _legacy_data_candidates() -> list:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="直播控制系统后端")
+    parser = argparse.ArgumentParser(description="直播控制系统后端（桌面版）")
     parser.add_argument(
         "--mode", choices=["console", "service"], default="console",
         help="启动模式：console（默认，显示控制台），service（隐藏，用于 Electron）")
@@ -61,17 +71,40 @@ def main():
                         help="统一数据目录（Electron 传入 userData/data；A8/E3）")
     parser.add_argument("--legacy-data-dir", type=str, default=None,
                         help="旧版本数据目录（D4：Electron 明确传入，os.pathsep 分隔多个）")
+    parser.add_argument("--account-root", type=str, default=None,
+                        help="账号数据根目录（显式给出才启用账号级数据路径；"
+                             "缺省且没有 ACCOUNT_DATA_ROOT 时取 <数据目录>/../account-data）")
+    parser.add_argument("--frontend-dir", type=str, default=None,
+                        help="前端构建目录（默认 <项目根>/frontend/dist）")
     args = parser.parse_args()
     if args.legacy_data_dir:
         os.environ["BILIBILI_LEGACY_DATA_DIR"] = (
             args.legacy_data_dir + os.pathsep + os.environ.get("BILIBILI_LEGACY_DATA_DIR", ""))
 
-    # 数据目录必须先于业务模块导入初始化（config.init_data_dir 幂等）
-    from app.core.config import init_data_dir, area_file_path
+    # 监听地址/端口在**导入 config 之前**写进环境：config 的 API_HOST/API_PORT 是
+    # 模块级常量（实例入口标识等展示口径读它），导入后再设就晚了。
+    os.environ["API_PORT"] = str(args.port)
+    os.environ["API_HOST"] = str(args.host)
+
+    # 数据目录必须先于业务模块导入初始化。
+    from app.core.config import (
+        BASE_DIR, init, resolve_account_root, area_file_path,
+    )
     from app.core.data_migration import migrate_legacy_data
+
+    data_dir = None
+    account_root = None
     try:
-        data_dir = init_data_dir(args.data_dir)
+        # 账号根与数据目录必须来自**同一份**解析：直接调 resolve_account_root 而不先按
+        # config 的口径定出数据目录，会在 --data-dir 缺省时推导出进程 cwd 下的根，
+        # 与 init 实际采用的数据目录不是同一个父目录。
+        resolved_data = (args.data_dir or os.getenv("BILIBILI_DATA_DIR")
+                         or str(BASE_DIR / "data"))
+        account_root = resolve_account_root(resolved_data, args.account_root)
+        data_dir = init(data_dir=args.data_dir, account_root=str(account_root))
         # 旧版本数据散落在旧安装目录/仓库根；带备份迁移进数据目录（E3/D4）。
+        # 这一步只把**文件**搬进数据目录；把它解释成账号资料是启动期的
+        # 旧资料接管（session_runtime.desktop.prepare_account_target）。
         # BILIBILI_SKIP_MIGRATION=1 可跳过（测试隔离用，避免复制真实账号数据）。
         if os.environ.get("BILIBILI_SKIP_MIGRATION") != "1":
             for legacy in _legacy_data_candidates():
@@ -97,6 +130,10 @@ def main():
         print(f"[fatal] 数据目录初始化失败：{e}", file=sys.stderr)
         sys.exit(2)
 
+    # 将 frontend_dir 存入环境变量，供 main.py 使用。
+    if args.frontend_dir:
+        os.environ["FRONTEND_DIR"] = os.path.abspath(args.frontend_dir)
+
     import uvicorn
 
     print("=" * 70)
@@ -105,6 +142,7 @@ def main():
     print(f"启动时间：{time.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"监听地址：http://{args.host}:{args.port}")
     print(f"数据目录：{data_dir}")
+    print(f"账号数据根：{account_root}")
     print(f"API 文档：http://{args.host}:{args.port}/docs")
     if args.mode == "service":
         print("服务模式：控制台输出将重定向")

@@ -1,649 +1,338 @@
-"""
-live.py - 直播控制相关 API（开始/停止/状态查询）
+"""live.py - 直播控制相关 API（阶段 4B：只解释协议，不推进业务）
 
-A2/A3：控制入口统一接入"票据 + 控制代际"协议：
-- 前端每次新控制意图先 GET /api/live/operation-ticket 取票；
-- 控制请求带 `X-Operation-Token` 头；
-- start/resume/run-next/switch-area/confirm-face-verify 经 begin_control_operation
-  校验并快照代际；
-- stop 经 claim_stop_operation 登记：旧停止重放只确认既有结果，不停掉新开播。
-- 过期/重放票据返回 409（响应体含"响应已丢失"标识，前端据此分类）。
+设计边界（见 ``docs/plans/live-session-core-reset-20260930/PHASE4B-DESIGN.md``）：
 
-A1：/stop 在**独立的单线程执行器**中同步执行——普通线程池饱和时停止仍可达。
+- 每个控制入口只做三件事：**校验冻结字段 → 交给唯一 ControlService → 映射回执**；
+- HTTP 成功 ≠ 平台开播成功：``accepted`` 只表示意图已持久保存；
+- 路由**不**维护自己的运行授权/长锁/票据缓存（4A 的领取互斥是唯一权威）；
+- 旧的状态编辑/清空/重载入口**明确退役**（410），保留恢复/放弃/放弃并新开。
 """
 
 import asyncio
 import functools
 import logging
-import concurrent.futures
-from typing import Optional, Tuple
-from fastapi import APIRouter, Header, HTTPException
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Dict, Optional
+
+from fastapi import APIRouter, Header, HTTPException, Query
 from fastapi.responses import JSONResponse
 
-from app.dependencies import get_live_controller, get_task_manager
-from app.models.schemas import (StartLiveRequest, StartLiveResponse,
-                                LiveStatusResponse, LiveInstruction,
-                                AcceptedIntent)
-from app.core.live_controller import SOURCE_RESUME
+from app.core import diagnostics as diagnostics_module
+from app.core.session_runtime.area_capability import get_area_loader, new_bilibili_api
+from app.core.session_runtime.control import ControlServiceError
+from app.dependencies import get_application_owner, get_control_service
+
+from app.models.control_dto import (
+    AbandonRequest, ControlRequest, ControlResponse, FaceConfirmRequest,
+    RestartAfterAbandonRequest, ResumeRequest, RetiredEndpointResponse,
+    StopRequest,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-# 指定开播/放弃凭证的拒绝码 → 面板可读原因（详情里保留原码，测试与前端据此分类）。
-_ABANDON_REJECT_MESSAGES = {
-    'abandon_state_untrusted': '保存的直播状态当前不可信（最近一次落盘未确认），请先核对任务进度',
-    'abandon_epoch_mismatch': '该确认已过期：期间发生停止或新的操作',
-    'abandon_no_saved_session': '当前没有进行中的任务可放弃',
-    'abandon_identity_changed': '任务身份已变化：确认与当前进度不属于同一场直播',
-    'abandon_missing_elapsed': '确认凭证缺少已播秒数，无法核对放弃进度',
-    'abandon_invalid_elapsed': '确认凭证的已播秒数非法',
-    'abandon_stale_elapsed': '确认已过期：已播进度已变化，请刷新后重新确认',
-    'duplicate_handover': '该确认已受理过，请勿重复提交',
-    'handover_persist_failed': '交接登记落盘失败：旧进度保持原样，未开始新任务',
-}
-
-_SELECTION_REJECT_MESSAGES = {
-    'start_requires_task_id': '指定开播缺少任务标识',
-    'start_requires_business_day': '指定开播缺少业务日，请刷新任务列表后重试',
-    'start_stale_business_day': '确认已跨日：请刷新任务列表后重新确认',
-    'start_requires_revision': '指定开播缺少任务版本，请刷新任务列表后重试',
-    'start_revision_unavailable': '任务版本不可用，请刷新任务列表后重试',
-    'start_stale_revision': '确认已过期：任务列表已更新（改名/编辑/结算），请刷新后重新确认',
-    'task_not_found': '该任务不存在或已被删除重建，请刷新任务列表',
-    'name_mismatch': '任务分区与所选记录不一致，请刷新任务列表',
-    'task_not_executable': '该任务已完成或今日已完成，无需开播',
-    'start_stale_selection': '受理校验未通过：任务刚被修改，请刷新后重试',
-    'reserve_unavailable': '任务管理器缺少预留能力，拒绝指定开播',
-    'reserve_unsupported': '任务管理器不支持原子预留，拒绝指定开播',
-    'task_identity_changed': '任务身份已变化，拒绝开播',
-    'handover_bind_failed': '交接登记不可用：旧进度保持原样，未开始新任务',
-}
-
-_REFUSAL_MESSAGES = {
-    'epoch_stale': '操作已失效（期间发生停止），请重新发起',
-    'shutdown_in_progress': '应用正在退出，不能开始直播',
-    'stop_in_progress': '停止清理尚未完成，请稍后再开始',
-    'already_streaming': '已有直播进行中，不能重复开播',
-    'start_in_progress': '上一个开播请求仍在处理中，请稍候',
-    'resume_identity_changed': '保存的直播状态与当前任务不一致，不能恢复',
-}
-
-# 停止专用执行通道：单线程、独立于默认池（A1）。
-# 注意：max_workers=1 只保证串行执行，不等于提交队列有界——队列语义由
-# 目标意图绑定保证（见 _stop_live_sync：执行时核对登记时刻的目标意图，
-# 期间新接受的开播意图不会被旧队列任务停掉）。
-_STOP_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
-    max_workers=1, thread_name_prefix="stop-executor")
-
-# 慢控制操作（同步网络往返）统一离开事件循环执行的线程池（D1）
-_BLOCKING_POOL = concurrent.futures.ThreadPoolExecutor(
-    max_workers=2, thread_name_prefix="blocking-control")
+#: 普通控制入口的有界执行器：同步等待（平台往返）不占事件循环。
+_CONTROL_EXECUTOR = ThreadPoolExecutor(max_workers=4,
+                                       thread_name_prefix='live-control')
+#: 停止/确认是"取消"语义：独立执行器，慢控制把它们排不到后面去。
+_PRIORITY_EXECUTOR = ThreadPoolExecutor(max_workers=2,
+                                        thread_name_prefix='live-priority')
+_DIAG_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix='live-diag')
 
 
-# ==================== 票据与代际协议 ====================
+# ==================== 协议 → 服务 ====================
 
-def _begin_operation(controller, token: str = '') -> int:
-    """校验票据并快照控制代际；无效票据抛 409。"""
-    begin = getattr(controller, 'begin_control_operation', None)
-    if begin is None:  # 测试替身兼容
-        return 0
-    epoch = begin(token)
-    if epoch is None:
-        raise HTTPException(
-            status_code=409,
-            detail='操作已失效（响应已丢失，旧操作在停止后到达被拒绝）')
-    return epoch
+def _require_control():
+    control = get_control_service()
+    if control is None:
+        raise HTTPException(status_code=503,
+                            detail='控制服务尚未就绪（服务正在启动或已关闭）')
+    return control
 
 
-def _claim_stop_operation(controller, token: str = '') -> Optional[int]:
-    """停止入口专用：登记票据并返回目标意图快照（None=重放，不再执行）。"""
-    claim = getattr(controller, 'claim_stop_operation', None)
-    if claim is None:
-        return 0
-    return claim(token)
+def _require_available(control):
+    """未登录 / 数据不可信时的**统一明确拒绝**（不是伪造一个空账号）。"""
+    owner = get_application_owner()
+    if owner is not None and not owner.control_available():
+        detail = owner.takeover.detail or '状态数据不可用于控制'
+        raise HTTPException(status_code=409,
+                            detail=f'控制当前不可用：{detail}')
+    return control
 
 
-def _epoch_current(controller, epoch: int) -> bool:
-    """代际复核（测试替身兼容）。"""
-    check = getattr(controller, '_is_epoch_current', None)
-    if check is None:
-        return True
-    return check(epoch)
-
-
-async def _run_blocking(func, *args, **kwargs):
-    """Run a synchronous control boundary on the bounded blocking pool."""
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(
-        _BLOCKING_POOL, functools.partial(func, *args, **kwargs))
-
-
-# ==================== 统一响应构建 ====================
-
-def _accepted_payload(controller) -> Optional[AcceptedIntent]:
-    """受理冻结基线（受理成功即刻返回；显示推算归前端，权威结算归后端）。"""
-    accepted = getattr(controller, '_last_acceptance', None)
-    if not accepted:
-        return None
-    return AcceptedIntent(
-        run_id=accepted.get('run_id'),
-        task_id=accepted.get('task_id'),
-        zone_name=accepted.get('zone_name'),
-        confirmed_elapsed_seconds=int(accepted.get('confirmed_elapsed_seconds') or 0),
-        duration_seconds=int(accepted.get('duration_seconds') or 0),
-        duration_known=bool(accepted.get('duration_known', True)),
-        source=accepted.get('source'),
-        accepted_epoch=accepted.get('accepted_epoch'),
+def _map_receipt(receipt) -> ControlResponse:
+    messages = {
+        'accepted': '控制意图已保存，后台按该目标处理',
+        'pending': '同一操作的另一个请求仍在处理中',
+        'ignored': '该输入与当前事实无关，未改变任何状态',
+        'rejected': '该控制未被受理',
+        'token_conflict': '同一操作令牌已用于不同请求',
+    }
+    return ControlResponse(
+        operation_token=receipt.operation_token,
+        status=receipt.status,
+        accepted=bool(receipt.accepted),
+        reason=receipt.reason or '',
+        projection=receipt.projection,
+        success=bool(receipt.accepted),
+        message=messages.get(receipt.status, receipt.status),
     )
 
 
-def _build_stream_response(controller, success: bool, success_msg: str = "直播已开始") -> StartLiveResponse:
-    """统一构建 start_streaming / run_next_task 后的响应（人脸验证、失败等）"""
-    if success:
-        return StartLiveResponse(
-            success=True,
-            room_id=controller.current_room_id,
-            message=success_msg,
-            accepted=_accepted_payload(controller)
-        )
-    if controller._pending_face_verify:
-        return StartLiveResponse(
-            success=False,
-            need_face_verification=True,
-            qr_data=controller._face_verify_url,
-            message="需要人脸验证，请扫描二维码完成验证后重试"
-        )
-    refusal = getattr(controller, '_last_start_refusal', '') or ''
-    message = _REFUSAL_MESSAGES.get(refusal, '开播失败，请查看日志')
-    return StartLiveResponse(success=False, message=message, refusal=refusal)
+def _http_status_for(receipt) -> int:
+    if receipt.status == 'accepted':
+        return 200
+    if receipt.status == 'pending':
+        return 202
+    if receipt.status in ('rejected', 'token_conflict'):
+        return 409
+    return 200
 
 
-def _make_instruction(zone_name: str, duration_seconds: int = 7200) -> LiveInstruction:
-    """生成直播指令（时长上限 24h，0=不限时）"""
-    if duration_seconds > 86400:
-        duration_seconds = 86400
-    return LiveInstruction(zone_name=zone_name, duration_seconds=duration_seconds)
+def _receipt_response(receipt) -> JSONResponse:
+    payload = _map_receipt(receipt)
+    return JSONResponse(status_code=_http_status_for(receipt),
+                        content=payload.model_dump())
 
 
-def _get_next_task_instruction() -> Tuple[Optional[LiveInstruction], Optional[str], Optional[str]]:
-    """获取下一个待执行任务的指令，返回 (instruction, video_path, error_msg)
+async def _offload(func, *args, executor=None, **kwargs):
+    loop = asyncio.get_running_loop()
+    call = functools.partial(func, *args, **kwargs)
+    return await loop.run_in_executor(executor or _CONTROL_EXECUTOR, call)
 
-    D3：OBS（非 ffmpeg 推流设置）模式下无本地视频不阻断任务入口；
-    仅 FFmpeg 推流必须有视频文件。
+
+def _run_control(operation, *args, executor=None, **kwargs):
+    """统一把服务异常翻译成稳定 HTTP 错误；回执翻译成稳定响应。"""
+    try:
+        receipt = operation(*args, **kwargs)
+    except ControlServiceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except TimeoutError as exc:
+        raise HTTPException(status_code=504, detail=str(exc))
+    except HTTPException:
+        raise
+    except Exception as exc:                     # noqa: BLE001
+        logger.error('控制入口异常：%s', exc, exc_info=True)
+        raise HTTPException(status_code=500,
+                            detail=f'控制处理失败：{type(exc).__name__}')
+    return _receipt_response(receipt)
+
+
+# ==================== 控制端点 ====================
+
+@router.post("/start", summary="开始直播（任务/单次/指定任务）",
+             response_model=ControlResponse)
+async def start_live(request: ControlRequest = ControlRequest(),
+                     x_operation_token: str = Header(default=None,
+                                                     alias='X-Operation-Token')):
+    """新场：一律先关后开；``mode`` 决定任务/单次；指定任务须带原票据三件套。"""
+    control = _require_available(_require_control())
+    frozen = request.to_service_request()
+    account = request.account_context.model_dump() if request.account_context else None
+    return await _offload(_run_control, control.start, frozen,
+                          x_operation_token or '', account_context=account)
+
+
+@router.post("/run-next", summary="执行下一个待执行任务",
+             response_model=ControlResponse)
+async def run_next_task(request: ControlRequest = ControlRequest(),
+                        x_operation_token: str = Header(
+                            default=None, alias='X-Operation-Token')):
+    """**一次**自动新意图（不是 clear→start 两项操作）。"""
+    control = _require_available(_require_control())
+    frozen = request.to_service_request()
+    frozen['mode'] = 'task'
+    frozen.pop('selection', None)
+    frozen.pop('task_id', None)
+    frozen.pop('expected_revision', None)
+    frozen.pop('business_date', None)
+    account = request.account_context.model_dump() if request.account_context else None
+    return await _offload(_run_control, control.start, frozen,
+                          x_operation_token or '', account_context=account)
+
+
+@router.post("/resume", summary="恢复进行中的直播",
+             response_model=ControlResponse)
+async def resume_live(request: ResumeRequest,
+                      x_operation_token: str = Header(
+                          default=None, alias='X-Operation-Token')):
+    """原场续播：请求必须携带**用户看到的**原 run_id 与 goal_revision。"""
+    control = _require_available(_require_control())
+    account = request.account_context.model_dump() if request.account_context else None
+    return await _offload(_run_control, control.resume, x_operation_token or '',
+                          run_id=request.run_id,
+                          goal_revision=request.goal_revision,
+                          account_context=account)
+
+
+@router.post("/stop", summary="停止直播", response_model=ControlResponse)
+async def stop_live(request: Optional[StopRequest] = None,
+                    x_operation_token: str = Header(default=None,
+                                                    alias='X-Operation-Token')):
+    """停止：**随时可达**，走独立优先执行器；受理只表示 stopping 意图已落盘。"""
+    control = _require_control()
+    body = request or StopRequest()
+    account = body.account_context.model_dump() if body.account_context else None
+    return await _offload(_run_control, control.stop, x_operation_token or '',
+                          account_context=account, executor=_PRIORITY_EXECUTOR)
+
+
+@router.post("/abandon", summary="单独放弃原场", response_model=ControlResponse)
+async def abandon(request: AbandonRequest,
+                  x_operation_token: str = Header(
+                      default=None, alias='X-Operation-Token')):
+    """只放弃同日已停止并保留的原场；不直接 unlink/clear 状态文件。"""
+    control = _require_available(_require_control())
+    return await _offload(_run_control, control.abandon, x_operation_token or '',
+                          run_id=request.run_id,
+                          goal_revision=request.goal_revision,
+                          selection=request.selection)
+
+
+@router.post("/restart-after-abandon", summary="放弃旧场并一步开新场",
+             response_model=ControlResponse)
+async def restart_after_abandon(request: RestartAfterAbandonRequest,
+                                x_operation_token: str = Header(
+                                    default=None, alias='X-Operation-Token')):
+    """**一项**请求同时携带原场冻结上下文与新选择：没有 clear→start 的间隙。"""
+    control = _require_available(_require_control())
+    return await _offload(_run_control, control.restart_after_abandon,
+                          request.to_service_request(), x_operation_token or '')
+
+
+@router.post("/confirm-face-verify", summary="面板确认人脸验证完成",
+             response_model=ControlResponse)
+async def confirm_face_verify(request: FaceConfirmRequest,
+                              x_operation_token: str = Header(
+                                  default=None, alias='X-Operation-Token')):
+    """面板与邮件共用**同一个**确认入口：都只调 ``ControlService.confirm``。"""
+    control = _require_available(_require_control())
+    return await _offload(_run_control, control.confirm, x_operation_token or '',
+                          goal_revision=request.goal_revision,
+                          uid=request.uid, room_id=request.room_id,
+                          executor=_PRIORITY_EXECUTOR)
+
+
+# ==================== 只读投影 ====================
+
+def read_own_projection(wait_reason: str = '') -> Dict[str, Any]:
+    """本实例的**一次读取**只读投影（M2 窄提取：原 `_read_projection` 公开名）。
+
+    实例状态入口与这里共用同一份读取：账号必须与投影来自同一次 `control.read()`，
+    不用多份回包拼"原子快照"。函数体与原实现逐字节同源，行为不变。
     """
-    tm = get_task_manager()
-    if not tm:
-        return None, None, "任务管理器未初始化"
-    task_ins = tm.select_next_instruction()
-    if not task_ins:
-        return None, None, "没有待执行的任务"
-    controller = get_live_controller()
-    video_path = controller.video_finder.find_video(task_ins.zone_name) if controller else None
-    if not video_path:
-        stream_mode, _ = controller._get_stream_settings() if controller else ('ffmpeg', False)
-        if stream_mode == 'ffmpeg':
-            return None, None, f"未找到分区 {task_ins.zone_name} 的视频文件，FFmpeg 推流不可用"
-        return task_ins, '', None  # OBS 外部推流：允许无本地视频
-    return task_ins, video_path, None
+    owner = get_application_owner()
+    control = get_control_service()
+    if control is None:
+        raise HTTPException(status_code=503, detail='控制服务尚未就绪')
+    from app.core.session_runtime.projection import build_projection
+    instance = control.instance
+    return build_projection(
+        control.read(),
+        clock=(owner.clock if owner is not None else None),
+        account=(instance.account if instance is not None else None),
+        wait_reason=wait_reason,
+        # 只读展示出口：最近**已确认**的后台事实（有界内存缓冲，读不发通知）。
+        notifications=(owner.notifications if owner is not None else None))
 
 
-# ==================== API 端点 ====================
-
-@router.get("/operation-ticket", summary="签发控制操作票据")
-async def issue_operation_ticket():
-    """前端每次新的控制意图取一张新票据（无跨意图缓存，A3/U1 语义）。"""
-    controller = get_live_controller()
-    if not controller:
-        raise HTTPException(status_code=500, detail="直播控制器未初始化")
-    issue = getattr(controller, 'issue_operation', None)
-    if issue is None:
-        raise HTTPException(status_code=404, detail="后端不支持签发票据")
-    ticket = issue()
-    return {'ticket': ticket, 'epoch': int(ticket.split(':')[1])}
+#: 既有内部调用保持原名（行为不变）。
+_read_projection = read_own_projection
 
 
 @router.get("/status", summary="获取直播状态")
 async def get_live_status():
-    controller = get_live_controller()
-    if not controller:
-        raise HTTPException(status_code=500, detail="直播控制器未初始化")
-    return controller.get_live_status_api()
-
-
-@router.post("/start", summary="开始直播")
-async def start_live(request: StartLiveRequest = None,
-                     x_operation_token: str = Header(default=None, alias='X-Operation-Token')):
-    """手动模式(指定分区)或任务模式(自动取下一任务)"""
-    controller = get_live_controller()
-    if not controller:
-        raise HTTPException(status_code=500, detail="直播控制器未初始化")
-    epoch = _begin_operation(controller, x_operation_token)
-
-    if request and request.zone_name:
-        requested_duration = getattr(request, 'duration_seconds', None)
-        dur = 7200 if requested_duration is None else requested_duration
-        if dur < 0:
-            return StartLiveResponse(
-                success=False,
-                message='duration_seconds 不能为负数')
-        instruction = _make_instruction(request.zone_name, dur)
-        video_path = controller.video_finder.find_video(request.zone_name)
-        # OBS 模式无视频不阻断开播，FFmpeg 模式必须有视频
-        if not video_path:
-            stream_mode, _ = controller._get_stream_settings()
-            if stream_mode == 'ffmpeg':
-                return StartLiveResponse(success=False, message=f"未找到分区 {request.zone_name} 的视频文件，FFmpeg 推流不可用")
-            # OBS 模式：允许无视频开播
-            video_path = ''
-        ok = await _run_blocking(
-            controller.start_streaming, instruction, video_path,
-            is_task_mode=False, epoch=epoch)
-    elif request and request.task_id is not None:
-        # ---- 2026-09-28 收口：指定任务开播（点哪条开哪条） ----
-        task_manager = get_task_manager()
-        if not task_manager:
-            raise HTTPException(status_code=500, detail="任务管理器未初始化")
-        select = functools.partial(
-            task_manager.select_task_instruction, request.task_id,
-            request.expected_revision, request.business_date)
-        instruction, reject_code = await _run_blocking(select)
-        if reject_code or instruction is None:
-            code = reject_code or 'task_not_found'
-            text = _SELECTION_REJECT_MESSAGES.get(code, code)
-            raise HTTPException(status_code=409, detail=f'{code}:{text}')
-        claim = request.abandon_saved
-        handover_confirmed = False
-        handover_id = ''
-        if claim is not None:
-            record = functools.partial(
-                controller.record_saved_abandon_handover,
-                claim.model_dump(), instruction, epoch)
-            ok_claim, claim_code, handover_id = await _run_blocking(record)
-            if not ok_claim:
-                text = _ABANDON_REJECT_MESSAGES.get(claim_code, claim_code)
-                raise HTTPException(status_code=409,
-                                    detail=f'{claim_code}:{text}')
-            handover_confirmed = True
-        video_path = controller.video_finder.find_video(instruction.zone_name)
-        if not video_path:
-            stream_mode, _ = controller._get_stream_settings()
-            if stream_mode == 'ffmpeg':
-                return StartLiveResponse(
-                    success=False,
-                    message=f"未找到分区 {instruction.zone_name} 的视频文件，FFmpeg 推流不可用")
-            video_path = ''
-        ok = await _run_blocking(
-            controller.start_streaming, instruction, video_path,
-            is_task_mode=True, epoch=epoch,
-            handover_confirmed=handover_confirmed,
-            expected_handover_id=handover_id or None)
-        if not ok:
-            # 受理失败（含绑定失败已在控制器内 void）；这里兜底确认。
-            hid = getattr(controller, '_pending_handover_id', None)
-            if hid:
-                await _run_blocking(
-                    functools.partial(controller._finalize_handover, 'void',
-                                      handover_id=hid,
-                                      target_run_id=None, epoch=epoch))
-    else:
-        instruction, video_path, err = await _run_blocking(
-            _get_next_task_instruction)
-        if err:
-            return StartLiveResponse(success=False, message=err)
-        ok = await _run_blocking(
-            controller.start_streaming, instruction, video_path,
-            is_task_mode=True, epoch=epoch)
-
-    return _build_stream_response(controller, ok)
-
-
-@router.post("/resume", summary="恢复进行中的直播")
-async def resume_live(x_operation_token: str = Header(default=None, alias='X-Operation-Token')):
-    """从 live_state.json 恢复直播"""
-    controller = get_live_controller()
-    if not controller:
-        raise HTTPException(status_code=500, detail="直播控制器未初始化")
-    epoch = _begin_operation(controller, x_operation_token)
-
-    resolver = getattr(controller, 'resolve_resume_target', None)
-    if callable(resolver):
-        instruction, reason = await _run_blocking(resolver)
-        if instruction is None:
-            return StartLiveResponse(success=False, message=reason or '没有可恢复的直播任务')
-    else:
-        # Compatibility for a minimal controller double; production desktop
-        # controllers always expose the identity checked resolver above.
-        state = controller.state
-        if not state.current_zone:
-            return StartLiveResponse(success=False, message="没有可恢复的直播任务")
-        instruction = _make_instruction(
-            state.current_zone, getattr(state, 'duration_seconds', 7200))
-
-    if controller.area_loader.get_area_id(instruction.zone_name, auto_update=False) is None:
-        return StartLiveResponse(success=False, message=f"分区 '{instruction.zone_name}' 不存在于分区列表中")
-
-    video_path = controller.video_finder.find_video(instruction.zone_name)
-    if not video_path:
-        # D3：OBS 外部推流模式无本地视频不阻断恢复
-        stream_mode, _ = controller._get_stream_settings()
-        if stream_mode == 'ffmpeg':
-            return StartLiveResponse(success=False, message=f"未找到分区 {instruction.zone_name} 的视频文件，FFmpeg 推流不可用")
-        video_path = ''
-
-    state = controller.state
-    inherit_elapsed = int(getattr(state, 'effective_seconds', 0) or
-                           getattr(state, 'elapsed_seconds', 0) or 0)
-    ok = await _run_blocking(
-        controller.start_streaming,
-        instruction, video_path, is_task_mode=True, epoch=epoch,
-        source=SOURCE_RESUME, inherit_elapsed=inherit_elapsed)
-    return _build_stream_response(controller, ok, success_msg="直播已恢复")
-
-@router.post("/confirm-face-verify", summary="确认人脸验证完成")
-async def confirm_face_verify(x_operation_token: str = Header(default=None, alias='X-Operation-Token')):
-    """前端用户完成人脸验证后调用，清除待验证状态"""
-    controller = get_live_controller()
-    if not controller:
-        raise HTTPException(status_code=500, detail="直播控制器未初始化")
-    _begin_operation(controller, x_operation_token)
-    # 消费前读取冻结意图（确认后意图转入"已确认"槽，供重试配对延续原身份）
-    intent = (getattr(controller, 'face_verify_intent', None) or (lambda: None))()
-    intent = intent or {}
-    run_id = (getattr(controller, '_current_run_id', '')
-              or getattr(controller, '_pending_run_id', '')
-              or intent.get('run_id')
-              or getattr(getattr(controller, 'state', None), 'run_id', '') or '')
-    confirmed = controller.confirm_face_verify(
-        run_id=run_id,
-        room_id=getattr(controller, 'current_room_id', None),
-        epoch=getattr(controller, '_control_epoch', None))
-    return {
-        'success': bool(confirmed),
-        'message': '验证状态已确认' if confirmed
-        else '确认链接已过期：该会话已结束或被新的会话取代',
-        'run_id': intent.get('run_id', '') if confirmed else '',
-        'handover_id': intent.get('handover_id', '') if confirmed else '',
-        'mode': intent.get('mode', '') if confirmed else '',
-    }
-
-
-def _stop_live_sync(x_operation_token: str = None, target_intent: Optional[int] = None):
-    """在独立执行器线程里执行的同步停止（A1：不受默认池饱和影响）。
-
-    D1：target_intent 是登记时刻的目标开播意图快照。执行时核对当前意图：
-    队列等待期间新接受的开播意图（id 已变）不会被旧队列任务停掉；
-    target_intent=None 表示无绑定（兼容直调），始终执行。
-    """
-    controller = get_live_controller()
-    if not controller:
-        return {'success': False, 'message': '直播控制器未初始化'}
-    if target_intent is not None:
-        current = getattr(controller, '_start_intent_id', 0)
-        if current != target_intent:
-            logger.info(
-                " 停止执行时目标意图已变更（登记=%s 当前=%s）：不执行下播",
-                target_intent, current)
-            return {'success': True,
-                    'message': '该停止意图的目标已被新开播取代或已结束（未重复执行）'}
-    try:
-        success = controller.stop_streaming()
-        return {
-            'success': success,
-            'message': '直播已停止' if success else '停止失败'
-        }
-    except Exception as e:
-        logger.error(f" 停止直播异常：{e}", exc_info=True)
-        return {'success': False, 'message': f'停止异常：{e}'}
-
-
-@router.post("/stop", summary="停止直播")
-async def stop_live(x_operation_token: str = Header(default=None, alias='X-Operation-Token')):
-    """停止当前直播。
-
-    旧停止重放（票据属于已过去的代际）只确认既有结果——返回成功但不再执行
-    下播，绝不停掉后来明确开启的新直播（A2/A7）。
-    D1：登记与执行分离——登记时刻快照目标意图，执行器队列中迟到执行时
-    仍关联原意图，不停掉期间新接受的开播。
-    """
-    controller = get_live_controller()
-    if not controller:
-        raise HTTPException(status_code=500, detail="直播控制器未初始化")
-    target = _claim_stop_operation(controller, x_operation_token)
-    if target is None:
-        return {'success': True, 'message': '该停止意图已在先前处理完成（重放确认，未重复执行）'}
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(
-        _STOP_EXECUTOR,
-        functools.partial(_stop_live_sync, x_operation_token, target))
+    return _read_projection()
 
 
 @router.get("/state", summary="检查进行中的任务状态")
 async def get_live_state():
-    """检查 live_state.json 是否有进行中的任务（分区名不为空即视为有未完成任务）"""
-    controller = get_live_controller()
-    if not controller:
-        raise HTTPException(status_code=500, detail="直播控制器未初始化")
-    s = controller.state
-    return {
-        'has_active': bool(s.current_zone),
-        'current_zone': s.current_zone or '',
-        'elapsed_seconds': s.elapsed_seconds,
-        'room_id': s.room_id,
-        # 2026-09-28 收口：覆盖确认的冻结凭证来源（放弃旧进度必须核对完整身份）
-        'run_id': getattr(s, 'run_id', '') or '',
-        'task_id': getattr(s, 'task_id', None),
-        'execution_date': getattr(s, 'execution_date', None),
-    }
-
-
-@router.post("/clear-state", summary="清空进行中的任务状态")
-async def clear_live_state():
-    """清空 live_state.json 中的进行中任务"""
-    controller = get_live_controller()
-    if not controller:
-        raise HTTPException(status_code=500, detail="直播控制器未初始化")
-    def clear():
-        lock = getattr(controller, '_start_lock', None)
-        if lock is None:
-            if controller.is_streaming or getattr(controller, '_is_starting', False):
-                return False
-            controller.state.stop_streaming(preserve=False)
-            return True
-        with lock:
-            if controller.is_streaming or getattr(controller, '_is_starting', False):
-                return False
-            controller.state.stop_streaming(preserve=False)
-            return True
-    if not await _run_blocking(clear):
-        return {'success': False, 'message': '直播正在运行或启动中，不能清空状态'}
-    return {'success': True, 'message': '任务状态已清空'}
+    """只读投影；GET **不**修改任何 JSON。"""
+    return _read_projection()
 
 
 @router.get("/state/full", summary="获取完整状态（含时长信息）")
 async def get_full_live_state():
-    """获取完整的 live_state.json 内容，含 duration_seconds。"""
-    controller = get_live_controller()
-    if not controller:
-        raise HTTPException(status_code=500, detail="直播控制器未初始化")
-    s = controller.state
-    return {
-        'has_active': bool(s.current_zone),  # 只要分区名不为空就认为有未完成任务
-        'current_zone': s.current_zone or '',
-        'elapsed_seconds': s.elapsed_seconds,
-        'room_id': s.room_id,
-        'duration_seconds': getattr(s, 'duration_seconds', 0),
-        'start_time': getattr(s, 'start_time', None),
-        'run_id': getattr(s, 'run_id', '') or '',
-        'task_id': getattr(s, 'task_id', None),
-        'execution_date': getattr(s, 'execution_date', None),
-    }
+    return _read_projection()
 
 
-@router.post("/state/reload", summary="重新加载 live_state.json")
-async def reload_live_state():
-    """从 live_state.json 重新读取状态（方便手动编辑 JSON 后刷新）"""
-    controller = get_live_controller()
-    if not controller:
-        raise HTTPException(status_code=500, detail="直播控制器未初始化")
-    def reload_state():
-        lock = getattr(controller, '_start_lock', None)
-        if lock is None:
-            if controller.is_streaming or getattr(controller, '_is_starting', False):
-                return False
-            controller.state.reload()
-            return True
-        with lock:
-            if controller.is_streaming or getattr(controller, '_is_starting', False):
-                return False
-            controller.state.reload()
-            return True
-    if not await _run_blocking(reload_state):
-        return {'success': False, 'message': '直播正在运行或启动中，不能重新加载状态'}
-    s = controller.state
-    return {
-        'success': True,
-        'message': '状态已重新加载',
-        'has_active': s.is_streaming,
-        'current_zone': s.current_zone or '',
-        'elapsed_seconds': s.elapsed_seconds,
-        'duration_seconds': getattr(s, 'duration_seconds', 0),
-    }
+# ==================== 已退役入口（稳定拒绝，零写入） ====================
+
+def _retired(reason: str, replacement) -> JSONResponse:
+    payload = RetiredEndpointResponse(reason=reason, replacement=list(replacement))
+    return JSONResponse(status_code=410, content=payload.model_dump())
 
 
-@router.post("/state/update", summary="更新进行中任务状态")
-async def update_live_state(data: dict):
-    """更新 live_state 中的字段（duration_seconds / current_zone / elapsed_seconds 等）
-    可传字段：is_streaming, current_zone, elapsed_seconds, room_id, duration_seconds
-    """
-    controller = get_live_controller()
-    if not controller:
-        raise HTTPException(status_code=500, detail="直播控制器未初始化")
-    if data.get('is_streaming') is True:
-        return {'success': False, 'message': '不能通过状态编辑伪造在播会话'}
-
-    def update_state():
-        lock = getattr(controller, '_start_lock', None)
-        if lock is None:
-            if controller.is_streaming or getattr(controller, '_is_starting', False):
-                return None
-            return controller.state.update_state(**data)
-        with lock:
-            if controller.is_streaming or getattr(controller, '_is_starting', False):
-                return None
-            return controller.state.update_state(**data)
-
-    changed = await _run_blocking(update_state)
-    if changed is None:
-        return {'success': False, 'message': '直播正在运行或启动中，不能编辑恢复状态'}
-    s = controller.state
-    return {
-        'success': True,
-        'changed': changed,
-        'message': '状态已更新' if changed else '无变更',
-        'current_zone': s.current_zone or '',
-        'elapsed_seconds': s.elapsed_seconds,
-        'duration_seconds': getattr(s, 'duration_seconds', 0),
-    }
+@router.post("/state/update", summary="（已退役）更新进行中任务状态")
+async def update_live_state(data: dict = None, force: bool = Query(False)):
+    """后端不再接受运行参数编辑：进度只由唯一 Core 的确认事实推进。"""
+    return _retired('后端恢复参数编辑能力已退役，未执行任何写入',
+                    ['/api/live/abandon', '/api/live/restart-after-abandon'])
 
 
-@router.post("/switch-area", summary="切换直播分区（手动模式）")
-async def switch_area(zone_name: str,
-                      x_operation_token: str = Header(default=None, alias='X-Operation-Token')):
-    """手动模式下正在直播时切换分区（调用 B 站换区 API，不下播）
+@router.post("/state/reload", summary="（已退役）重新加载 live_state.json")
+async def reload_live_state(force: bool = Query(False)):
+    """磁盘旧档不得替换 actor 的当前快照。"""
+    return _retired('重载已退役：运行快照由唯一执行器持有，不接受磁盘旧档替换',
+                    ['/api/live/state/full'])
 
-    D1：换区是同步网络往返，放到线程池执行——事件循环不被慢换区阻塞
-    （停止等控制入口可及时获得执行）；返回结果在提交前复核代际，
-    换区期间发生停止时不把结果提交到已停止的会话。
-    """
-    controller = get_live_controller()
-    if not controller:
-        raise HTTPException(status_code=500, detail="直播控制器未初始化")
-    epoch = _begin_operation(controller, x_operation_token)
-    if controller._stream_mode != 'manual':
-        raise HTTPException(status_code=400, detail="仅手动模式支持直播中切换分区")
-    if not controller.is_streaming:
-        raise HTTPException(status_code=400, detail="当前未在直播")
+
+@router.post("/clear-state", summary="（已退役）清空进行中的任务状态")
+async def clear_live_state(force: bool = Query(False)):
+    """清空等价于绕过 Core 直接改业务 JSON；改用明确的放弃/重新开播。"""
+    return _retired('直接清空状态已退役：请使用放弃原场或放弃并新开',
+                    ['/api/live/abandon', '/api/live/restart-after-abandon'])
+
+
+@router.post("/switch-area", summary="（已退役）直播中切换分区")
+async def switch_area(zone_name: str = ''):
+    """新控制核心没有"运行中换区"这一步：目标分区属于本场固定目标。"""
+    return _retired('运行中切换分区已退役：分区是本场固定目标的一部分',
+                    ['/api/live/restart-after-abandon'])
+
+
+@router.get("/operation-ticket", summary="（已退役）签发控制操作票据")
+async def issue_operation_ticket():
+    """票据由调用方在冻结请求时生成并随请求携带（``X-Operation-Token``）。"""
+    return _retired('服务端票据签发已退役：操作令牌由客户端生成并随请求携带',
+                    ['/api/live/start', '/api/live/stop'])
+
+
+# ==================== 诊断（旁路，只读） ====================
+
+@router.get("/diagnostics", summary="旁路诊断状态（默认关闭，只读）")
+async def get_diagnostics_status():
+    """只读内存计数：不获取预算锁、不做磁盘扫描、不参与控制决策。"""
+    return diagnostics_module.get_diagnostics().stats_fast()
+
+
+@router.post("/diagnostics/export", summary="导出脱敏诊断摘要")
+async def export_diagnostics(limit: int = 200):
+    if limit < 1 or limit > 2000:
+        raise HTTPException(status_code=400, detail="limit 需在 1..2000 之间")
     loop = asyncio.get_running_loop()
-    success = await loop.run_in_executor(
-        _BLOCKING_POOL, functools.partial(controller.switch_partition, zone_name))
-    # D1：换区期间发生停止 → 结果不提交（不修改 current_instruction）
-    if not _epoch_current(controller, epoch):
-        return {'success': False, 'message': '直播已停止，换区结果未提交'}
-    if success:
-        # 更新当前指令的分区名
-        if controller.current_instruction:
-            controller.current_instruction.zone_name = zone_name
-        return {'success': True, 'message': f'已切换到分区：{zone_name}'}
-    raise HTTPException(status_code=500, detail=f'切换分区失败：{zone_name}')
+    return await loop.run_in_executor(
+        _DIAG_EXECUTOR,
+        lambda: diagnostics_module.get_diagnostics().export_bundle(limit=limit))
 
 
-@router.post("/run-next", summary="执行下一个任务")
-async def run_next_task(x_operation_token: str = Header(default=None, alias='X-Operation-Token')):
-    """执行下一个待执行直播任务"""
-    controller = get_live_controller()
-    if not controller:
-        raise HTTPException(status_code=500, detail="直播控制器未初始化")
-    epoch = _begin_operation(controller, x_operation_token)
-
-    if controller.is_streaming or getattr(controller, '_is_starting', False):
-        return {
-            'success': False,
-            'message': '当前已有直播进行中或正在启动'
-        }
-
-    success = controller.run_next_task(epoch=epoch)
-    if success:
-        accepted = _accepted_payload(controller)
-        return {
-            'success': True,
-            'message': '任务已开始执行',
-            'task': {
-                'zone_name': controller.current_instruction.zone_name if controller.current_instruction else '',
-                'duration': controller.current_instruction.duration_seconds if controller.current_instruction else 0
-            },
-            'accepted': accepted.model_dump() if accepted else None,
-        }
-    elif controller._pending_face_verify:
-        return {
-            'success': False,
-            'need_face_verification': True,
-            'qr_data': controller._face_verify_url,
-            'message': '需要人脸验证，请扫描二维码完成验证后重试'
-        }
-    else:
-        refusal = getattr(controller, '_last_start_refusal', '') or ''
-        message = _REFUSAL_MESSAGES.get(refusal,
-                                        '执行任务失败（可能无可用任务或找不到视频）')
-        return {
-            'success': False,
-            'message': message,
-            'refusal': refusal,
-        }
-
+# ==================== 分区（纯能力） ====================
 
 @router.get("/areas/search", summary="模糊搜索分区")
 async def search_areas(keyword: str = ""):
-    """模糊搜索直播分区"""
-    controller = get_live_controller()
-    if not controller:
-        raise HTTPException(status_code=500, detail="直播控制器未初始化")
-    results = controller.area_loader.fuzzy_search(keyword)
-    return {'results': results}
+    loader = get_area_loader()
+    return {'results': loader.fuzzy_search(keyword),
+            'available': bool(loader.areas)}
 
 
 @router.post("/areas/refresh", summary="刷新分区列表")
 async def refresh_areas():
-    """从 B 站 API 获取最新分区列表
-
-    D1：网络往返同步调用离开事件循环执行，不阻塞停止等控制入口。
-    """
-    controller = get_live_controller()
-    if not controller:
-        raise HTTPException(status_code=500, detail="直播控制器未初始化")
+    """联网刷新分区缓存；**不**启动任何旧控制器线程。"""
+    loader = get_area_loader()
     loop = asyncio.get_running_loop()
     success = await loop.run_in_executor(
-        _BLOCKING_POOL,
-        functools.partial(controller.area_loader.fetch_and_save_areas, controller.api))
+        _DIAG_EXECUTOR,
+        functools.partial(loader.fetch_and_save_areas, new_bilibili_api()))
     if success:
-        return {'success': True, 'message': f'已更新 {len(controller.area_loader.areas)} 个分区'}
-    raise HTTPException(status_code=500, detail='获取分区列表失败')
+        return {'success': True, 'message': f'已更新 {len(loader.areas)} 个分区'}
+    raise HTTPException(status_code=502, detail=f'获取分区列表失败（{loader.status}）')

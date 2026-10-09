@@ -1,9 +1,11 @@
 """
 areas.py - 分区信息 API
 
-分区列表是**运行时数据**（不入库）：缓存位于数据目录（userData/data 或
---data-dir）；没有缓存时接口仍正常返回，只是 available=False 并给出提示，
+分区列表是**运行时数据**（不入库）：本实例缓存位于 --data-dir 数据目录；
+没有缓存时接口仍然正常返回，只是 available=False 并给出提示，
 面板与其它功能不受影响。
+
+阶段 4B 起，这里只经**纯能力**访问口读分区，不构造旧 ``LiveController``。
 """
 
 import logging
@@ -11,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 
 from fastapi import APIRouter, Query
-from app.dependencies import get_live_controller
+from app.core.session_runtime.area_capability import get_area_loader, new_bilibili_api
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -25,12 +27,7 @@ _REFRESH_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix='areas-refr
 @router.get("", summary="获取所有分区列表")
 async def get_all_areas():
     """获取完整分区列表（含层次结构）+ 可用性状态"""
-    controller = get_live_controller()
-    if not controller:
-        return {'areas': [], 'available': False,
-                'status': 'controller_unavailable',
-                'message': '直播控制器未初始化'}
-    loader = controller.area_loader
+    loader = get_area_loader()
     if not loader.areas:
         return {'areas': [], 'available': False, 'status': loader.status,
                 'message': AREAS_UNAVAILABLE_HINT}
@@ -41,12 +38,9 @@ async def get_all_areas():
 @router.get("/search", summary="模糊搜索分区")
 async def search_areas(keyword: str = Query("", description="搜索关键词")):
     """根据关键词模糊搜索分区"""
-    controller = get_live_controller()
-    if not controller:
-        return {'results': [], 'total': 0, 'available': False,
-                'message': '直播控制器未初始化'}
-    results = controller.area_loader.fuzzy_search(keyword)
-    available = bool(controller.area_loader.areas)
+    loader = get_area_loader()
+    results = loader.fuzzy_search(keyword)
+    available = bool(loader.areas)
     return {'results': results, 'total': len(results), 'available': available,
             'message': '' if available else AREAS_UNAVAILABLE_HINT}
 
@@ -59,22 +53,18 @@ async def refresh_areas():
     不返回假成功。
     """
     import asyncio
-    controller = get_live_controller()
-    if not controller:
-        return {'success': False, 'status': 'controller_unavailable',
-                'message': '直播控制器未初始化'}
-    loader = controller.area_loader
+    loader = get_area_loader()
     loop = asyncio.get_running_loop()
     success = await loop.run_in_executor(
-        _REFRESH_POOL, partial(loader.fetch_and_save_areas, controller.api))
+        _REFRESH_POOL, partial(loader.fetch_and_save_areas, new_bilibili_api()))
     if success:
         total_sub = sum(
-            len(a.get('children', [])) for a in controller.area_loader.areas
+            len(a.get('children', [])) for a in loader.areas
         )
         return {
             'success': True,
             'status': loader.status,
-            'message': f'更新成功，共 {len(controller.area_loader.areas)} 个大类、{total_sub} 个子分区'
+            'message': f'更新成功，共 {len(loader.areas)} 个大类、{total_sub} 个子分区'
         }
     return {
         'success': False,
