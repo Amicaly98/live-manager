@@ -316,10 +316,12 @@ def test_stop_intent_read_failure_is_not_treated_as_absent(tmp_path):
     assert broken['status'] == 'unreadable'
     assert broken['detail']
 
-    # 落标记：读不出也必须落，不能把读失败当成"用户没停过"。
-    note = desktop.materialize_stop_marker(tmp_path, broken)
-    assert '读不出' in note
-    assert (tmp_path / '.no_auto_resume').is_file()
+    # 转换只**产出内容**，绝不落到来源目录：读不出也必须按"存在停止意图"带上。
+    assert '读不出' in desktop.stop_intent_note(broken)
+    payload = json.loads(desktop.stop_marker_content(broken))
+    assert payload['intent'] == 'unreadable'
+    assert payload['source'] == 'desktop-restart-policy'
+    assert not (tmp_path / '.no_auto_resume').exists()
 
 
 def test_video_base_from_settings_ignores_blank_and_invalid():

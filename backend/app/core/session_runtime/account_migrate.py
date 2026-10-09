@@ -39,7 +39,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 from .accounts import (
     DB_FILE,
@@ -91,11 +91,22 @@ class MigrationRequest:
     #: 显式来源证据（可选，给定时逐项核对）：房间号 / 运行 id / goal revision。
     room_id: Optional[int] = None
     run_id: Optional[str] = None
+    #: 调用方要在**候选目录**里先落实的附加兼容文件（文件名 → 内容）——桌面适配点。
+    #:
+    #: 桌面产品规则"重开应用只提示恢复、不自动开播"必须在**候选转换之前**生效，
+    #: 发布出来的快照本身才是 ``stopped``（既满足产品语义，也让旧场不必在缺少分区
+    #: 缓存时去做分区绑定）。它**不能**写在来源目录上：那是"拒绝迁移也会先改原件"
+    #: （复核 R4）。来源里已经存在的同名文件一律**原样保留**，不被本项覆盖。
+    #:
+    #: 默认空：服务端调用方的语义逐字不变。
+    extra_auxiliary: Mapping[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {'uid': int(self.uid), 'source_dir': str(self.source_dir),
                 'shared_root': str(self.shared_root),
-                'room_id': self.room_id, 'run_id': self.run_id}
+                'room_id': self.room_id, 'run_id': self.run_id,
+                'extra_auxiliary': sorted(str(k) for k in
+                                          (self.extra_auxiliary or {}))}
 
 
 @dataclass
@@ -535,6 +546,14 @@ def run_migration(request: MigrationRequest) -> MigrationReport:
             report.steps.append('任务库一致性副本已准备（含已提交 WAL）')
         copied = _copy_auxiliary(source, candidate)
         report.steps.append(f'账号资料已复制：{",".join(copied) or "无"}')
+        for name, content in (request.extra_auxiliary or {}).items():
+            target = candidate / str(name)
+            if target.exists():
+                # 来源自己带的那一份**原样保留**：产品规则不覆盖用户/运维写下的原件。
+                report.steps.append(f'候选附加标记已在来源中存在，保持原件：{name}')
+                continue
+            target.write_text(str(content), encoding='utf-8')
+            report.steps.append(f'候选附加标记已写入：{name}')
 
         # 归属登记 + 形状核验（在**候选**上做，源目录原字节未动）。
         #

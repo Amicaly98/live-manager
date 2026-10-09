@@ -346,17 +346,40 @@ def _request_platform_stop() -> dict:
     return report
 
 
+def _platform_stop_confirmed(report) -> bool:
+    """「停止并退出」的前置判据：**这一次平台停止是否确证收尾**。
+
+    本地资源收齐**不足以**证明"停止并退出"完成（复核 R3）：房间还在播时销毁 owner
+    会让调用方失去继续关房/重试所需的后端。三种结论分别处理：
+
+    - ``skipped``：没有控制服务 / 当前没有已登录账号 → 本程序没有要关的门，判据不
+      适用，**不**阻断正常退出；
+    - 回执未被受理 → 未确证；
+    - 已受理 → 以 ``settled``（唯一 Core 是否真的走到"Goal=stopped 且 step=idle"）
+      为准。受理只是把意图落盘，不是关房事实。
+    """
+    if not isinstance(report, dict):
+        return False
+    if report.get('status') == 'skipped':
+        return True
+    if not report.get('accepted'):
+        return False
+    return bool(report.get('settled'))
+
+
 @app.post("/api/shutdown", tags=["系统"])
 async def shutdown(stop_live: bool = True):
     """桌面受控关闭入口。
 
-    - ``stop_live=true``（停止并退出）：先经 ``ControlService`` 发停止意图，再走与
-      lifespan 同一道幂等关闭门回收**自有**资源。受理 ≠ 平台已关房，报告如实区分。
+    - ``stop_live=true``（停止并退出）：先经 ``ControlService`` 发停止意图，在有界
+      窗口内等**唯一 Core** 收尾（关房核对 → 必要时下播 → 收尾）；**确证收尾**之后
+      才走与 lifespan 同一道幂等关闭门回收自有资源。
     - ``stop_live=false``（不停止并退出）：**不**请求平台下播，只回收自有本地媒体与
       后端；运行资料与恢复依据保留。
 
-    资源未确认收齐时返回 503（``SHUTDOWN_NOT_CONFIRMED``）并**不**放行进程退出：
-    由调用方自行决定重试或强杀。这里不伪报成功、不误杀外部进程、不提前释放账号锁。
+    未确证或资源未收齐时返回 503（``SHUTDOWN_NOT_CONFIRMED``）并**不**放行进程退出、
+    **不**释放账号占用、**不**销毁运行实例：由调用方自行决定重试或强杀。这里不伪报
+    成功、不误杀外部进程、不把"已受理"写成"平台已关房"。
     """
     owner = get_application_owner()
     if owner is None:
@@ -371,6 +394,20 @@ async def shutdown(stop_live: bool = True):
         # 停止本身用掉的等待从**同一份**预算里扣：收尾不会再获得一整份新预算。
         budget = max(0.0, STOP_EXIT_CLOSE_BUDGET_SECONDS
                      - (time.monotonic() - started))
+        if not _platform_stop_confirmed(stop_report):
+            # 平台停止未确证：本地资源收齐也不能算"停止并退出"完成。保留运行实例
+            # （继续关房/重试所需）、账号占用与后端，明确回报未收齐事实。
+            logger.error("停止并退出未确证，保留后端继续核验：%s", stop_report)
+            return JSONResponse(status_code=503, content={
+                "status": "error",
+                "message": "平台停止未确证，保留后端继续核验，未退出",
+                "code": "SHUTDOWN_NOT_CONFIRMED",
+                "stop_live": True,
+                "stop": stop_report,
+                "ok": False,
+                "steps": [],
+                "errors": ["平台停止未确证（受理 ≠ 已关房）：未销毁运行实例、未释放账号占用"],
+            })
     if budget is None:
         report = await loop.run_in_executor(_LIFECYCLE_EXECUTOR, owner.close)
     else:

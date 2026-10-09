@@ -55,7 +55,7 @@ from ..session.model import (
     WANT_STOPPED,
     business_day_of,
 )
-from ..session.store import VERDICT_TRUSTED, SessionStore
+from ..session.store import VERDICT_FIRST_START, VERDICT_TRUSTED, SessionStore
 from .accounts import (
     AccountAcquisitionError,
     AccountError,
@@ -1130,6 +1130,10 @@ class ApplicationOwner:
         要续播的原场，就在这里按既有用户 Stop 语义停一次。这不是"先自动开播再补
         Stop"：此函数在 Bootstrap 派发任何 Start 之前执行，且它**只改 Goal，不动
         Run/固定目标/检查点**，因此"继续任务"仍能按原 Run 与 Goal revision 恢复。
+
+        三种状态读取结论分别走三条不同的路（复核 R1）：**没有**任何状态资料
+        （``first_start``）按首次启动继续；**存在**可信快照时按上面的停止语义落实；
+        状态**存在却不可信**才抛错、保留标记。前两者都不是"放过读失败"。
         """
         markers = self.external_stop_markers(instance)
         manual_only = bool(getattr(self, 'manual_resume_only', False))
@@ -1139,9 +1143,21 @@ class ApplicationOwner:
         if store is None:                                 # pragma: no cover - 契约护栏
             raise RuntimeError('实例没有可用的状态存储，外部停止要求无法落实，标记保留')
         loaded = store.load()
+        if loaded.status == VERDICT_FIRST_START:
+            # **没有任何状态资料**（主档与最后可用副本都不存在）：这是正常的首次
+            # 启动，不是坏档。这里没有可续播的原场，也就没有任何东西需要停 ——
+            # 外部停止要求（若有标记）此刻已被满足，消费标记后按首次启动继续。
+            #
+            # 把 ``first_start`` 与"状态存在却不可信"合并处理会把**每一个新账号**
+            # 挡在登录之外（复核 R1）：新账号第一次扫码时账号目录刚建好、状态档
+            # 还不存在，而 ``manual_resume_only`` 让本函数每次都会走到这里。
+            for marker in markers:
+                self._consume_marker(marker)
+            return
         if loaded.status != VERDICT_TRUSTED or loaded.snapshot is None:
-            # 状态不可信时**不**消费标记，也不允许进入 Bootstrap（否则会带着
-            # 未被落实的停止要求开播）。
+            # 状态**存在**却读不出 / 判为不可信：不消费标记，也不允许进入 Bootstrap
+            # （否则会带着未被落实的停止要求开播）。读不出不等于没有 —— 这条出口
+            # 与 :class:`SessionStore` 的 fail-closed 判据同源，不是"一律放过"。
             raise RuntimeError('状态不可信，外部停止要求无法落实，标记保留')
         snapshot = loaded.snapshot
         goal = snapshot.goal

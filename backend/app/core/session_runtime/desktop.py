@@ -11,7 +11,9 @@
    前的 ``live_state.json`` / ``live_tasks.db`` 就躺在数据目录里，必须先经既有的
    显式迁移工具（``account_migrate.run_migration``：预检 → 一致性候选 → 转换核对 →
    原子发布）搬进 ``accounts/<uid>/``，**才能**让 ``open_account_binding`` 建库。
-   顺序反了就会先落一个空目标库，之后再无合法覆盖路径。
+   顺序反了就会先落一个空目标库，之后再无合法覆盖路径。接管前先按既有归属能力
+   （库登记 / 有效状态身份 / 迁移回执）判定这份资料属于谁，规则见
+   :func:`prepare_account_target` 的说明。
 3. **设置页是视频目录/FFmpeg 路径的权威**。桌面用 Electron 目录选择器写的
    ``settings.json:video_path`` 必须真正进入选片与进程创建，而不是只让诊断接口读到。
 
@@ -24,7 +26,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +46,12 @@ _FOREIGN_OWNERSHIP_REASONS = frozenset((
 #: 不构成失败、可以照常继续激活的迁移结论。
 _CONTINUE_STATUSES = frozenset(('published', 'already_done', 'ready'))
 _CONTINUE_REASONS = frozenset(('source_empty', 'target_exists'))
+
+#: :func:`_ownership_verdict` 的四种结论。
+_OWNERSHIP_BOUND = 'bound'            # 有可核对的线索，且与本账号一致
+_OWNERSHIP_FOREIGN = 'foreign'        # 有可核对的线索，且**确证**属于别的账号
+_OWNERSHIP_UNKNOWN = 'unknown'        # 既没有归属登记、也没有场次身份
+_OWNERSHIP_UNREADABLE = 'unreadable'  # 归属登记**在**却读不出（≠ 没有登记）
 
 
 # ==================== 视频目录（设置页是权威） ====================
@@ -96,14 +104,14 @@ def read_stop_intent(data_dir: Path) -> Dict[str, Any]:
     return {'status': 'ok', 'detail': '', 'facts': facts}
 
 
-def materialize_stop_marker(data_dir: Path, intent: Dict[str, Any]) -> str:
-    """把桌面"重开不自动开播"这条产品规则落成共享链认识的**外部停止标记**。
+def stop_marker_content(intent: Dict[str, Any]) -> str:
+    """桌面"重开不自动开播"这条产品规则落成共享链认识的**外部停止标记**的内容。
 
     为什么是标记而不是另写一套：``.no_auto_resume`` 在既有阶段 2 解释器里正是
     "外部停止指令"（``session.migrate._stop_intent``：标记 → ``STOP_USER``，并注记
-    "停止输入只产生 Goal=stopped，不自动 Start"）。转换只表达一件事——**这一份旧
-    资料不是"正在跑、重启后应当自动续播"的**——由既有解释器与既有 Bootstrap 前
-    落实门处理，不新建第二套停止机制、不写第二个标记文件。
+    "停止输入只产生 Goal=stopped，不自动 Start"）。它只表达一件事——**这一份旧
+    资料不是"正在跑、重启后应当自动续播"的**——由既有解释器在**候选转换**时落实，
+    不新建第二套停止机制、不写第二个标记文件。
 
     三种来源分别有话说：
 
@@ -111,20 +119,19 @@ def materialize_stop_marker(data_dir: Path, intent: Dict[str, Any]) -> str:
     - ``missing``：桌面产品规则本身（重开只提示恢复，不自动开播）；
     - ``unreadable``：文件在但读不出 —— 按**存在**停止意图处理（宁可多一次"启动不
       自动开播"，也不能把读失败当成"用户没停过"）。
-    """
-    from .production import NO_AUTO_RESUME_MARKER
 
-    marker = Path(data_dir) / NO_AUTO_RESUME_MARKER
-    try:
-        marker.parent.mkdir(parents=True, exist_ok=True)
-        marker.write_text(json.dumps({
-            'source': 'desktop-restart-policy',
-            'intent': intent.get('status'),
-            'facts': dict(intent.get('facts') or {}),
-        }, ensure_ascii=False, indent=2), encoding='utf-8')
-    except OSError as exc:
-        # 落标记失败必须如实上报：这条事实没有进入账号资料，不能假装已带上。
-        return f'桌面停止意图未能落成标记（{exc}）'
+    注意本函数**只产出内容**，落点由调用方决定：它只作为候选目录里的附加文件进入
+    :class:`~.account_migrate.MigrationRequest`，**绝不**先写到来源目录（复核 R4）。
+    """
+    return json.dumps({
+        'source': 'desktop-restart-policy',
+        'intent': intent.get('status'),
+        'facts': dict(intent.get('facts') or {}),
+    }, ensure_ascii=False, indent=2)
+
+
+def stop_intent_note(intent: Dict[str, Any]) -> str:
+    """本次落下的停止意图**为什么**落下（只用于报告，不是第二份权威）。"""
     if intent.get('status') == 'unreadable':
         return f'桌面停止意图读不出（{intent.get("detail")}）：已按"存在停止意图"带上'
     if intent.get('status') == 'ok':
@@ -133,6 +140,91 @@ def materialize_stop_marker(data_dir: Path, intent: Dict[str, Any]) -> str:
 
 
 # ==================== 旧资料接管 ====================
+
+def _ownership_verdict(evidence: Dict[str, Any], *, uid: int,
+                       room_id: int) -> Tuple[str, str]:
+    """自动接管前对旧资料归属的**唯一**判定（只读，不改字节）。
+
+    依据取自既有能力，不为此另造账号系统：
+
+    1. **库归属登记**（``tasks_meta.account_owner_uid``）——最硬的证据；
+    2. **有效状态快照冻结的运行身份**（``run.uid``）——迁移产物自带；
+    3. **旧格式 ``LiveState`` 的房间号**——旧档没有 UID，但它记下的房间是登录时
+       从平台实际取得的事实，两者一致才构成本账号的归属依据（复核 R4 的同一份
+       预检判据）。
+
+    读不出（登记在却解析不出 / 库形状不可读）**不等于**没有登记，单独成一类：它
+    必须走保守出口，不能被"未标注"吞掉。
+    """
+    db_state = evidence.get('db_owner_state')
+    if db_state in ('corrupt', 'unreadable'):
+        return _OWNERSHIP_UNREADABLE, f'旧任务库归属登记/形状读不出（{db_state}）'
+    db_uid = evidence.get('db_owner_uid')
+    if db_state == 'ok' and db_uid is not None:
+        if int(db_uid) != int(uid):
+            return _OWNERSHIP_FOREIGN, f'旧任务库登记属于 UID {int(db_uid)}'
+        return _OWNERSHIP_BOUND, f'旧任务库登记属于本账号 UID {int(uid)}'
+
+    run_uid = int(evidence.get('state_run_uid') or 0)
+    if run_uid:
+        if run_uid != int(uid):
+            return _OWNERSHIP_FOREIGN, f'旧场次快照的运行账号是 UID {run_uid}'
+        return _OWNERSHIP_BOUND, f'旧场次快照的运行账号是本账号 UID {run_uid}'
+
+    legacy = evidence.get('state_legacy') or {}
+    room = int(evidence.get('state_run_room') or 0) or int(legacy.get('room_id') or 0)
+    if room:
+        if int(room_id) <= 0:
+            return _OWNERSHIP_UNKNOWN, f'旧资料记录了房间 {room}，但本次登录没有可核对的房间'
+        if room != int(room_id):
+            return _OWNERSHIP_FOREIGN, (f'旧资料记录的房间是 {room}，'
+                                        f'与本次登录的房间 {int(room_id)} 不符')
+        return _OWNERSHIP_BOUND, f'旧资料记录的房间 {room} 与本次登录一致'
+    return _OWNERSHIP_UNKNOWN, '旧资料既没有归属登记、也没有场次身份'
+
+
+def _claimed_by_other_account(account_root: Path, fingerprint: str,
+                              uid: int) -> Optional[int]:
+    """同一份来源是否已被**别的**账号目录领走？返回那个 UID，否则 None。
+
+    依据是迁移工具写在**候选库**里、随账号目录一起发布的回执（键为来源指纹）——
+    "这一份来源已经归谁"因此不需要第二份权威文件（复核 R2）。
+
+    读取在**整族字节副本**上做：不去直接打开别人账号目录里的 SQLite（WAL 库被
+    只读打开也会在**那个目录**落下 ``-wal``/``-shm``）。副本读不出来的账号目录按
+    "没有回执"处理并记警告 —— 它既不是本次迁移的目标，也不构成"来源属于它"的证据。
+    """
+    from .account_migrate import _read_receipt, _staged_database
+    from .accounts import ACCOUNTS_SUBDIR, DB_FILE
+
+    if not fingerprint:
+        return None
+    try:
+        entries = sorted((Path(account_root) / ACCOUNTS_SUBDIR).iterdir())
+    except OSError:
+        return None
+    for entry in entries:
+        if not entry.is_dir():
+            continue
+        try:
+            other = int(entry.name)
+        except (TypeError, ValueError):
+            continue
+        if other == int(uid):
+            continue
+        db_path = entry / DB_FILE
+        if not db_path.is_file():
+            continue
+        try:
+            with _staged_database(db_path) as staged:
+                receipt = _read_receipt(staged, fingerprint)
+        except Exception as exc:                          # noqa: BLE001
+            logger.warning('账号 %s 的迁移回执读不出（按无回执处理）：%s', other, exc)
+            continue
+        if receipt is not None:
+            return other
+    return None
+
 
 def prepare_account_target(data_dir: Path, account_root: Path, account: Any,
                            ) -> Optional[str]:
@@ -145,15 +237,23 @@ def prepare_account_target(data_dir: Path, account_root: Path, account: Any,
     转换/归属核对 → 原子发布。本函数只负责三件桌面专属的事：
 
     - **什么时候跑**：只在目标账号目录还不存在、且数据目录里确实有旧资料时；
-    - **带上桌面旧字段**：把 ``stop_intent.json`` 先落成共享链认识的停止标记，随
-      既有辅助文件一起进入候选（因此它与账号资料同步发布，不是发布后再补写）；
-    - **失败怎么定性**：区分"确证属于别人"（保留原件、如实报告、本次账号照常新开）
-      与"读不出/转换不过"（**拒绝激活**，绝不留下一个会被当成接管成功的空目标）。
+    - **先证明归属**（复核 R2）：这次扫码拿到的 UID **不是**历史权威。归属线索
+      与本账号冲突 → 原件保留、本次照常新开；线索读不出 → 拒绝激活；没有任何
+      线索（旧库未标注 + 没有场次档）时，这份资料只能被**领取一次**：已经由别的
+      账号领走过同一指纹就保留原件、本次照常新开，绝不因为原件还在就再发一份；
+    - **带上桌面旧字段**：把 ``stop_intent.json`` 转换成共享链认识的停止标记，作为
+      **候选目录**里的附加文件进入迁移（``MigrationRequest.extra_auxiliary``），
+      因此它与账号资料同步发布，且**拒绝迁移时来源目录一个字节都不动**（复核 R4）；
+    - **失败怎么定性**：区分"确证属于别人/已被别人领走"（保留原件、如实报告、
+      本次账号照常新开）与"读不出/转换不过"（**拒绝激活**，绝不留下一个会被当成
+      接管成功的空目标）。
     """
     from .account_migrate import (
         MigrationRequest, preflight, read_source_evidence, run_migration,
+        source_fingerprint,
     )
     from .accounts import account_paths
+    from .production import NO_AUTO_RESUME_MARKER
 
     source = Path(data_dir)
     root = Path(account_root)
@@ -176,19 +276,48 @@ def prepare_account_target(data_dir: Path, account_root: Path, account: Any,
         # 真的没有旧资料（已在只读预检里确认过，不是"读不出"）：按首次启动继续。
         return None
 
-    intent = read_stop_intent(source)
-    marker_note = ''
-    if evidence.get('state_present'):
-        # 有**旧场次资料**要接管时才落标记：桌面产品规则是"重开应用只提示恢复、
-        # 不自动开播"，因此这一份资料不是"正在跑、重启后应当自动续播"的。标记随
-        # 既有辅助文件一起进入候选并随账号目录发布，**不是**发布后再补写。
-        marker_note = materialize_stop_marker(source, intent)
-        if marker_note:
-            logger.info('桌面停止意图：%s', marker_note)
-
     room_id = int(getattr(account, 'room_id', 0) or 0) or None
+    verdict, detail = _ownership_verdict(evidence, uid=uid,
+                                         room_id=int(room_id or 0))
     request = MigrationRequest(uid=uid, source_dir=source, shared_root=root,
                                room_id=room_id)
+
+    if verdict == _OWNERSHIP_UNREADABLE:
+        return (f'旧资料归属读不出（{detail}）：不接管、不建空库，保留原件')
+    if verdict == _OWNERSHIP_FOREIGN:
+        # 仍走一次**只读**预检，把既有判据码（room_mismatch / owner_mismatch /
+        # state_owner_mismatch）如实登记进接管事实；预检不写任何字节、不建目标目录。
+        report = preflight(request).to_dict()
+        logger.warning('旧资料确证属于另一个账号（%s）：原件保留，本次不接管', detail)
+        _remember(report)
+        return None
+    if verdict == _OWNERSHIP_UNKNOWN:
+        fingerprint = source_fingerprint(source)
+        claimed = _claimed_by_other_account(root, fingerprint, uid)
+        if claimed is not None:
+            logger.warning('同一份旧资料（指纹 %s…）已由 UID %s 领走：原件保留，'
+                           '本次不接管', fingerprint[:12], claimed)
+            _remember({
+                'status': 'refused', 'reason': 'claimed_by_other_account',
+                'detail': (f'同一份旧资料（来源指纹 {fingerprint}）已由 UID {claimed} '
+                           '领取并发布：原件保留，本次不重复接管'),
+                'uid': uid, 'target_dir': str(paths.account_dir),
+                'source_fingerprint': fingerprint,
+            })
+            return None
+
+    intent = read_stop_intent(source)
+    extra: Dict[str, str] = {}
+    marker_note = ''
+    if evidence.get('state_present'):
+        # 有**旧场次资料**要接管时才带上标记。它进的是**候选目录**：随账号资料一起
+        # 发布，来源目录（以及它自己的 .no_auto_resume，若有）一个字节都不动。
+        extra[NO_AUTO_RESUME_MARKER] = stop_marker_content(intent)
+        marker_note = stop_intent_note(intent)
+        logger.info('桌面停止意图：%s', marker_note)
+
+    request = MigrationRequest(uid=uid, source_dir=source, shared_root=root,
+                               room_id=room_id, extra_auxiliary=extra)
     report = run_migration(request).to_dict()
     logger.info('桌面旧资料接管：%s（%s）', report.get('status'),
                 report.get('reason') or report.get('detail'))

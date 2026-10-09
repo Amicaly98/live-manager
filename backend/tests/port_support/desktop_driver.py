@@ -20,7 +20,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 #: 面板崩溃/统计用的旧桌面 live_state.json 字段形状（1.1.x 实际写出的键）。
 LEGACY_PHASE_LIVE = 'live'
@@ -290,6 +290,10 @@ def _run_lifespan(params: Dict[str, Any]) -> Dict[str, Any]:
             out['counters_after_resume'] = dict(counters)
 
         if params.get('shutdown_stop_live') is not None:
+            # 退出提交边界要能观察到"是否放行进程退出"：uvicorn 句柄在真实进程里由
+            # run.py 注入，这里放一个只读的替身，读它的 should_exit。
+            import types
+            app.state.uvicorn_server = types.SimpleNamespace(should_exit=False)
             response = client.post(
                 f"/api/shutdown?stop_live={str(bool(params['shutdown_stop_live'])).lower()}")
             try:
@@ -298,6 +302,8 @@ def _run_lifespan(params: Dict[str, Any]) -> Dict[str, Any]:
             except Exception:                                # noqa: BLE001
                 out['shutdown'] = {'status_code': response.status_code,
                                    'body': response.text[:400]}
+            out['server_should_exit'] = bool(
+                app.state.uvicorn_server.should_exit)
             out['counters_after_shutdown'] = dict(counters)
     out['counters_final'] = dict(counters)
     return out
@@ -342,7 +348,11 @@ def _run_lock(params: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _run_migration_only(params: Dict[str, Any]) -> Dict[str, Any]:
-    """只跑既有显式迁移工具：证明拒绝路径不发布、不建空目标。"""
+    """只跑既有显式迁移工具：证明拒绝路径不发布、不建空目标。
+
+    单次（``uid`` / ``room_id``）与多次（``attempts``）都支持：多次用来证明**同一份
+    保留的来源**不会被第二次发布给另一个账号。
+    """
     from app.core import config
     from app.core.session_runtime import production
 
@@ -353,23 +363,132 @@ def _run_migration_only(params: Dict[str, Any]) -> Dict[str, Any]:
     from app.core.session_runtime import desktop
     from app.core.session import AccountContext
 
-    account = AccountContext(uid=int(params['uid']), room_id=int(params['room_id']))
-    refusal = desktop.prepare_account_target(
-        Path(params['data_dir']), Path(params['account_root']), account)
-    from app.core.session_runtime.accounts import account_paths
-    paths = account_paths(Path(params['account_root']), int(params['uid']))
+    data_dir = Path(params['data_dir'])
+    account_root = Path(params['account_root'])
+    attempts = params.get('attempts') or [
+        {'uid': params['uid'], 'room_id': params['room_id']}]
+
+    out: Dict[str, Any] = {'attempts': []}
+    # 来源快照取自**本进程**：``config.init`` 会在数据目录里落下可写探测文件，那
+    # 是初始化的一部分，不是迁移改了原件；由本进程前后各取一次才对得上。
+    out['source_before'] = _tree_bytes(data_dir)
+    for attempt in attempts:
+        uid = int(attempt['uid'])
+        account = AccountContext(uid=uid, room_id=int(attempt['room_id']))
+        refusal = desktop.prepare_account_target(data_dir, account_root, account)
+        from app.core.session_runtime.accounts import account_paths
+        paths = account_paths(account_root, uid)
+        out['attempts'].append({
+            'uid': uid,
+            'refusal': refusal,
+            'account_dir_exists': paths.account_dir.exists(),
+            'db_exists': paths.db_path.exists(),
+            'takeover': desktop.current_takeover_facts(),
+            'task_rows': _account_task_rows(account_root, uid),
+        })
+    # 单次调用沿用旧字段名（既有用例按这些名字读）。
+    last = out['attempts'][-1]
+    out.update({'refusal': last['refusal'],
+                'account_dir_exists': last['account_dir_exists'],
+                'db_exists': last['db_exists'],
+                'takeover': last['takeover']})
+    out['source_after'] = _tree_bytes(data_dir)
+    out['source_unchanged'] = out['source_after'] == out['source_before']
+    out['source_changed'] = sorted(
+        name for name in out['source_before']
+        if out['source_before'][name] != out['source_after'].get(name))
+    out['source_added'] = sorted(set(out['source_after']) - set(out['source_before']))
+    return out
+
+
+def _tree_bytes(directory: Path) -> Dict[str, str]:
+    """目录下每个文件的相对路径 → sha256（"一个字节都不动"的完整判据）。"""
+    import hashlib
     return {
-        'refusal': refusal,
-        'account_dir_exists': paths.account_dir.exists(),
-        'db_exists': paths.db_path.exists(),
-        'takeover': desktop.current_takeover_facts(),
+        path.relative_to(directory).as_posix():
+            hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(Path(directory).rglob('*')) if path.is_file()
     }
+
+
+def _account_task_rows(account_root: Path, uid: int) -> List[list]:
+    """账号库里 ``tasks`` 表的事实行（只读打开；库不存在就是空列表）。"""
+    path = Path(account_root) / 'accounts' / str(int(uid)) / 'live_tasks.db'
+    if not path.is_file():
+        return []
+    connection = sqlite3.connect(f'file:{path.as_posix()}?mode=ro', uri=True)
+    try:
+        return [list(row) for row in connection.execute(
+            'SELECT id, zone_name, category, total_days, days_done FROM tasks')]
+    finally:
+        connection.close()
+
+
+def _run_login_session(params: Dict[str, Any]) -> Dict[str, Any]:
+    """真实默认 owner 的登录/换号序列：每个账号的激活结论、接管事实与任务行。
+
+    ``params['logins']`` 是一串 ``{'uid', 'room_id', 'action'}``：``action`` 为
+    ``login``（默认）或 ``logout``。走的是**真实** ``ControlService`` 登录/登出
+    出口（与桌面扫码登录同一条职责），因此"首次登录被拒"这类出口问题在这里是
+    可直接观察的事实，不是推断。
+    """
+    from app.core import config
+    from app.core.session_runtime import production
+
+    config.init(data_dir=params['data_dir'], account_root=params['account_root'])
+    if params.get('endpoint_base'):
+        production.configure_boundaries(endpoint_base=params['endpoint_base'])
+
+    counters = install_counters()
+
+    from app.core.session import AccountContext
+    from app.core.session_runtime import desktop
+    from app.core.session_runtime.desktop import build_desktop_owner
+
+    account_root = Path(params['account_root'])
+    owner = build_desktop_owner(data_dir=Path(params['data_dir']))
+    out: Dict[str, Any] = {'account_root': str(owner.account_root),
+                           'counters': counters, 'steps': []}
+    try:
+        for index, step in enumerate(params['logins']):
+            action = str(step.get('action') or 'login')
+            if action == 'logout':
+                receipt = owner.control.logout(
+                    f'desktop-logout-{index}',
+                    timeout=float(params.get('logout_timeout', 5.0)))
+                out['steps'].append({'action': 'logout',
+                                     'receipt': receipt.to_dict()})
+                continue
+            uid = int(step['uid'])
+            account = AccountContext(
+                uid=uid, room_id=int(step.get('room_id') or 0),
+                zone_name=params.get('zone') or '隔离分区',
+                area_id=int(params.get('area_id') or 100))
+            receipt = owner.control.login(
+                f'desktop-login-{index}', account,
+                dict(step.get('credentials') or {
+                    'SESSDATA': 'synthetic', 'bili_jct': 'synthetic',
+                    'DedeUserID': str(uid), 'uid': str(uid)}))
+            out['steps'].append({
+                'action': 'login', 'uid': uid,
+                'receipt': receipt.to_dict(),
+                'instance_errors': list(owner.instance_errors),
+                'installed': owner.control.instance is not None,
+                'takeover': desktop.current_takeover_facts(),
+                'task_rows': _account_task_rows(account_root, uid),
+                'counters': dict(counters),
+            })
+    finally:
+        out['close'] = owner.close()
+    out['counters_final'] = dict(counters)
+    return out
 
 
 SCENARIOS = {
     'lifespan': _run_lifespan,
     'lock': _run_lock,
     'migration_only': _run_migration_only,
+    'login_session': _run_login_session,
 }
 
 
