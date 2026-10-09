@@ -12,7 +12,9 @@
    显式迁移工具（``account_migrate.run_migration``：预检 → 一致性候选 → 转换核对 →
    原子发布）搬进 ``accounts/<uid>/``，**才能**让 ``open_account_binding`` 建库。
    顺序反了就会先落一个空目标库，之后再无合法覆盖路径。接管前先按既有归属能力
-   （库登记 / 有效状态身份 / 迁移回执）判定这份资料属于谁，规则见
+   （库登记 / 有效状态身份 / 旧档房间号）判定这份资料属于谁：**只有与本账号一致
+   才自动接管**，确证属于别人就保留原件照常新开，归属不明或读不出则拒绝激活并
+   说明问题 —— 本次扫码 UID 本身不是历史授权。规则见
    :func:`prepare_account_target` 的说明。
 3. **设置页是视频目录/FFmpeg 路径的权威**。桌面用 Electron 目录选择器写的
    ``settings.json:video_path`` 必须真正进入选片与进程创建，而不是只让诊断接口读到。
@@ -155,6 +157,9 @@ def _ownership_verdict(evidence: Dict[str, Any], *, uid: int,
 
     读不出（登记在却解析不出 / 库形状不可读）**不等于**没有登记，单独成一类：它
     必须走保守出口，不能被"未标注"吞掉。
+
+    四种结论**都只是"能不能自动接管"的判据**，没有一种是"先领取再说"：没有任何
+    线索时返回 ``unknown``，调用方据此拒绝自动接管。
     """
     db_state = evidence.get('db_owner_state')
     if db_state in ('corrupt', 'unreadable'):
@@ -183,49 +188,6 @@ def _ownership_verdict(evidence: Dict[str, Any], *, uid: int,
     return _OWNERSHIP_UNKNOWN, '旧资料既没有归属登记、也没有场次身份'
 
 
-def _claimed_by_other_account(account_root: Path, fingerprint: str,
-                              uid: int) -> Optional[int]:
-    """同一份来源是否已被**别的**账号目录领走？返回那个 UID，否则 None。
-
-    依据是迁移工具写在**候选库**里、随账号目录一起发布的回执（键为来源指纹）——
-    "这一份来源已经归谁"因此不需要第二份权威文件（复核 R2）。
-
-    读取在**整族字节副本**上做：不去直接打开别人账号目录里的 SQLite（WAL 库被
-    只读打开也会在**那个目录**落下 ``-wal``/``-shm``）。副本读不出来的账号目录按
-    "没有回执"处理并记警告 —— 它既不是本次迁移的目标，也不构成"来源属于它"的证据。
-    """
-    from .account_migrate import _read_receipt, _staged_database
-    from .accounts import ACCOUNTS_SUBDIR, DB_FILE
-
-    if not fingerprint:
-        return None
-    try:
-        entries = sorted((Path(account_root) / ACCOUNTS_SUBDIR).iterdir())
-    except OSError:
-        return None
-    for entry in entries:
-        if not entry.is_dir():
-            continue
-        try:
-            other = int(entry.name)
-        except (TypeError, ValueError):
-            continue
-        if other == int(uid):
-            continue
-        db_path = entry / DB_FILE
-        if not db_path.is_file():
-            continue
-        try:
-            with _staged_database(db_path) as staged:
-                receipt = _read_receipt(staged, fingerprint)
-        except Exception as exc:                          # noqa: BLE001
-            logger.warning('账号 %s 的迁移回执读不出（按无回执处理）：%s', other, exc)
-            continue
-        if receipt is not None:
-            return other
-    return None
-
-
 def prepare_account_target(data_dir: Path, account_root: Path, account: Any,
                            ) -> Optional[str]:
     """首次领取账号目录**之前**的旧资料接管；返回拒绝原因（None 表示可以继续）。
@@ -237,20 +199,21 @@ def prepare_account_target(data_dir: Path, account_root: Path, account: Any,
     转换/归属核对 → 原子发布。本函数只负责三件桌面专属的事：
 
     - **什么时候跑**：只在目标账号目录还不存在、且数据目录里确实有旧资料时；
-    - **先证明归属**（复核 R2）：这次扫码拿到的 UID **不是**历史权威。归属线索
-      与本账号冲突 → 原件保留、本次照常新开；线索读不出 → 拒绝激活；没有任何
-      线索（旧库未标注 + 没有场次档）时，这份资料只能被**领取一次**：已经由别的
-      账号领走过同一指纹就保留原件、本次照常新开，绝不因为原件还在就再发一份；
+    - **先证明归属**（复核 R2）：这次扫码拿到的 UID **不是**历史权威，因此它不能
+      自己构成迁移授权。可核对的归属线索与本账号一致才自动接管；线索**确证**属于
+      别人 → 原件保留、本次照常新开；线索读不出、或**根本没有线索** → 明确拒绝
+      激活并说明归属问题（既不发布、也不建空库把问题藏起来），留给既有的**显式
+      迁移工具**按用户已确定的映射处理。产品现在没有"归属确认"入口，因此这里不做
+      任何形式的自动认领；
     - **带上桌面旧字段**：把 ``stop_intent.json`` 转换成共享链认识的停止标记，作为
       **候选目录**里的附加文件进入迁移（``MigrationRequest.extra_auxiliary``），
       因此它与账号资料同步发布，且**拒绝迁移时来源目录一个字节都不动**（复核 R4）；
-    - **失败怎么定性**：区分"确证属于别人/已被别人领走"（保留原件、如实报告、
-      本次账号照常新开）与"读不出/转换不过"（**拒绝激活**，绝不留下一个会被当成
-      接管成功的空目标）。
+    - **失败怎么定性**：区分"确证属于别人"（保留原件、如实报告、本次账号照常新开）
+      与"读不出/归属不明/转换不过"（**拒绝激活**，绝不留下一个会被当成接管成功的
+      空目标）。
     """
     from .account_migrate import (
         MigrationRequest, preflight, read_source_evidence, run_migration,
-        source_fingerprint,
     )
     from .accounts import account_paths
     from .production import NO_AUTO_RESUME_MARKER
@@ -284,6 +247,19 @@ def prepare_account_target(data_dir: Path, account_root: Path, account: Any,
 
     if verdict == _OWNERSHIP_UNREADABLE:
         return (f'旧资料归属读不出（{detail}）：不接管、不建空库，保留原件')
+    if verdict == _OWNERSHIP_UNKNOWN:
+        # **归属不明不自动发**：本次扫码 UID 不是历史权威，也就不是这张迁移授权
+        # （交办 §7 / 计划 §"可信 UID 无法确定时保留原件并说明归属问题，不把旧任务
+        # 自动交给下一个扫码账号"）。这里既不发布、也不建空库把问题藏起来 —— 明确
+        # 拒绝激活并说明归属问题，旧资料留给既有的**显式迁移工具**按用户已确定的
+        # 映射处理。
+        logger.warning('旧资料归属不明（%s）：不自动接管，来源保留待显式迁移', detail)
+        _remember({
+            'status': 'refused', 'reason': 'ownership_unknown', 'detail': detail,
+            'uid': uid, 'target_dir': str(paths.account_dir),
+        })
+        return (f'旧资料归属不明（{detail}）：本次不自动接管、不建空库，'
+                '原件与运行库均未改动；请用既有显式迁移工具按已确定的账号映射处理')
     if verdict == _OWNERSHIP_FOREIGN:
         # 仍走一次**只读**预检，把既有判据码（room_mismatch / owner_mismatch /
         # state_owner_mismatch）如实登记进接管事实；预检不写任何字节、不建目标目录。
@@ -291,20 +267,6 @@ def prepare_account_target(data_dir: Path, account_root: Path, account: Any,
         logger.warning('旧资料确证属于另一个账号（%s）：原件保留，本次不接管', detail)
         _remember(report)
         return None
-    if verdict == _OWNERSHIP_UNKNOWN:
-        fingerprint = source_fingerprint(source)
-        claimed = _claimed_by_other_account(root, fingerprint, uid)
-        if claimed is not None:
-            logger.warning('同一份旧资料（指纹 %s…）已由 UID %s 领走：原件保留，'
-                           '本次不接管', fingerprint[:12], claimed)
-            _remember({
-                'status': 'refused', 'reason': 'claimed_by_other_account',
-                'detail': (f'同一份旧资料（来源指纹 {fingerprint}）已由 UID {claimed} '
-                           '领取并发布：原件保留，本次不重复接管'),
-                'uid': uid, 'target_dir': str(paths.account_dir),
-                'source_fingerprint': fingerprint,
-            })
-            return None
 
     intent = read_stop_intent(source)
     extra: Dict[str, str] = {}

@@ -97,14 +97,23 @@ updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
 """
 
 
-def write_legacy_database(data_dir: Path, *, tasks) -> Path:
-    """写一份**桌面旧形状**的任务库（不含账本/历史表，属于待迁移对象）。"""
+def write_legacy_database(data_dir: Path, *, tasks, owner_uid=None) -> Path:
+    """写一份**桌面旧形状**的任务库（不含账本/历史表，属于待迁移对象）。
+
+    ``owner_uid`` 给出时同时写进 ``tasks_meta.account_owner_uid`` —— 那是"这份库
+    登记属于谁"的既有归属依据；不给出时库是**未标注**的（归属线索只能来自场次档，
+    或者根本没有线索）。
+    """
     path = Path(data_dir) / 'live_tasks.db'
     connection = sqlite3.connect(str(path))
     try:
         connection.execute(LEGACY_TASKS_SCHEMA)
         connection.execute(
             'CREATE TABLE IF NOT EXISTS tasks_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
+        if owner_uid is not None:
+            connection.execute(
+                'INSERT OR REPLACE INTO tasks_meta (key, value) VALUES (?, ?)',
+                ('account_owner_uid', str(int(owner_uid))))
         for task in tasks:
             connection.execute(
                 'INSERT INTO tasks (zone_name, category, total_days, days_done,'

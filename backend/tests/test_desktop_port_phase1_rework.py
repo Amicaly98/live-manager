@@ -4,7 +4,8 @@
 它们断言的是**出口事实**，不依赖第二阶段页面：
 
 - R1 没有保存过场次的新账号必须能登录（``first_start`` ≠ 状态不可信）；
-- R2 同一份旧资料不能被自动发给第二个账号（归属依据 + 迁移回执）；
+- R2 自动接管前必须先有**可信归属**：归属不明不发给任何账号（含第一个），
+  确证属于本账号才接管、确证属于别人则保留原件照常新开；
 - R3 平台未确证关房时不允许"停止并退出"放行进程退出；
 - R4 拒绝迁移不能先改写来源目录的停止标记。
 
@@ -66,14 +67,14 @@ def test_fresh_account_first_login_activates_without_auto_start(tmp_path):
     assert (account_root / 'accounts' / '92001' / 'live_tasks.db').is_file()
 
 
-def test_legacy_tasks_without_session_state_still_lets_account_in(tmp_path):
-    """只有旧任务库、没有场次档：同样不能把账号挡在登录之外。"""
+def test_legacy_tasks_without_session_state_and_with_owner_registration(tmp_path):
+    """只有旧任务库、没有场次档，但库**已登记本账号**：按既有归属依据接管。"""
     data_dir, account_root, videos = _layout(tmp_path)
     driver.write_settings(data_dir, video_path=str(videos))
     driver.write_legacy_database(data_dir, tasks=[
         {'zone_name': '隔离分区', 'category': 2, 'total_days': 7, 'days_done': 3,
          'deadline_raw': '2027-12-31'},
-    ])
+    ], owner_uid=92002)
 
     result = run_scenario(tmp_path, 'login_session', {
         'data_dir': str(data_dir),
@@ -85,14 +86,50 @@ def test_legacy_tasks_without_session_state_still_lets_account_in(tmp_path):
     assert step['receipt']['accepted'] is True, step
     assert step['installed'] is True, step
     assert step['instance_errors'] == [], step['instance_errors']
+    assert step['takeover']['status'] == 'published', step['takeover']
+    assert len(step['task_rows']) == 1, step['task_rows']
 
 
-# ==================== R2：一份旧资料只能被领取一次 ====================
+def test_unattributed_legacy_family_reaches_no_account_at_all(tmp_path):
+    """归属**不明**的旧任务库（没有登记、没有场次身份）：第一个候选也不接管。
 
-def test_legacy_family_is_claimed_once_and_never_reassigned(tmp_path):
-    """换号守卫：A 领走的旧任务族不会被自动再发给 B。"""
+    "禁止第二个人领取"不能证明"第一个人有权领取"：本次扫码 UID 不是历史权威，
+    因此既不发布、也不建空库把归属问题藏起来。
+    """
     data_dir, account_root, videos = _layout(tmp_path)
     driver.write_settings(data_dir, video_path=str(videos))
+    driver.write_legacy_database(data_dir, tasks=[
+        {'zone_name': '隔离分区', 'category': 2, 'total_days': 7, 'days_done': 3,
+         'deadline_raw': '2027-12-31'},
+    ])
+
+    result = run_scenario(tmp_path, 'login_session', {
+        'data_dir': str(data_dir),
+        'account_root': str(account_root),
+        'logins': [{'uid': 91002, 'room_id': 55002}],
+    })
+
+    step = result['steps'][0]
+    assert step['receipt']['accepted'] is False, step
+    assert step['installed'] is False, step
+    assert step['takeover']['reason'] == 'ownership_unknown', step['takeover']
+    # 既没有发布账号目录，也没有留下一个会被当成接管成功的空库。
+    assert step['task_rows'] == [], step['task_rows']
+    assert not (account_root / 'accounts' / '91002').exists(), step
+    # 原件保留：来源库仍躺在数据目录里。
+    assert (data_dir / 'live_tasks.db').is_file()
+
+
+# ==================== R2：一份旧资料不会被自动再发给别的账号 ====================
+
+def test_legacy_family_with_trusted_ownership_is_never_reassigned(tmp_path):
+    """换号守卫：给 A 可信历史归属后 A 接管，B 不继承那份旧任务族。"""
+    data_dir, account_root, videos = _layout(tmp_path)
+    driver.write_settings(data_dir, video_path=str(videos))
+    # A 的可信归属依据：旧场次档记录的房间与 A 登录的房间一致。
+    driver.write_legacy_state(data_dir, room_id=55001, zone='隔离分区',
+                              elapsed=1234, duration=5000, run_id='legacy-A')
+    driver.write_area_cache(data_dir, [('隔离分区', 1001)])
     driver.write_legacy_database(data_dir, tasks=[
         {'zone_name': '隔离分区', 'category': 2, 'total_days': 7, 'days_done': 3,
          'deadline_raw': '2027-12-31'},
@@ -113,9 +150,9 @@ def test_legacy_family_is_claimed_once_and_never_reassigned(tmp_path):
     assert first['takeover']['status'] == 'published', first['takeover']
     assert len(first['task_rows']) == 1, first['task_rows']
 
+    # B：旧资料**确证**记着 A 的房间 → 原件保留、本次按新账号继续、不继承。
     assert second['receipt']['accepted'] is True, second
-    assert second['takeover']['reason'] == 'claimed_by_other_account', second['takeover']
-    assert second['takeover']['detail'].count('91001') == 1
+    assert second['takeover']['reason'] == 'room_mismatch', second['takeover']
     # B 拿到的是自己的空库；旧任务族仍只在 A 那里。
     assert second['task_rows'] == [], second['task_rows']
     with sqlite3.connect(str(account_root / 'accounts' / '91001' / 'live_tasks.db')) as conn:
@@ -124,8 +161,12 @@ def test_legacy_family_is_claimed_once_and_never_reassigned(tmp_path):
     assert (data_dir / 'live_tasks.db').is_file()
 
 
-def test_unattributed_family_is_never_copied_by_the_migration_entry(tmp_path):
-    """直接验证迁移入口：同一份保留的来源不会被第二次发布给别的 UID。"""
+def test_migration_entry_refuses_unattributed_family_for_every_candidate(tmp_path):
+    """直接验证迁移入口：归属不明的旧资料对**任何**候选 UID 都不产生迁移授权。
+
+    两次尝试分别换 UID 与房间号：结论都必须是"归属问题未解决"，来源不进任何账号
+    目录，也没有空目标被建出来。
+    """
     data_dir, account_root, videos = _layout(tmp_path)
     driver.write_settings(data_dir, video_path=str(videos))
     driver.write_legacy_database(data_dir, tasks=[
@@ -140,15 +181,12 @@ def test_unattributed_family_is_never_copied_by_the_migration_entry(tmp_path):
                      {'uid': 91002, 'room_id': 55002}],
     })
 
-    first, second = result['attempts']
-    assert first['takeover']['status'] == 'published', first['takeover']
-    assert first['refusal'] is None
-    assert len(first['task_rows']) == 1, first['task_rows']
-
-    assert second['refusal'] is None, second
-    assert second['takeover']['reason'] == 'claimed_by_other_account', second['takeover']
-    assert second['task_rows'] == [], second['task_rows']
-    assert second['account_dir_exists'] is False
+    for attempt in result['attempts']:
+        assert attempt['refusal'], attempt
+        assert '归属不明' in attempt['refusal'], attempt['refusal']
+        assert attempt['takeover']['reason'] == 'ownership_unknown', attempt['takeover']
+        assert attempt['account_dir_exists'] is False, attempt
+        assert attempt['task_rows'] == [], attempt['task_rows']
     # 原件保留：来源库仍躺在数据目录里，没有被搬走。
     assert (data_dir / 'live_tasks.db').is_file()
 
