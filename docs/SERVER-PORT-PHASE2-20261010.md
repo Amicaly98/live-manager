@@ -159,6 +159,31 @@
 返修验证与证据：`deliveries/desktop-port-phase2-create-fix-20261010/`（冻结监督脚本
 原样复跑、run3 窄跑、真实浏览器"在途刷新"窄验证、类型检查与前端构建）。
 
+## 八、第二轮返修记录（2026-10-10，复核 92510d3 暂不通过后）
+
+第二轮复核（`deliveries/desktop-port-phase2-rereview-92510d3-20261010/`）确认 R1–R4
+已转绿、9 项冻结监督复跑通过，另以 5 项交错探针钉出两处共同职责（S1/S2 P1、S3 P2），
+集中在 `frontend/src/views/TaskManager.vue` 的持有/消费/发送接缝；退出、防多开、通知、
+显示与 Core 零改动，未新增服务器 attempt 表、后台投递或状态机：
+
+- **S1/S2（持有与销账绑定具体操作）**：`holdPendingCreate` 拒绝覆盖**另一个操作**
+  （不同令牌）的待核对命令——新账号的一次成功创建不再间接销掉旧账号的未知命令；
+  新增 `releasePendingCreate(token)` 作用域消费，所有成功/明确拒绝出口只销**本次
+  操作自己的**命令；回执命中即在本操作的列表刷新等待**之前**消费，迟到的旧核对
+  续体不再持有销账权。槽位被占时本次操作的"发送前落账"按占用降级，不新增
+  "禁止创建其他任务"规则。
+- **S3（发送前资格复核）**：共同发送入口 `submitCreation` 与 `runCreateFlow` 的
+  预检回包、确认放行后续体，都在发送前核对页面存活与 `writeScopeIsCurrent`——
+  确认期间换号后，尚未发出的旧账号写请求停止投递（POST=0），不再等回包落点才拦。
+- **证据表述更正**：第一轮"在途刷新"浏览器窄验证的 route 处理器对 POST 直接
+  return（未 continue），请求**从未送达后端**；其证明范围收窄为"发送前落账、刷新
+  恢复、（真实回执 GET）found=false 仍保留"，不含"后端已接收"语义。第一轮 REWORK
+  已附更正节（`deliveries/desktop-port-phase2-create-fix-20261010/REWORK.md` §4），
+  窄验证脚本口径同步更正。按复核要求未重跑完整浏览器矩阵。
+
+第二轮返修验证与证据：`deliveries/desktop-port-phase2-create-fix2-20261010/`（两套
+冻结探针原样复跑 9/9 + 5/5、真实浏览器窄用例复跑、类型检查与前端构建）。
+
 ## 六、端到端证据目录
 
 `deliveries/desktop-port-phase2-20261010/real-chain/`

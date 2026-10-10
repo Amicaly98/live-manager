@@ -429,9 +429,10 @@ const editingScope = ref<FrozenWriteScope | undefined>(undefined)
 /**
  * 待核对项（原 UID + 原令牌 + 原冻结载荷）。
  *
- * 写请求**发送之前**就已持有（R3）；只有**确定**的结果才移除它：查到持久回执
- * （确定已提交）、或无前序未知的首次明确拒绝（结果确定为"没受理"）。下列情况
- * 一律**继续持有**：
+ * 持有与消费都绑定**具体操作**（S1/S2）：写请求**发送之前**就已持有（R3），
+ * 但槽位被另一个操作占用时不再写入（谁也不覆盖谁）；只有**这一项自己的**
+ * 确定终态才消费它（按令牌作用域）：查到自己的持久回执（确定已提交）、或
+ * 无前序未知的首次明确拒绝（结果确定为"没受理"）。下列情况一律**继续持有**：
  *  - 回执 `found=false`（只表示尚未查到）；
  *  - 查询本身暂时失败；
  *  - 后一次重试被拒（那只说明"这一次没受理"，R2）；
@@ -448,14 +449,43 @@ const pendingBusy = ref(false)
 
 const PENDING_CREATE_KEY = 'pending_task_create_v1'
 
+/**
+ * 持有/刷新一条待核对命令。
+ *
+ * 槽位语义（S1/S2）：这条记录属于**一个具体操作**（按原令牌核对）——
+ *  - 槽位为空，或已是**同一令牌**（同一操作的重试/再持有）→ 写入；
+ *  - 槽位被**另一个操作**占用 → **拒绝写入**：一次操作的核对依据不能被另一次
+ *    操作覆盖或销掉——新账号的一次成功创建不证明旧未知操作的结果（S1），
+ *    迟到的旧回执续体也不得连带清掉新操作的命令（S2，配合"回执命中即消费"
+ *    的时序，正常交错下新命令总能拿到空槽位）。此时本次操作的"发送前落账"
+ *    按槽位被占降级——操作本身照常进行，不新增"禁止创建其他任务"的规则。
+ */
 function holdPendingCreate(pending: typeof pendingCreate.value): void {
+  if (pending === null) {
+    pendingCreate.value = null
+    try { sessionStorage.removeItem(PENDING_CREATE_KEY) } catch { /* 忽略 */ }
+    return
+  }
+  const current = pendingCreate.value
+  if (current && current.token !== pending.token) return
   pendingCreate.value = pending
   try {
-    if (pending === null) sessionStorage.removeItem(PENDING_CREATE_KEY)
-    else sessionStorage.setItem(PENDING_CREATE_KEY, JSON.stringify(pending))
+    sessionStorage.setItem(PENDING_CREATE_KEY, JSON.stringify(pending))
   } catch {
     /* 会话存储不可用时只在内存里保留，不影响本次会话的核对能力 */
   }
+}
+
+/**
+ * 只消费**本次操作自己的**待核对命令（按原令牌核对）。
+ *
+ * 槽位已被别的操作占用（自己的发送前写入曾被拒绝），或已被自己的回执命中
+ * 提前消费时，这次消费是 no-op——迟到的续体不得连带销掉别人的命令（S2）。
+ */
+function releasePendingCreate(token: string): void {
+  if (pendingCreate.value?.token !== token) return
+  pendingCreate.value = null
+  try { sessionStorage.removeItem(PENDING_CREATE_KEY) } catch { /* 忽略 */ }
 }
 
 /** 当前账号 UID（未登录为 null），用于判定待核对项还属不属于本页面。 */
@@ -778,9 +808,14 @@ async function runCreateFlow(data: TaskCreate, scope: FrozenWriteScope): Promise
     if (pageAlive.value) ElMessage.error(detailOf(error) || '无法取得该分区的当前状态，请稍后重试')
     return false
   }
-  // R4：每个 await 之后都是页面可能已经不在的边界——死页面不弹旧结果、
-  // 不继续新投递。
+  // R4/S3：每个 await 之后都是页面可能已经不在、账号可能已经变化的边界——
+  // 死页面不弹旧结果；冻结账号已不是当前账号时，旧意图停止投递（发送前的
+  // 共同入口 submitCreation 还会再核一次）。
   if (!pageAlive.value) return false
+  if (!taskStore.writeScopeIsCurrent(scope)) {
+    ElMessage.warning('登录账号已变化：本次创建未发送，请按当前账号重新操作')
+    return false
+  }
   // 服务端以真实原因拒绝（例如该分区任务正在执行）：如实展示并结束本次创建。
   if (!preview.creation_allowed) {
     ElMessage.error(preview.reason || '当前无法在该分区创建任务')
@@ -796,8 +831,13 @@ async function runCreateFlow(data: TaskCreate, scope: FrozenWriteScope): Promise
   }
   if (frozen.existing_is_unfinished) {
     const confirmed = await confirmReplaceTask(preview, frozen)
-    // R4：确认框回来时页面可能已经卸载——不放行旧确认续体，不再发出新的写请求。
+    // R4/S3：确认框回来时页面可能已经卸载、账号可能已经变化——不放行旧确认
+    // 续体，尚未发出的旧账号写请求在此停止投递。
     if (!pageAlive.value) return false
+    if (!taskStore.writeScopeIsCurrent(scope)) {
+      ElMessage.warning('登录账号已变化：本次创建未发送，请按当前账号重新操作')
+      return false
+    }
     if (!confirmed) {
       ElMessage.info('已取消创建')
       return false
@@ -808,6 +848,14 @@ async function runCreateFlow(data: TaskCreate, scope: FrozenWriteScope): Promise
 
 async function submitCreation(data: TaskCreate, preview: FrozenCreationPreview,
                               token: string, scope: FrozenWriteScope): Promise<boolean> {
+  // P2/S3：**共同发送入口**的发送前资格复核——页面存活 + 冻结账号仍是当前账号。
+  // 换号后旧账号的意图在此停止投递（POST=0）；后端冻结 UID 防线是第二道，
+  // 不是第一道。
+  if (!pageAlive.value) return false
+  if (!taskStore.writeScopeIsCurrent(scope)) {
+    ElMessage.warning('登录账号已变化：本次创建未发送，请按当前账号重新操作')
+    return false
+  }
   // 这次提交是否在重放**一份已持有的未知命令**（同一个令牌）：是的话，本轮收到的
   // 任何明确拒绝都只说明"这一轮没受理"，不能否定此前那次未知尝试（R2）。
   const wasHeld = pendingCreate.value?.token === token
@@ -827,7 +875,7 @@ async function submitCreation(data: TaskCreate, preview: FrozenCreationPreview,
     // "待核对"条收敛。
     if (!pageAlive.value || !taskStore.writeScopeIsCurrent(scope)) return false
     reportCreated(res)
-    holdPendingCreate(null)
+    releasePendingCreate(token)
     return true
   } catch (error: unknown) {
     if (!pageAlive.value || !taskStore.writeScopeIsCurrent(scope)) {
@@ -840,9 +888,10 @@ async function submitCreation(data: TaskCreate, preview: FrozenCreationPreview,
       const resolved = await lookupReceipt(token, scope)
       if (!pageAlive.value || !taskStore.writeScopeIsCurrent(scope)) return false
       if (resolved) {
-        holdPendingCreate(null)
+        releasePendingCreate(token)
         return true
       }
+      // 同一令牌再持有：允许刷新自己的那一项；别的操作的命令不会被覆盖（S1/S2）。
       holdPendingCreate({ zoneName: data.zone_name, data, preview, token, scope })
       // 关掉新建框：这次操作已经离开表单，结果由"待核对"条统一跟进——
       // 否则模态遮罩会把那条提示压在下面，用户根本看不到。
@@ -859,9 +908,9 @@ async function submitCreation(data: TaskCreate, preview: FrozenCreationPreview,
         await taskStore.fetchTasks()
         return false
       }
-      // 原请求自己被明确拒绝（预检前置条件已经变了），因此可以销掉这次待核对；
-      // 与"后一次重试被拒"不是一回事（G1 钉住这一点）。
-      holdPendingCreate(null)
+      // 原请求自己被明确拒绝（预检前置条件已经变了），因此可以销掉**这一次
+      // 操作**的待核对；与"后一次重试被拒"不是一回事（G1 钉住这一点）。
+      releasePendingCreate(token)
       await taskStore.fetchTasks()
       ElMessage.warning(detail)
       return false
@@ -873,7 +922,7 @@ async function submitCreation(data: TaskCreate, preview: FrozenCreationPreview,
     }
     // 无前序未知的明确拒绝（响应已收到、结果确定）：发送前持有的这一项现在消费掉
     // （R3 的对称面——不留下一条已知被拒、永远核对不到的僵尸命令）。
-    holdPendingCreate(null)
+    releasePendingCreate(token)
     ElMessage.error(detail || '创建失败（数据未变更）')
     return false
   }
@@ -906,6 +955,10 @@ async function lookupReceipt(token: string, scope: FrozenWriteScope): Promise<bo
     // 不弹结果、不刷新展示；原命令保持持有，由回到原账号后的待核对条收敛。
     if (!pageAlive.value || !taskStore.writeScopeIsCurrent(scope)) return false
     if (!receipt.found) return false
+    // 回执命中即**本次操作**的确定终态：在列表刷新等待之前就消费自己的待核对
+    // 命令（按令牌作用域）——迟到的续体（刷新、提示）不再持有销账权，正常交错
+    // 下也让新操作拿到空槽位（S2）。
+    releasePendingCreate(token)
     const result = receipt.result || {}
     reportReceipt(result)
     await taskStore.fetchTasks({ fresh: true })
@@ -936,7 +989,8 @@ async function checkPending() {
   pendingBusy.value = true
   try {
     if (await lookupReceipt(pending.token, pending.scope)) {
-      holdPendingCreate(null)
+      // 兜底（通常已在回执命中时消费）：只销**自己**的令牌，不连带别的操作。
+      releasePendingCreate(pending.token)
     } else if (pageAlive.value && taskStore.writeScopeIsCurrent(pending.scope)) {
       ElMessage.warning('还没有查到这次创建的成功回执：不能据此认为没有执行，原命令继续保留')
     }
