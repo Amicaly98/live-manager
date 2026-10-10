@@ -99,8 +99,14 @@ NEGATIVE_CONTROL_EXIT=1
 结论（对照构建日志与文件系统）：进程以 1 退出；**前端与 Electron 步骤一次都没跑**
 （日志里没有它们）；`backend/dist/run.exe` 与 `release/win-unpacked/resources/backend/run.exe`
 都已被删除且**没有**重新出现——即"上一轮的 `run.exe` 不可能被顺手打进包"。
-对照结束后已重建 `backend/dist/run.exe`，并把 `release/win-unpacked/…/run.exe`
-从交付目录还原为与 `build-manifest.json` 一致的那一份（哈希已复核）。
+
+对照结束后：重建了 `backend/dist/run.exe`；并把
+`release/win-unpacked/resources/backend/run.exe` 从交付目录还原为与
+`build-manifest.json` 一致的那一份（哈希已复核）。
+还原这一步是必要的，因为清理是**两步都做**的——只重建后端（`--only=backend`）同样会
+清掉包内那一份，理由是此时"包内副本相对新后端已经过期"。这属于有意的保守行为，
+不是缺陷；但它意味着**只重建后端不会得到一个自洽的 `win-unpacked`**，
+要自洽就得跑完整构建。
 
 ## 四、实际包验证（不是源码兜底）
 
