@@ -33,6 +33,9 @@ Electron 主进程（单实例锁 → 端口 → 后端 → 窗口）
 - **旧资料接管**：升级前的 `live_state.json` / `live_tasks.db` 在**第一次领取账号目录之前**
   迁移进 `accounts/<uid>/`；归属判据取库登记 `tasks_meta.account_owner_uid`、
   场次快照的运行账号、或旧档房间号——**归属不明不自动认领、也不建空库**，原件保留。
+  用安装包**原地升级**时，安装器（`build/installer.nsh`）会在旧版卸载器清空安装根目录
+  **之前**把已知的旧数据文件复制到 `<appData>/<应用名>/legacy-rescue`，应用再把这个
+  目录交给同一条接管链——否则 1.0.x 落在安装根目录里的资料会在"升级成功"的同时被删掉。
 - **两种退出**（外加显式放弃等待）：`停止并退出` 先经同一 `ControlService` 停播并核对
   关房，再收本地资源；`不停止并退出` 不发平台 Stop，只回收自有媒体与后端、保留恢复依据。
   未确认收齐时**不**静默强杀：保留后端与账号占用，页面显示失败/待核对并允许重试。
@@ -75,6 +78,7 @@ live-manager/
 │   ├── backendManager.ts         # 纯逻辑：后端 owner 状态机 + 端口占用判定
 │   └── preload.ts                # contextBridge IPC
 ├── dist-electron/                # TS 编译产物（gitignore）
+├── build/installer.nsh           # NSIS 自定义片段：覆盖安装前保全旧资料（nsis.include）
 └── package.json                  # 构建链
 ```
 
@@ -148,7 +152,7 @@ npm run dev:electron    # 一键启动桌面应用（源码模式，后端走 py
 
 | 文档 | 内容 |
 |------|------|
-| [HANDOFF.md](HANDOFF.md) | 交接文档：运行链、存储、API 与历史勘误 |
+| （本地工作文档）`HANDOFF.md` | 交接草稿：运行链、存储、API 与历史勘误。**它在本仓库 `.gitignore` 内，不随提交分发**——需要交付的现行说明请以本 README 与 `docs/` 下的阶段文档为准 |
 | [docs/SERVER-PORT-PHASE1-20261009.md](docs/SERVER-PORT-PHASE1-20261009.md) | 移植阶段 1：后端核心与旧数据接管 |
 | [docs/SERVER-PORT-PHASE2-20261010.md](docs/SERVER-PORT-PHASE2-20261010.md) | 移植阶段 2：页面接入、退出与防多开 |
 | [docs/SERVER-PORT-PHASE3-20261010.md](docs/SERVER-PORT-PHASE3-20261010.md) | 移植阶段 3：打包与精简收尾（构建链、实际包验证） |

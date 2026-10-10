@@ -242,6 +242,15 @@ function getBackendCommand(): { cmd: string; args: string[] } {
  * D4：旧版本（1.0.x）数据目录候选，经 --legacy-data-dir 明确传给后端。
  * 旧版 spawn 未设 cwd → 数据落在进程工作目录（安装根）；另含 resources
  * 目录作为兜底候选。只传"存在且含已知旧数据文件"的目录。
+ *
+ * 阶段 3 A 包：安装器（build/installer.nsh 的 customInit）在**覆盖安装清空安装根
+ * 目录之前**，把旧数据复制到 `<appData>/<应用名>/legacy-rescue`。这里把它也作为
+ * 候选交给后端，走的就是同一条既有迁移/接管链，没有第二套入口。
+ *
+ * 为什么写成 `appData + 应用名` 而不是 `userData`：安装器只会写到这个**固定**位置
+ * （它不知道也拿不到本进程的 userData）。正常运行时二者就是同一个目录
+ * （`userData === appData/<应用名>`）；只有显式传了 `--user-data-dir` 时才会分叉，
+ * 那时仍然要能读到安装器放下的那一份。
  */
 function getLegacyDataDirs(): string[] {
   const knownOldFiles = ['live_state.json', 'live_tasks.db', 'bili_cookies.json', 'settings.json'];
@@ -252,6 +261,7 @@ function getLegacyDataDirs(): string[] {
       candidates.push(process.resourcesPath);
       candidates.push(path.join(process.resourcesPath, 'backend'));
     }
+    candidates.push(path.join(app.getPath('appData'), app.getName(), 'legacy-rescue'));
   } catch { /* 忽略 */ }
   return candidates.filter(dir => {
     try {

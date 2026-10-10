@@ -24,7 +24,15 @@ from typing import List, Tuple
 
 logger = logging.getLogger(__name__)
 
-# 旧布局 → 新布局的文件名映射（同名文件）
+# 旧布局 → 新布局的文件名映射（同名文件）。
+#
+# ``stop_intent.json`` 是桌面旧版的"用户停止意图"（阶段 1 计划 §4 要求接管的旧字段
+# 之一）：它由旧控制器写在旧工作目录（安装场景即安装根目录），而
+# ``session_runtime.desktop.read_stop_intent`` 读的是**数据目录**里的同名文件。
+# 不把它列进来，"升级前人工停止过"这件事就永远走不到接管链上。
+#
+# 安装器侧的保全清单（build/installer.nsh）与本清单是本模块唯一的对应关系：
+# 这里加一个名字，那边就要跟着加，否则该文件在覆盖升级里仍会被卸载器删掉。
 _MIGRATED_FILES = [
     "live_state.json",
     "bili_areas_full.json",
@@ -34,6 +42,7 @@ _MIGRATED_FILES = [
     "live_tasks.db",
     "live_tasks.xlsx",
     "task_manager_last_run.json",
+    "stop_intent.json",
 ]
 
 _SQLITE_SUFFIXES = ('.db',)

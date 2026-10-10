@@ -1,9 +1,84 @@
 # 桌面移植第三阶段交付说明（打包与精简收尾）
 
-- 日期：2026-10-10
-- 分支：`port-server-core-20261009`（入场 HEAD `4880123c474db9081de6ffc057fa43599c41b155`，
-  本阶段提交 `26354aaf07b5d5dee915776b41627fb11a2ad3b7`）
+- 日期：2026-10-10（含当日独立复核后的返修）
+- 分支：`port-server-core-20261009`（入场 HEAD `4880123c474db9081de6ffc057fa43599c41b155`）
+- 提交：正文 `26354aaf07b5d5dee915776b41627fb11a2ad3b7`，文档补记 `734fa91`、`efb9f4b`；
+  **独立复核后的返修见第零节**（父提交 `efb9f4b`）
 - 状态：**第三阶段候选完成，待独立复核**。未推送、未公开发布、未改服务端、未触碰日常数据目录。
+
+## 零、独立复核后的两包返修（本轮新增）
+
+独立复核（`F:/livestream/deliveries/desktop-port-phase3-review-efb9f4b-20261010/REVIEW.md`）
+结论为「暂不通过」，两条：**A 覆盖升级会删除旧资料**（原计划的"升级资料不丢"未满足）、
+**B 媒体采证工具存在假绿**（结束命令失败也照样判通过；进程查询失败被当成 0）。
+本轮只修这两处，不重刷整仓、不重跑历史阶段。
+
+### A：覆盖升级的旧资料保全（改产品）
+
+原来的事实：1.0.x 的 Electron 用 spawn 拉起后端且未设 cwd，运行时数据落在**安装根目录**；
+同 appId 覆盖安装时，安装器先静默跑**旧版**卸载器，而旧卸载器会 `RMDir /r $INSTDIR`，
+资料在"升级成功"的同时消失。旧版驱动把这一点登记成"记录存活情况"（恒为 true），
+因此 85/85 覆盖不了这条完成条件。
+
+修法（不重写迁移体系，只补两个接缝）：
+
+- **新增 `build/installer.nsh`**（electron-builder 的 `nsis.include` 约定路径，自动拾取）。
+  在 `.onInit` 的 `customInit` 里——**早于 `installSection.nsh` 调用的 `uninstallOldVersion`**
+  ——把已知的旧数据文件从 `$INSTDIR`（以及注册表 `InstallLocation` 登记的位置）复制到
+  `%APPDATA%\<包名>\legacy-rescue`。复制清单与后端 `data_migration._MIGRATED_FILES`
+  对齐，另带 `live_tasks.db` 的 `-wal`/`-shm`（后端用 SQLite backup API 做一致性快照，
+  只拿主库会丢掉还在 WAL 里的已提交内容）。只在检测到旧数据文件时才建目录。
+- **`electron/main.ts`**：`getLegacyDataDirs()` 增加
+  `path.join(app.getPath('appData'), app.getName(), 'legacy-rescue')` 作为候选，
+  仍走既有的 `--legacy-data-dir` 入口。写成 `appData + 应用名` 而不是 `userData`，
+  是因为安装器只会写到这个固定位置（正常运行时两者本就是同一个目录）。
+- **`backend/app/core/data_migration.py`**：`_MIGRATED_FILES` 补 `stop_intent.json`。
+  它是计划 §阶段 1.4 明确要求接管的旧字段，而 `desktop.read_stop_intent` 读的是
+  数据目录里的同名文件——不列进来，"升级前人工停止过"这件事永远走不到接管链上。
+
+**没有**新建迁移入口、**没有**改归属判定、**没有**改 appId 或 userData 路径。
+
+### B：媒体采证工具（只改夹具/驱动，不改产品）
+
+- `countFfmpegFor` 现在**观察失败即抛出**（spawn 失败、非零退出、超时、结果解析不出、
+  部分进程的命令行读不出），只有"命令成功且确实列出空结果"才返回 0。新增
+  `observeFfmpegFor` 包装，未知一律记 `{count: null, error}`，绝不折算成 0。
+- 媒体中断段改为：**先留结束命令回执、再按本场景持有的媒体身份确证原对象退出，
+  才谈中断后的行为**。前提没确证时，2.14–2.17 四项按"未取得"（失败）计，不再空过。
+- 夹具前提修正：合成素材从 8 秒改成 900 秒。8 秒素材会让后端起的 ffmpeg 在场景跑到
+  "媒体中断"之前就播完退出（随后被重新拉起、PID 也换掉），于是那一步打的其实是一个
+  早已不存在的 PID——旧写法下中断根本没发生却照样全绿。本轮实测复现了这一点
+  （`alive_before=false`、`taskkill` 返回 128 找不到进程），修正后为
+  `alive_before=true / status=0 / alive_after=false`。
+
+`packaged-smoke.mjs` 里被复核探针抽取的那两段保持"只依赖 `check` / `spawnSync` /
+`pidAlive` / `sleep` / `countFfmpegFor` / `api` / `platform`"，因此复核方原有的
+`probe_media_evidence.cjs` 可以**原样**再跑（见第五节）。
+
+### 返修后的实测
+
+| 事项 | 结果 |
+|---|---|
+| 真实 1.0.0 → 返修后 1.1.1 覆盖升级（`smoke-r2`，`--only=legacy,upgrade`） | A 包 4.00–4.15 全通过；B 包 2.13c 如实报红（见下） |
+| `--only=legacy` 重跑（`smoke-r3`，媒体夹具修正后） | **40/40**，`errors: []`，2.13c–2.17 全部真实取得 |
+| 复核方自己的 `probe_media_evidence.cjs` 对返修后驱动再跑 | 4 run / 0 failure / 0 ERROR（T1/G1/T2/G2 全 PASS） |
+
+A 包的关键判据（`smoke-r2/aggregate.json`）：保全目录
+`C:\Users\chenz\AppData\Roaming\bilibili-live-manager\legacy-rescue` 里五份文件与安装前
+原件**逐字节相同**；同一时刻安装根目录里的原件**已被清掉**（`survived=[]`）——两条合起来
+才是"删除之前先复制"；应用认定的落点与安装器实际写入的目录**是同一个**；五份文件经既有
+入口进入数据目录；接管后任务参数与完成天数原样（`3 / 12 / 7 / 2026-12-01`）；保全目录里的
+原件在接管后仍在且未变（来源可恢复）；升级后启动零自动开播；受控退出后端收回、8000 释放。
+
+B 包那一条如实报红是因为**夹具前提当时不成立**（见上一节），不是产品缺陷——这正是被
+指出的空过被堵上之后应有的表现。
+
+### 仍然成立的两条既有事实
+
+- **PyInstaller 单文件不逐字节可复现**：本次构建 `run.exe` 又是新的哈希与字节数
+  （`3c746a0e…` / 46,051,537），与前三次都不同。绑定判据仍然只能是同一次构建内比对。
+- `--only=backend` 也会清掉 `release/win-unpacked/resources/backend/run.exe`（有意保守）。
+
 
 ## 一、这一阶段解决的真实缺口
 
@@ -20,7 +95,7 @@
 
 ## 二、提交范围（本轮实际修改）
 
-### 构建（`backend/run.spec`、`package.json`、`scripts/build-release.mjs`）
+### 构建（`backend/run.spec`、`package.json`、`scripts/build-release.mjs`、`build/installer.nsh`）
 
 - `run.spec`：`hiddenimports` 补齐到当前真实导入面——`session/` 10 个模块、
   `session_runtime/` 19 个模块、`app.dependencies`、`app.core.area_data /
@@ -50,24 +125,33 @@
 
 ### 未改动
 
-`electron/`、`frontend/`、`backend/app/` 的**产品源码一行未改**。本阶段只改构建配置、
-构建入口与文档。这一点对下面的"退出衔接"证据很重要：退出链相关代码与阶段 2 逐字节相同。
+`frontend/`、`backend/app/` 的**产品源码一行未改**。本阶段只改构建配置、构建入口与文档。
+这一点对下面的"退出衔接"证据很重要：退出链相关代码与阶段 2 逐字节相同。
+
+> **勘误（返修后）**：独立复核的 A 包修到了产品行为，上面这段只描述**第一版**：
+> 返修新增了 `build/installer.nsh`，改了 `electron/main.ts` 的 `getLegacyDataDirs()`
+> 与 `backend/app/core/data_migration.py` 的 `_MIGRATED_FILES`（见第零节）。
+> `backendManager.ts` 与退出链仍未改动。
 
 ## 三、构建产物与绑定事实
 
 | 产物 | 路径 | 字节 | SHA256 |
 |---|---|---|---|
-| 安装版（NSIS） | `release/直播控制系统 Setup 1.1.1.exe` | 128,427,593 | `9e0a8fe853129f1a9f2841ca152858becccaf511aecc74a201e58ec252f82778` |
-| 便携版 | `release/直播控制系统 1.1.1.exe` | 128,211,507 | `b66921653f198efd8e4ef0c064300fd8d0de6908d973ebdf8bb8cd3c76ef2263` |
-| 包内后端 | `release/win-unpacked/resources/backend/run.exe`（与两个包内同一文件） | 46,053,813 | `26cee87a409182c3e498fa49d191e6e798bc20a53919877aa7f671bf27abdaa3` |
+| 安装版（NSIS） | `release/直播控制系统 Setup 1.1.1.exe` | 128,426,353 | `5faf628fc75906a0d958e9bad21392cdbc6b94855fed0b9ebb46973dacc33b5c` |
+| 便携版 | `release/直播控制系统 1.1.1.exe` | 128,209,574 | `ce57c7dffb43f066fa14bf84145581c0210bdae79409013730f9c48967f62349` |
+| 包内后端 | `release/win-unpacked/resources/backend/run.exe`（与两个包内同一文件） | 46,051,537 | `3c746a0ee4be46d8db7fcb46ba4e9c02a59ad7884a1a05fbc385413d0c6f6e87` |
 | 构建输入：分区种子 | `backend/build-inputs/bili_areas_full.json`（未跟踪） | 72,654 | `648ac56d76938bde5601e6c3e1b912affc7aed5862ac586de4229d79be94c768` |
+
+> **勘误**：上表是**返修后**（父提交 `efb9f4b` + 本轮两包）的构建。返修前那一版
+> （`Setup` 128,427,593 / `9e0a8fe8…`，便携 128,211,507 / `b6692165…`，`run.exe`
+> 46,053,813 / `26cee87a…`）已被本次构建覆盖，从未推送或发布，仅在本说明的历史版本里出现过。
 
 构建环境：Node `v22.20.0`（`tools/node-v22.20.0-win-x64`）、Python `3.12.2` +
 PyInstaller `6.19.0`（`F:/python/python.exe`）。三者都记在 `build-manifest.json` 里。
 
-构建时的源码 = 本阶段提交 `26354aa`：产物是在**带着这批改动的工作树**上构建的
-（`build-manifest.json` 里 `working_tree_dirty=true` 以及记录的 `commit=4880123c`
-反映的就是这一点）；提交内容与构建时的源文件逐字相同，此后未再改动产品源码。
+构建时的源码 = 本阶段提交 `26354aa` + 两轮返修的工作树：产物是在**带着这批改动的工作树**
+上构建的（`build-manifest.json` 里 `working_tree_dirty=true`、`commit` 是当时 HEAD
+`efb9f4b`，反映的就是这一点）；提交内容与构建时的源文件逐字相同，此后未再改动产品源码。
 
 **包内后端 = 本次源码构建**：构建脚本与冒烟各核对一次（`1.03`），哈希与上表一致。
 PyInstaller 的分析图（`backend/build/run/xref-run.html`）里能看到
@@ -141,7 +225,10 @@ NEGATIVE_CONTROL_EXIT=1
    （"二次恢复不产生重复媒体"这一条在 `smoke-final` 里是**弱绿**：采样窗口落在媒体
    生成期之后，全 0，虽然峰值 ≤ 1 成立但没观测到对象。已把采样起点挪到点「继续场次」
    之前，并用 `--only=legacy` 窄跑复核（`smoke-dup-check`，39/39）：采样为
-   `0,0,1,0,…,1,0…`，**峰值恰好 1**，从未同时出现两份本场景媒体。）
+   `0,0,1,0,…,1,0…`，**峰值恰好 1**，从未同时出现两份本场景媒体。
+   **返修后的复核又发现这一节还有更强的空过**：媒体中断那一步打的是 8 秒素材播完后
+   早已消失的 PID（`taskkill` 返回 128），中断根本没发生，四项判据却照样全绿——
+   见第零节 B 包与 `smoke-r3`。）
 3. **冻结程序里的账号原生锁（`legacy` 内）**：另一份**本次构建**的 run.exe、独立端口
    8101、同一隔离账号根 → 同 UID 绑定返回 409 且未安装，`instance_errors` 明写
    `账号已被占用：锁已被占用（WinError 32）`（不是别的构造错误）；账号库 mtime 一字节
@@ -151,9 +238,11 @@ NEGATIVE_CONTROL_EXIT=1
    未产生第二份自有媒体、已有窗口被唤起；同版重复启动同样如此。
 5. **实际旧安装包 → 本轮新安装包（`upgrade`）**：本机 `release/` 里有 2026-05-20 构建的
    `直播控制系统 Setup 1.0.0.exe`（ProductVersion=1.0.0，sha256 `b85a3fbe…`）。在同一隔离
-   目标上先装 1.0.0、再覆盖装 1.1.1 → 升级后的包内 `run.exe` 仍是本轮构建产物；
-   升级后的安装版跑的是包内 `run.exe`，把（显式旧位置里的）旧资料接管成功
-   （`category=3 / total=12 / days_done=7 / deadline=2026-12-01` 原样），启动零自动开播、
+   目标上先装 1.0.0、把合成旧资料放进**安装根目录**（1.0.x 的真实数据位置）、再覆盖装
+   1.1.1。**返修后**这一节验的是第零节 A 包那条链（4.00–4.15）：原件在覆盖安装里被清掉
+   的同时，安装器已经把逐字节相同的五份文件保全到 `legacy-rescue`；升级后的安装版跑的是
+   包内 `run.exe`，自动找到这个目录并经既有入口接管（`category=3 / total=12 / days_done=7
+   / deadline=2026-12-01` 原样），保全目录里的原件接管后仍在，启动零自动开播、
    呈现恢复入口、受控退出正常。
 6. **收尾清扫**：全部场景结束后没有遗留的自有后端进程，8000/8101 均空闲。
 
@@ -167,14 +256,14 @@ NEGATIVE_CONTROL_EXIT=1
 （旧版 spawn 未设 cwd，数据恰好落在这里）。
 
 后果与边界：`run.py` 的"安装根目录里发现旧数据并迁移"这条路径，在**用户用安装包原地
-升级**的真实场景里通常**没有东西可迁**。要迁移必须让旧资料先到一个能存活的位置
-（手工复制出来、或用既有的显式旧位置入口 `BILIBILI_LEGACY_DATA_DIR`）。
-场景 5 的第二半正是按后者验证的，因此——
+升级**的真实场景里通常**没有东西可迁**。要迁移必须让旧资料先到一个能存活的位置。
 
-> **可以说"旧安装器升级后的安装版能接管仍存在的旧资料"；不能说"旧安装器升级 +
-> 安装根目录旧数据自动迁移已验证"。**
-
-这一条属于升级路径的既有风险，本阶段只如实登记，未改产品行为。
+> **勘误（返修后）**：上面这段是本阶段第一版**当时的事实与结论**。独立复核指出它不满足
+> 原计划的"升级资料不丢"完成条件，返修已改产品：安装器在旧卸载清空 `$INSTDIR` **之前**
+> 把旧资料复制到 `%APPDATA%\<包名>\legacy-rescue`，应用经既有入口接管（见第零节 A 包）。
+> 现在**可以**说"旧安装器升级 + 安装根目录旧数据自动迁移已验证"（`smoke-r2` 4.05/4.06/4.09
+> 三条一起构成判据）。"手工把旧资料搬到别处再用 `BILIBILI_LEGACY_DATA_DIR`"这条路径**仍然
+> 有效**，是给归属不明或已离开安装目录的资料用的显式入口，本轮未改。
 
 ### 本轮驱动的返修（采证缺陷，不是产品缺陷）
 
@@ -204,6 +293,10 @@ NEGATIVE_CONTROL_EXIT=1
 另外，`upgrade` 场景必须排在依赖"安装目录还在"的场景**之后**：同 appId 覆盖安装会先
 卸载既有安装（见下面的发现），先跑它会把别场景的安装顺手清掉。
 
+上表是**第一轮**（85/85 那一轮）修掉的五处。独立复核之后又修了第二轮的采证问题
+（结束命令回执、进程观察未知、8 秒素材造成的中断前提不成立），见第零节 B 包——
+它们属于同一类"工具造成的假绿"，不是产品缺陷。
+
 ## 五、沿用的证据 / 未取得项
 
 沿用的既有证据（本轮未重跑，按阶段 2 的减负规则）：
@@ -217,32 +310,49 @@ NEGATIVE_CONTROL_EXIT=1
   "重复 before-quit 被挡住直到同一份收尾完成"、"退出未确认则保持存活"）覆盖。
   本轮未连接 GitHub 下载或安装真实更新。
   → **"退出衔接与阶段 2 相同、由模块证据覆盖"成立；"公网自动更新已验证"不成立。**
+  （返修动了 `main.ts` 的 `getLegacyDataDirs()`——旧资料候选表，与退出链无关；
+  `tsc` 编译通过，退出相关的模块用例本轮未再重跑，仍是阶段 2 的证据。）
 
 未取得 / 未验证：
 
 - 真实 B 站账号、真实推流到平台、真实 SMTP 与 Server酱发送、生产数据迁移。
-- 公网自动更新的下载与安装（只核对了退出衔接）。
+- 公网自动更新的下载与安装（只核对退出衔接）。
 - macOS / Linux 产物（本轮只做 Windows）。
 - 安装到含空格路径的静默安装（沿用 1.0.0/1.1.0 阶段已知限制：`/D=` 在首个空格处截断；
   本轮隔离目标一律不含空格）。
 - 安装包代码签名（未签名，SmartScreen 可能提示）。
+- **按机器（per-machine / "为所有用户"）安装**下的保全落点：安装器写的是**当前用户**的
+  `%APPDATA%`，而提权重启后的内层实例可能是管理员上下文。本产品是按用户安装
+  （`RequestExecutionLevel user`），本轮只验了这条路径。
 
 ## 六、证据目录（仓库外）
 
 `F:/livestream/deliveries/desktop-port-phase3-20261010/`
 
-- `packaged-smoke.mjs`、`smoke-final.log`、`smoke-final/aggregate.json` 与截图、
-  各场景的 main/stdout/stderr 日志、`platform.*.log`
-- `smoke-dup-check.log` / `smoke-dup-check/`：`--only=legacy` 的窄跑，
-  用改好的采样窗口（在点「继续场次」**之前**开始采样）复核"二次恢复不产生重复媒体"
-- `upgrade-repro.ps1` / `upgrade-repro.log`（覆盖安装清空安装目录的受控复现）
-- `artifacts/`（安装版、便携版、包内 `run.exe`、`build-manifest.json`、`SHA256SUMS.txt`）
+- `packaged-smoke.mjs`（返修后的驱动）、`smoke-final.log`、`smoke-final/aggregate.json`
+  与截图、各场景的 main/stdout/stderr 日志、`platform.*.log`
+- `smoke-r2.log` / `smoke-r2/`：返修后 `--only=legacy,upgrade` 的窄跑。A 包 4.00–4.15
+  全通过；B 包 2.13c 如实报红（夹具前提不成立，见第零节）
+- `smoke-r3.log` / `smoke-r3/`：媒体夹具修正后 `--only=legacy` 重跑，**40/40**、
+  `errors: []`，2.13c–2.17 真实取得
+- `probe_media_evidence.cjs` / `media-evidence-rerun.log` / `media-evidence-summary.json`：
+  **复核方原有的探针原件**，`SMOKE_SOURCE` 指向返修后的驱动再跑一次，4 run / 0 failure /
+  0 ERROR（T1/G1/T2/G2 全 PASS）
+- `rescue-probe.mjs`：A 包的快速独立探针（只验安装器侧保全，用真实两个安装包）
+- `smoke-dup-check.log` / `smoke-dup-check/`：第一轮 `--only=legacy` 的窄跑
+- `upgrade-repro.ps1` / `upgrade-repro.log`（覆盖安装清空安装目录的受控复现，返修前）
+- `artifacts/`（返修后的安装版、便携版、包内 `run.exe`、`build-manifest.json`、`SHA256SUMS.txt`）
+- `full-build.log`：返修后的整链构建日志
 - 中间轮次的 `smoke-*.log` / `smoke-*/` 一并保留，便于对照（不删除既有 release 内容）
 
 ## 七、边界
 
 - 未推送、未打标签、未创建公开 release、未上传任何产物。
 - 未修改服务端仓库；未触碰日常使用的数据目录与现有安装。
-- 为验证而做的安装（1.1.1 与 1.0.0 各一次）已在脚本收尾时静默卸载并核对清空。
+- 为验证而做的安装（1.1.1 与 1.0.0）已在脚本收尾时静默卸载并核对清空：无遗留进程、
+  8000/8101 空闲、无卸载登记、无快捷方式。
+- 安装器保留下来的 `%APPDATA%\<包名>\legacy-rescue` 是**产品行为**（升级后仍是一份可
+  恢复的旧资料副本，与既有的"迁移后不删旧文件"一致）；验证用的那一份已由驱动在收尾时
+  删除，`smoke-r2/aggregate.json` 的 4.15 是这条事实。
 - `HANDOFF.md` 已按现实现重写，但它在仓库既有 `.gitignore` 里（第 58 行），
   因此保持为**本地工作文档**、不随本次提交入库；`README.md` 与本文档是入库的那两份。
