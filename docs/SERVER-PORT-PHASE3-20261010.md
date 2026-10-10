@@ -1,9 +1,11 @@
 # 桌面移植第三阶段交付说明（打包与精简收尾）
 
-- 日期：2026-10-10（含当日两轮独立复核后的返修；第二轮返修的窄跑跨到 2026-10-11 凌晨）
+- 日期：2026-10-10（含当日两轮独立复核后的返修；第二轮返修的窄跑跨到 2026-10-11 凌晨，
+  第三轮 A 包返修在 2026-10-11）
 - 分支：`port-server-core-20261009`（入场 HEAD `4880123c474db9081de6ffc057fa43599c41b155`）
 - 提交：正文 `26354aaf07b5d5dee915776b41627fb11a2ad3b7`，文档补记 `734fa91`、`efb9f4b`；
-  **两轮独立复核后的返修见第零节**（`7681aeb`，父 `efb9f4b`；`f65b9ba`，父 `e0f23c7`）
+  **三轮独立复核后的返修见第零节**（`7681aeb`，父 `efb9f4b`；`f65b9ba`，父 `e0f23c7`；
+  第三轮 A 包见本节末）
 - 状态：**第三阶段候选完成，待独立复核**。未推送、未公开发布、未改服务端、未触碰日常数据目录。
 
 ## 零、独立复核后的两包返修（本轮新增）
@@ -115,7 +117,41 @@
   `uninstallOldVersion` 处 `SetErrorLevel 2` 退出、什么都不装，而驱动的症状只是
   "旧版安装产物超时"。已确认清理后修复。
 
+### 第三轮返修（独立复核 `72b26b1` → 本轮）
+
+复核结论：**B 包通过**（两组媒体探针原件 4/4、3/3，退出码 0）；**A 包还有三条 P1**，
+阶段暂不通过。三条都成立，全部落在同一个责任上——"旧卸载前取得安全、完整的保全结果"。
+本轮只动 `build/installer.nsh`（外加文档），B 包不重开。
+
+**R1：已有同大小的旧副本会掩盖真实的复制失败。** 原实现复制后只比源/目标大小，
+没有消费 `CopyFiles` 自己的错误标志；目标已存在且长度恰好相同时，"大小相同"
+这件事可能只是上一轮那份旧副本，本次复制其实失败了也照样 `exit=0` 继续。
+现在复制一律**先落进本次新建的干净候选目录**（`legacy-rescue-new`），那里不可能
+存在上一轮的旧副本，同时**显式读 `CopyFiles` 的错误标志**（`${If} ${Errors}`），
+再逐份核对大小。
+
+**R2：中止升级后，已有的保全目录可能变成混合资料。** 原实现往已有目录里逐文件覆盖，
+失败时只删"本次新建的"目录；已有目录里的四份新版 + 一份旧库会留在那里，而应用启动时
+还会把它当成一份完整来源。现在改成**独立候选 → 全部成功才整体切换**：
+候选完整之后才把已有保全 `Rename` 成 `legacy-rescue-old`、把候选换上去、再删掉旧的。
+任何一步不成就整体回退并**中止升级**：候选整个删掉，**已有保全一个字节都不动**
+（既不留混合目录，也不把已有完整保全删掉）。移不开（被占用）时同样什么都不动。
+
+**R3：停写保护没有覆盖复制窗口。** 原实现拿共享模式 0 打开旧主库确证停写后**立刻
+关掉**，再回头逐文件复制——只证明了打开那一瞬间没人持有，挡不住复制期间重新开库的
+写者（复核的受控交错里源库只出现过 `(0,0)→(1,0)→(1,1)`，副本却拼出了 `(0,1)`，
+`integrity_check` 还是 ok）。现在确证之后**立刻改握一个"只读 + `FILE_SHARE_READ`"的
+句柄并一直握到整族复制与核验结束**（成功/失败出口都释放）：其他读者还能读（`CopyFiles`
+读得到源），任何想拿写权限的进程都被拒。
+
+> 确证（共享模式 0）与握持（只读 + 共享只读）之间还有一个极短的空档，这段**是安全的、
+> 也是故意的**：若真有写者在这段挤进来并且还开着，第二个 `CreateFileW` 会直接失败 →
+> 按"取不到排写保护"中止；若它已经写完并退出，复制到的是它留下的那个**真实**状态，
+> 仍然是自洽的。挡住"复制窗口里重新开库"的是第二个句柄，它在复制与核验全程都在。
+
 ### 返修后的实测
+
+> 下表是**第二轮**返修后的实测（`smoke-r6` / `smoke-r7`）。第三轮的实测在同节末尾。
 
 | 事项 | 结果 |
 |---|---|
@@ -145,10 +181,66 @@ B 包的实测（`smoke-r6` 内）：2.13c 本次是**真中断**
 2.14–2.17 四项由前提门放行后真实取得；2.18 报 `app_exited=true`，读的是**应用自己**的退出
 事实（不再是媒体的那个布尔）。
 
-### 仍然成立的两条既有事实
+### 第三轮返修后的实测（A 包）
+
+宏级窄证现在有 7 条，全部用**真实 makensis 编译本文件里的保全宏**（只在交付目录里读写，
+不安装、不卸载、不写注册表、不碰 `%APPDATA%`）：
+
+| 事项（`rescue-macro-run.mjs`） | 结果 |
+|---|---|
+| A-n1 干净来源 + 不存在的目标 | exit 0、继续、五份文件逐字节一致、无候选/暂存残留 |
+| A-r1 真实复制失败（源文件被共享模式 0 占住 ⇒ `CopyFiles` 报错） | **中止**、不写继续标记、目标目录不存在 |
+| A-r2 停写未确证（源主库被别的进程持有） | **中止**、不产出拼接副本 |
+| A-r3 候选目录建不出来 | **中止** |
+| A-r4 已有保全被占用（同大小旧副本） | **exit 3 中止**、已有保全**逐字节未变**、无候补目录（复核 R1/R2 的受控情形） |
+| A-r5 已有保全被占用（不同大小） | **exit 3 中止**、已有保全**逐字节未变** |
+| A-n2 已有保全没被占用 | exit 0、整体替换、新保全完整、暂存目录已清掉 |
+
+排写保护覆盖复制窗口（`rescue-r3-probe.mjs`：真实 SQLite（WAL）+ 真实 NSIS 复制 +
+真实独立写者进程；两处观察闸门是**从当前文件机械生成**的副本，全文差异见
+`OBSERVATION-DIFF-r3.txt`，保护与复制语句一字未改）：
+
+| 事项 | 结果 |
+|---|---|
+| R3-n0 正对照：同一个写者、同样的调用，无保护时 | `opened=true`，真的写进去了 |
+| R3-r1 保护挂上之后 | `opened=false`（`attempt to write a readonly database`） |
+| R3-r2 主库复制完成、保护释放之前 | `opened=false` |
+| R3-r3 保全整体成功 | exit 0、继续、五份文件逐字节一致 |
+| R3-r4 保全副本是源库真实状态 | 副本 `(0,0)`（写者全程没进得去） |
+
+复核方自己的两个探针**原件**（逐字节复制到 `review-probes-rerun/`，用当前
+`build/installer.nsh` 重新编译它们的 harness）再跑：
+
+| 事项 | 结果 |
+|---|---|
+| `probe_existing_rescue.py`（R1/R2 那组） | **3 run / 0 failure / 0 ERROR，exit 0** —— G1 正常保全照常；R1 同大小旧副本下"复制失败却继续"的断言不再成立；R2 中止后已有保全 `previous_rescue_changed_files=[]` |
+| `probe_reopen_during_rescue.py`（R3 那组） | **写者被保护挡住**：它的第二阶段写者在"主库已复制、保护未释放"的闸门处开库失败，探针以异常报告这一点（复核方写明"修后如写者被保护挡住…应按该安全出口验证"，不要求保持旧形状） |
+
+`smoke-r8`（`--only=legacy,upgrade`）**62/62、`errors: []`**；`smoke-r9`
+（`--only=install,single`）**37/37**。关键判据（`smoke-r8/aggregate.json`）：
+`4.02c` 旧库被另一进程持有时安装器 **exit=3**、五份旧资料一份未动；`4.02d` 此刻
+**没有** `legacy-rescue` 也没有 `legacy-rescue-new`/`-old`；`4.03/4.05/4.06` 释放后正常
+升级、保全副本逐字节等于安装前原件、安装根目录里的原件确实已被清掉；`4.14b` 升级后再装
+一次（此时安装根目录里已经没有旧资料可保全）→ 已有保全**逐字节未变**、不留候选/暂存目录。
+`4.14` 受控退出后后端收回、8000 释放。
+
+> **一次作废轮次（如实登记）**：排查期间同一台机器上曾同时有两条冒烟驱动在跑（我自己的
+> 后台进程超时后没杀干净），表现为 `4.03` 上安装器 `0xC0000005` 退出或**静默悬挂**
+> （`uninstallOldVersion` 重试 5 次后弹一个没有 `/SD` 兜底的 MessageBox）。清干净进程、
+> 残留卸载登记与 `legacy-rescue` 之后，同一份产物 62/62。细节见交付目录
+> `smoke-r8-incident.txt` / `stray-processes.txt`。**这不是产品缺陷，也不是"没发生过"。**
+
+### 仍然成立的三条既有事实
 
 - **PyInstaller 单文件不逐字节可复现**：本次构建 `run.exe` 又是新的哈希与字节数
-  （`c249e31d…` / 46,053,460），与前四次都不同。绑定判据仍然只能是同一次构建内比对。
+  （`ec88145b…` / 46,053,280），与前五次都不同。绑定判据仍然只能是同一次构建内比对。
+  （更早那几版是 `c249e31d…` / 46,053,460、`4897219c…` / 46,054,704、`26cee87a…` /
+  46,053,813、`3ccd993c…` / 46,053,784。）
+- **electron-builder 的安装包也不是逐字节可复现的**：同一份源码、同一份
+  `build/installer.nsh`，用 `--only=electron` 重建出来的 `Setup 1.1.1.exe` 与全链构建的
+  不是同一串字节（`44ea18ff…` / 128,430,324 vs 交付的 `edea7e34…` / 128,430,464）。
+  所以**交付产物只能取自那一次全链构建**（`full-build-r4.log`）；重建之后必须按
+  `artifacts/SHA256SUMS.txt` 把三个二进制还原回去再跑冒烟。
 - `--only=backend` 也会清掉 `release/win-unpacked/resources/backend/run.exe`（有意保守）。
 
 
@@ -209,16 +301,18 @@ B 包的实测（`smoke-r6` 内）：2.13c 本次是**真中断**
 
 | 产物 | 路径 | 字节 | SHA256 |
 |---|---|---|---|
-| 安装版（NSIS） | `release/直播控制系统 Setup 1.1.1.exe` | 128,430,255 | `09d335df8641f25d0e256417426dcda128e10240d024d8ca6377a50975fcd8ca` |
-| 便携版 | `release/直播控制系统 1.1.1.exe` | 128,211,651 | `6814608ab1284ce4ec05367d19713d0b97ddfbcdcdf2df023fafb48455d78ff8` |
-| 包内后端 | `release/win-unpacked/resources/backend/run.exe`（与两个包内同一文件） | 46,053,460 | `c249e31d4209befeb3d17232363884542e0e327fb530c1a45c978b931da4813e` |
+| 安装版（NSIS） | `release/直播控制系统 Setup 1.1.1.exe` | 128,430,464 | `edea7e34b75d8e9b93b6a05d541a20d3848f6aa9c57adbde2067f894c83982ab` |
+| 便携版 | `release/直播控制系统 1.1.1.exe` | 128,211,842 | `3e30c59e9a9d70689b8b4a33eccb644513a48133349f25dfcecd5ffacfc88c1e` |
+| 包内后端 | `release/win-unpacked/resources/backend/run.exe`（与两个包内同一文件） | 46,053,280 | `ec88145ba43985443fc795df6081b0a0d971c7a52a9a587e06bb42c012b621f8` |
 | 构建输入：分区种子 | `backend/build-inputs/bili_areas_full.json`（未跟踪） | 72,654 | `648ac56d76938bde5601e6c3e1b912affc7aed5862ac586de4229d79be94c768` |
 
-> **勘误（第二轮返修后）**：上表是**本轮**（第二轮复核后的 A 包返修）的构建，安装/便携两个包
-> 因为改的是安装器脚本所以字节变了，`run.exe` 也换了（PyInstaller 单文件不可复现）。
-> 第一轮返修那一版（`5faf628f…` / 128,426,353、`ce57c7df…` / 128,209,574、
-> `3c746a0e…` / 46,051,537）与最初那一版（`9e0a8fe8…` / `b6692165…` / `26cee87a…`）
-> 都从未推送或发布，已被本次构建覆盖。
+`build/installer.nsh` 本次构建时的 sha256 = `4a5f9196b1fc9c18dfee74b5b6d98f9911e266929301f8d9f1b02babe8526c9c`。
+
+> **勘误（第三轮返修后）**：上表是**本轮**（第三轮复核后的 A 包返修）的构建。改的是安装器
+> 脚本，所以两个包的字节都变了；`run.exe` 也换了（PyInstaller 单文件不可复现）。
+> 第二轮那一版（`09d335df…` / 128,430,255、`6814608a…` / 128,211,651、`c249e31d…` / 46,053,460）、
+> 第一轮那一版（`5faf628f…` / 128,426,353、`ce57c7df…` / 128,209,574、`3c746a0e…` /
+> 46,051,537）与最初那一版（`9e0a8fe8…` / `b6692165…` / `26cee87a…`）都从未推送或发布。
 
 
 构建环境：Node `v22.20.0`（`tools/node-v22.20.0-win-x64`）、Python `3.12.2` +
@@ -406,18 +500,38 @@ NEGATIVE_CONTROL_EXIT=1
 
 - `packaged-smoke.mjs`（返修后的驱动）、`smoke-final.log`、`smoke-final/aggregate.json`
   与截图、各场景的 main/stdout/stderr 日志、`platform.*.log`
-- **`smoke-r6.log` / `smoke-r6/`：本轮（第二轮复核后）的窄跑，`--only=legacy,upgrade`，
-  `61/61`、`errors: []`**；其中 4.02c/4.02d 是"停写未确证→拒绝升级"的实际流程窄证
-- **`smoke-r7.log` / `smoke-r7/`：本轮 `--only=install,single`**，覆盖被改过的公共观察入口
+- **`smoke-r8.log` / `smoke-r8/`：第三轮（本轮）的窄跑，`--only=legacy,upgrade`，`62/62`、
+  `errors: []`**；4.02c/4.02d 是"停写未确证 → 拒绝升级、旧资料一份未动、不留候选目录"的
+  实际流程窄证，4.14b 是"再装一次（已无旧资料可保全）→ 已有保全逐字节未变、不留候选/暂存
+  目录"
+- **`smoke-r9.log` / `smoke-r9/`：第三轮 `--only=install,single`，`37/37`**，覆盖被改过的
+  公共观察入口
+- **`smoke-r8-incident.txt` / `stray-processes.txt` / `smoke-r10.log` / `smoke-r2bis.log` /
+  `smoke-varA.log` / `smoke-trace.log` / `trace-403.txt`**：上面那次作废轮次的完整留档
+  （同一台机器上同时两条冒烟驱动造成的假红/悬挂），以及排查时用过的临时变体
+  `installer-r3-trace.nsh` / `installer-r3-noguard.nsh` / `installer-r3-nocommit.nsh` /
+  `installer-r3-diag.nsh` / `installer-r2-bisect.nsh` 与 `repro-403.mjs`、
+  `make-trace-variant.py`、`check-guard-released.py`。**这些都不是产品代码**；
+  `installer-r3-final.nsh` 才是仓库里那一份（sha256 `4a5f9196…`）。
 - **`rescue-macro-harness.nsi` / `rescue-macro-run.mjs` / `rescue-macro-facts.json` /
-  `rescue-macro-work/`**：A 包的宏级三态窄证（真实 makensis 编译本文件的保全宏；
-  只在本目录里读写，不安装、不卸载、不写注册表、不碰 `%APPDATA%`）
+  `rescue-macro-work/`**：A 包的宏级窄证，7 条（正常 / 复制失败中止 / 停写未确证中止 /
+  候选建不出中止 / 已有保全被占用 ×2 中止且一个字节未变 / 已有保全没被占用时整体替换）；
+  真实 makensis 编译本文件的保全宏，只在本目录里读写，不安装、不卸载、不写注册表、
+  不碰 `%APPDATA%`
+- **`rescue-r3-probe.mjs` / `rescue-r3-writer.py` / `rescue-r3-facts.json` /
+  `rescue-r3-work/` / `rescue-r3-repo/` / `OBSERVATION-DIFF-r3.txt`**：排写保护覆盖复制窗口的
+  窄证（真实 SQLite + 真实 NSIS 复制 + 真实独立写者进程；观察闸门是从当前文件机械生成的
+  副本，保护与复制语句一字未改）
+- **`review-probes-rerun/`**：复核方第三轮两个探针的**原件**（逐字节复制）用当前
+  `build/installer.nsh` 重新编译后再跑 —— `probe_existing_rescue.py` 3/3、exit 0；
+  `probe_reopen_during_rescue.py` 的写者被保护挡住（`reopen-rerun.log` 与
+  `existing-rescue-rerun.log`），另有 `annotate-r3.mjs` / `OBSERVATION-DIFF.txt` / `observed/`
 - `probe_media_evidence.cjs` / `media-evidence-rerun.log` / `media-evidence-summary.json`：
   **复核方原有的探针原件**，`SMOKE_SOURCE` 指向返修后的驱动再跑，4 run / 0 failure / 0 ERROR
 - `probe_media_remaining.cjs` / `media-remaining-summary.json`：**复核方第二轮的探针原件**，
   同样指向返修后的驱动再跑，3 run / 0 failure / 0 ERROR
-- `smoke-r2` / `smoke-r3` / `smoke-r5`：第一轮返修的窄跑与跨午夜那次（4.13 由绿转红，
-  原因见第零节夹具日期口径，不是产品缺陷）——保留对照
+- `smoke-r2` / `smoke-r3` / `smoke-r5` / `smoke-r6` / `smoke-r7`：前两轮返修的窄跑与跨午夜那次
+  （4.13 由绿转红，原因见第零节夹具日期口径，不是产品缺陷）——保留对照
 - `rescue-probe.mjs`：A 包第一轮的快速独立探针（只验安装器侧保全）
 - `probe_upgrade_facts_r2.py`：按复核 A 项的两条判据审计 `smoke-r2` 的字段，5/5 OK。
   复核方原版 `probe_upgrade_facts.py` 读的是返修前那轮的字段名；**旧证据
@@ -425,7 +539,7 @@ NEGATIVE_CONTROL_EXIT=1
 - `smoke-dup-check.log` / `smoke-dup-check/`：第一轮 `--only=legacy` 的窄跑
 - `upgrade-repro.ps1` / `upgrade-repro.log`（覆盖安装清空安装目录的受控复现，返修前）
 - `artifacts/`（**本轮**的安装版、便携版、包内 `run.exe`、`build-manifest.json`、`SHA256SUMS.txt`）
-- `full-build-r2.log`：本轮的整链构建日志（`full-build.log` 是第一轮的）
+- `full-build-r4.log`：本轮的整链构建日志（`full-build-r2.log` 是第二轮的、`full-build.log` 是第一轮的）
 - 中间轮次的 `smoke-*.log` / `smoke-*/` 一并保留，便于对照（不删除既有 release 内容）
 
 ## 七、边界
