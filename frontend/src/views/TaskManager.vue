@@ -48,10 +48,12 @@
         </span>
       </div>
 
-      <!-- 回包丢失：数据库里可能已经建好了。这里只提供**这一项**的核对/重试，
+      <!-- 回包丢失：数据库里可能已经建好了。每一项已发出、结果可能未知的创建
+           各自保留原 UID + 原令牌 + 原冻结载荷（逐项展示、逐项核对/重试），
            复用同一个令牌与同一份冻结命令，不新增后台重试任务。 -->
       <el-alert
-        v-if="pendingCreate"
+        v-for="item in pendingList"
+        :key="item.token"
         class="pending-create"
         type="warning"
         :closable="false"
@@ -61,30 +63,30 @@
         <template #default>
           <div class="pending-create-body">
             <span>
-              分区「{{ pendingCreate.zoneName }}」的创建请求没有得到回包，
+              分区「{{ item.zoneName }}」的创建请求没有得到回包，
               可能已经生效，也可能没有。
-              <template v-if="pendingCreate.scope.uid != null">
-                这项待核对按<strong>发起时的账号（UID {{ pendingCreate.scope.uid }}）</strong>
+              <template v-if="item.scope.uid != null">
+                这项待核对按<strong>发起时的账号（UID {{ item.scope.uid }}）</strong>
                 与原令牌保留：刷新页面后仍在这里，换号后**不会**在新账号下重放。
               </template>
               <template v-else>
                 发起时尚未取得账号身份，这项待核对只能按当前账号核对。
               </template>
-              <span v-if="pendingCreate.scope.uid != null && !pendingOwnedByCurrentAccount()"
+              <span v-if="item.scope.uid != null && !pendingOwnedByCurrentAccount(item)"
                     class="muted">
                 当前登录的是其他账号：核对与重发已停用（不会清除原命令）；
-                切回 UID {{ pendingCreate.scope.uid }} 后可继续。
+                切回 UID {{ item.scope.uid }} 后可继续。
               </span>
             </span>
             <span class="pending-create-actions">
-              <el-button size="small" :loading="pendingBusy"
-                         :disabled="!pendingOwnedByCurrentAccount()"
-                         @click="checkPending">
+              <el-button size="small" :loading="isPendingBusy(item.token)"
+                         :disabled="!pendingOwnedByCurrentAccount(item)"
+                         @click="checkPending(item)">
                 核对结果
               </el-button>
-              <el-button size="small" type="primary" :loading="pendingBusy"
-                         :disabled="!pendingOwnedByCurrentAccount()"
-                         @click="retryPending">
+              <el-button size="small" type="primary" :loading="isPendingBusy(item.token)"
+                         :disabled="!pendingOwnedByCurrentAccount(item)"
+                         @click="retryPending(item)">
                 重试提交
               </el-button>
             </span>
@@ -427,65 +429,97 @@ const editingScope = ref<FrozenWriteScope | undefined>(undefined)
 // ==================== 创建结果未知的待核对项 ====================
 
 /**
- * 待核对项（原 UID + 原令牌 + 原冻结载荷）。
+ * 待核对项（原 UID + 原令牌 + 原冻结载荷），**按操作逐项保存**。
  *
- * 持有与消费都绑定**具体操作**（S1/S2）：写请求**发送之前**就已持有（R3），
- * 但槽位被另一个操作占用时不再写入（谁也不覆盖谁）；只有**这一项自己的**
- * 确定终态才消费它（按令牌作用域）：查到自己的持久回执（确定已提交）、或
- * 无前序未知的首次明确拒绝（结果确定为"没受理"）。下列情况一律**继续持有**：
+ * 每一项已发出、结果可能未知的创建都保留**自己的**核对依据（U1/U2）：
+ * 同一令牌（同一操作的重试/再持有）原位更新，不同令牌（另一项创建）各自
+ * 追加——谁也不覆盖谁、谁也不销掉谁。只有**这一项自己的**确定终态才消费它
+ * （按令牌作用域）：查到自己的持久回执（确定已提交）、或无前序未知的首次
+ * 明确拒绝（结果确定为"没受理"）。下列情况一律**继续持有**：
  *  - 回执 `found=false`（只表示尚未查到）；
  *  - 查询本身暂时失败；
  *  - 后一次重试被拒（那只说明"这一次没受理"，R2）；
  *  - 回包落点发现页面已卸载或账号已换（R4/R1：死页面不清账，换号不清账）。
  */
-const pendingCreate = ref<{
+interface PendingCreateEntry {
   zoneName: string
   data: TaskCreate
   preview: FrozenCreationPreview
   token: string
   scope: FrozenWriteScope
-} | null>(null)
-const pendingBusy = ref(false)
+}
+const pendingList = ref<PendingCreateEntry[]>([])
+/** 单项视图：集合里最早的一项（旧的单项语义；模板逐项展示全部）。 */
+const pendingCreate = computed<PendingCreateEntry | null>(
+  () => pendingList.value[0] ?? null)
+
+/** 某一项的核对/重发是否正在进行（按令牌逐项标记，互不卡住）。 */
+const pendingBusyTokens = ref<string[]>([])
+function isPendingBusy(token: string): boolean {
+  return pendingBusyTokens.value.includes(token)
+}
 
 const PENDING_CREATE_KEY = 'pending_task_create_v1'
+const PENDING_LIST_KEY = 'pending_task_create_v2'
 
 /**
- * 持有/刷新一条待核对命令。
+ * 把当前集合写进会话存储。
  *
- * 槽位语义（S1/S2）：这条记录属于**一个具体操作**（按原令牌核对）——
- *  - 槽位为空，或已是**同一令牌**（同一操作的重试/再持有）→ 写入；
- *  - 槽位被**另一个操作**占用 → **拒绝写入**：一次操作的核对依据不能被另一次
- *    操作覆盖或销掉——新账号的一次成功创建不证明旧未知操作的结果（S1），
- *    迟到的旧回执续体也不得连带清掉新操作的命令（S2，配合"回执命中即消费"
- *    的时序，正常交错下新命令总能拿到空槽位）。此时本次操作的"发送前落账"
- *    按槽位被占降级——操作本身照常进行，不新增"禁止创建其他任务"的规则。
+ * - 空集合：两个键都不存在；
+ * - 恰一条：`v2` 存数组，`v1` **镜像**这一条的单对象旧形态——旧版本写入的
+ *   `v1` 记录、以及只认 `v1` 的旧读取方都继续可读（读写双向兼容）；
+ * - 两条及以上：只存 `v2` 数组，清掉 `v1`（它只能表达一条，留着会误导）。
  */
-function holdPendingCreate(pending: typeof pendingCreate.value): void {
-  if (pending === null) {
-    pendingCreate.value = null
-    try { sessionStorage.removeItem(PENDING_CREATE_KEY) } catch { /* 忽略 */ }
-    return
-  }
-  const current = pendingCreate.value
-  if (current && current.token !== pending.token) return
-  pendingCreate.value = pending
+function persistPendingList(): void {
   try {
-    sessionStorage.setItem(PENDING_CREATE_KEY, JSON.stringify(pending))
+    const items = pendingList.value
+    if (items.length === 0) {
+      sessionStorage.removeItem(PENDING_LIST_KEY)
+      sessionStorage.removeItem(PENDING_CREATE_KEY)
+    } else {
+      sessionStorage.setItem(PENDING_LIST_KEY, JSON.stringify(items))
+      if (items.length === 1) {
+        sessionStorage.setItem(PENDING_CREATE_KEY, JSON.stringify(items[0]))
+      } else {
+        sessionStorage.removeItem(PENDING_CREATE_KEY)
+      }
+    }
   } catch {
     /* 会话存储不可用时只在内存里保留，不影响本次会话的核对能力 */
   }
 }
 
 /**
+ * 持有/刷新一条待核对命令。
+ *
+ * 集合语义：这条记录属于**一个具体操作**（按原令牌核对）——同令牌原位更新
+ * （同一操作的重试/再持有），新令牌追加（另一项创建有它自己的核对依据，
+ * U1/U2）。`null` 清空整个集合（保留给"全部重来"的显式语义；常规消费一律
+ * 走 `releasePendingCreate(token)` 的按项作用域）。
+ */
+function holdPendingCreate(pending: PendingCreateEntry | null): void {
+  if (pending === null) {
+    pendingList.value = []
+    persistPendingList()
+    return
+  }
+  const idx = pendingList.value.findIndex(p => p.token === pending.token)
+  if (idx >= 0) pendingList.value.splice(idx, 1, pending)
+  else pendingList.value.push(pending)
+  persistPendingList()
+}
+
+/**
  * 只消费**本次操作自己的**待核对命令（按原令牌核对）。
  *
- * 槽位已被别的操作占用（自己的发送前写入曾被拒绝），或已被自己的回执命中
- * 提前消费时，这次消费是 no-op——迟到的续体不得连带销掉别人的命令（S2）。
+ * 该令牌不在集合里（已被自己的回执命中提前消费，或从未持有）时是 no-op——
+ * 迟到的续体不得连带销掉别人的命令（S2）。
  */
 function releasePendingCreate(token: string): void {
-  if (pendingCreate.value?.token !== token) return
-  pendingCreate.value = null
-  try { sessionStorage.removeItem(PENDING_CREATE_KEY) } catch { /* 忽略 */ }
+  const idx = pendingList.value.findIndex(p => p.token === token)
+  if (idx < 0) return
+  pendingList.value.splice(idx, 1)
+  persistPendingList()
 }
 
 /** 当前账号 UID（未登录为 null），用于判定待核对项还属不属于本页面。 */
@@ -495,68 +529,87 @@ function currentUid(): number | null {
 }
 
 /**
- * 刷新页面后恢复待核对项。
+ * 刷新页面后恢复待核对集合。
  *
- * 唯一的清除条件是**这份记录本身损坏**（解析失败/缺关键字段）——那是垃圾数据，
- * 不是任何操作的核对依据。账号不符**不清除**（R1）：UID/令牌/载荷是"那次未知
- * 创建"仅存的核对依据，换号只能取消当前账号核对/重发的资格（见
- * `pendingOwnedByCurrentAccount`），不能推导出旧操作不存在。切回原账号后，
- * 这里恢复的这份仍然可核对。
+ * 先读 `v2`（集合数组），没有再兜 `v1`（旧版本写入的**单条**记录，原样迁移
+ * 进集合——旧单项会话记录继续可读）。逐项校验：**损坏的条目**（解析失败/缺
+ * 关键字段）是垃圾数据，剔除它不是销掉任何操作的核对依据；账号不符**不清除**
+ * （R1）：UID/令牌/载荷是"那次未知创建"仅存的核对依据，换号只能取消当前账号
+ * 核对/重发的资格（见 `pendingOwnedByCurrentAccount`），不能推导出旧操作不
+ * 存在。切回原账号后，这里恢复的这些条目仍然可核对。
  */
 function restorePendingCreate(): void {
-  let parsed: unknown = null
+  let v2Raw: string | null = null
+  let v1Raw: string | null = null
   try {
-    const raw = sessionStorage.getItem(PENDING_CREATE_KEY)
-    if (!raw) return
-    parsed = JSON.parse(raw)
+    v2Raw = sessionStorage.getItem(PENDING_LIST_KEY)
+    v1Raw = sessionStorage.getItem(PENDING_CREATE_KEY)
   } catch {
-    try { sessionStorage.removeItem(PENDING_CREATE_KEY) } catch { /* 忽略 */ }
     return
   }
-  const candidate = parsed as {
-    zoneName?: string; data?: TaskCreate; preview?: FrozenCreationPreview
-    token?: string; scope?: FrozenWriteScope
-  } | null
-  if (!candidate || typeof candidate.token !== 'string' || !candidate.token
-      || !candidate.data || typeof candidate.zoneName !== 'string') {
+  const parseOne = (raw: string): PendingCreateEntry | null => {
+    let candidate: {
+      zoneName?: string; data?: TaskCreate; preview?: FrozenCreationPreview
+      token?: string; scope?: FrozenWriteScope
+    } | null = null
+    try { candidate = JSON.parse(raw) } catch { return null }
+    if (!candidate || typeof candidate.token !== 'string' || !candidate.token
+        || !candidate.data || typeof candidate.zoneName !== 'string') return null
+    const scope: FrozenWriteScope = {
+      uid: candidate.scope?.uid ?? null,
+      businessDate: String(candidate.scope?.businessDate || ''),
+    }
+    return {
+      zoneName: candidate.zoneName,
+      data: candidate.data,
+      preview: candidate.preview ?? { task_id: null, revision: null,
+        business_day: '', existing_is_unfinished: false },
+      token: candidate.token,
+      scope,
+    }
+  }
+  let list: PendingCreateEntry[] = []
+  if (v2Raw) {
+    try { sessionStorage.removeItem(PENDING_LIST_KEY) } catch { /* 忽略 */ }
+    try {
+      const arr = JSON.parse(v2Raw) as unknown
+      if (Array.isArray(arr)) {
+        list = arr
+          .map(item => parseOne(JSON.stringify(item)))
+          .filter((p): p is PendingCreateEntry => p !== null)
+      }
+    } catch { /* v2 整体损坏：按空处理，v1 兜底 */ }
+  }
+  if (list.length === 0 && v1Raw) {
     try { sessionStorage.removeItem(PENDING_CREATE_KEY) } catch { /* 忽略 */ }
-    return
+    const one = parseOne(v1Raw)
+    if (one) list = [one]
   }
-  const scope: FrozenWriteScope = {
-    uid: candidate.scope?.uid ?? null,
-    businessDate: String(candidate.scope?.businessDate || ''),
-  }
-  // 换号不清除（R1）：保留原命令，资格判定推迟到动作入口。
-  pendingCreate.value = {
-    zoneName: candidate.zoneName,
-    data: candidate.data,
-    preview: candidate.preview ?? { task_id: null, revision: null,
-      business_day: '', existing_is_unfinished: false },
-    token: candidate.token,
-    scope,
-  }
+  pendingList.value = list
+  // 规范化回写：单条时同时维护 v1 镜像，保持旧形态可读。
+  persistPendingList()
 }
 
 /**
- * 待核对项能否由**当前账号**核对/重发。
+ * 某条待核对项能否由**当前账号**核对/重发。
  *
  * 原命令带账号归属（UID）时必须与当前账号一致：换号后既不能核对也不能重发，
  * 更不能改用新账号重放——原命令继续保留，切回原账号后恢复可操作（R1）。
  * 发起时尚未取得账号身份（uid=null）的命令只能按当前账号核对（见模板说明）。
  */
-function pendingOwnedByCurrentAccount(): boolean {
-  const pending = pendingCreate.value
-  if (!pending) return false
-  const uid = pending.scope?.uid
+function pendingOwnedByCurrentAccount(pending: PendingCreateEntry | null = null): boolean {
+  const item = pending ?? pendingCreate.value
+  if (!item) return false
+  const uid = item.scope?.uid
   if (uid == null) return true
   return uid === currentUid()
 }
 
 /** 账号不符时的统一说明（不删除原命令，只取消当前账号的动作资格）。 */
-function warnPendingOwnedByOtherAccount(): void {
-  const pending = pendingCreate.value
+function warnPendingOwnedByOtherAccount(pending: PendingCreateEntry | null = null): void {
+  const item = pending ?? pendingCreate.value
   ElMessage.warning(
-    `这项待核对属于发起时的账号（UID ${pending?.scope?.uid ?? '未取得'}）：`
+    `这项待核对属于发起时的账号（UID ${item?.scope?.uid ?? '未取得'}）：`
     + `当前账号不能核对或重发，也不会在新账号下重放；原命令已保留，切回原账号后可继续。`)
 }
 
@@ -858,10 +911,12 @@ async function submitCreation(data: TaskCreate, preview: FrozenCreationPreview,
   }
   // 这次提交是否在重放**一份已持有的未知命令**（同一个令牌）：是的话，本轮收到的
   // 任何明确拒绝都只说明"这一轮没受理"，不能否定此前那次未知尝试（R2）。
-  const wasHeld = pendingCreate.value?.token === token
-  // R3：写请求可能离手**之前**，先把原命令（原 UID + 原令牌 + 原冻结载荷）落进
-  // 会话存储。页面在请求在途时刷新/崩溃，catch 根本来不及执行——核对依据必须
-  // 已经在。只有确定终态（成功，或无前序未知时的明确拒绝）才消费这一项。
+  const wasHeld = pendingList.value.some(p => p.token === token)
+  // R3/U1/U2：写请求可能离手**之前**，先把**这一项自己的**原命令（原 UID +
+  // 原令牌 + 原冻结载荷）落进会话存储——集合语义下每项各存各的，别的操作
+  // 持有什么不影响这一项。页面在请求在途时刷新/崩溃，catch 根本来不及执行
+  // ——核对依据必须已经在。只有确定终态（成功，或无前序未知时的明确拒绝）
+  // 才消费这一项。
   let attemptLost = false
   holdPendingCreate({ zoneName: data.zone_name, data, preview, token, scope })
   try {
@@ -956,8 +1011,8 @@ async function lookupReceipt(token: string, scope: FrozenWriteScope): Promise<bo
     if (!pageAlive.value || !taskStore.writeScopeIsCurrent(scope)) return false
     if (!receipt.found) return false
     // 回执命中即**本次操作**的确定终态：在列表刷新等待之前就消费自己的待核对
-    // 命令（按令牌作用域）——迟到的续体（刷新、提示）不再持有销账权，正常交错
-    // 下也让新操作拿到空槽位（S2）。
+    // 命令（按令牌作用域）——迟到的续体（刷新、提示）不再持有销账权，别的
+    // 操作持有的命令也不受影响（S2）。
     releasePendingCreate(token)
     const result = receipt.result || {}
     reportReceipt(result)
@@ -978,43 +1033,43 @@ function reportReceipt(result: Record<string, unknown>) {
   ElMessage.info('这是已提交的持久回执：本次未取得唤醒投递结果')
 }
 
-async function checkPending() {
-  const pending = pendingCreate.value
-  if (!pending) return
-  if (!pendingOwnedByCurrentAccount()) {
+async function checkPending(pending: PendingCreateEntry | null = null) {
+  const item = pending ?? pendingCreate.value
+  if (!item) return
+  if (!pendingOwnedByCurrentAccount(item)) {
     // R1：换号只取消资格，不删除原命令。
-    warnPendingOwnedByOtherAccount()
+    warnPendingOwnedByOtherAccount(item)
     return
   }
-  pendingBusy.value = true
+  pendingBusyTokens.value = [...pendingBusyTokens.value, item.token]
   try {
-    if (await lookupReceipt(pending.token, pending.scope)) {
+    if (await lookupReceipt(item.token, item.scope)) {
       // 兜底（通常已在回执命中时消费）：只销**自己**的令牌，不连带别的操作。
-      releasePendingCreate(pending.token)
-    } else if (pageAlive.value && taskStore.writeScopeIsCurrent(pending.scope)) {
+      releasePendingCreate(item.token)
+    } else if (pageAlive.value && taskStore.writeScopeIsCurrent(item.scope)) {
       ElMessage.warning('还没有查到这次创建的成功回执：不能据此认为没有执行，原命令继续保留')
     }
   } finally {
-    pendingBusy.value = false
+    pendingBusyTokens.value = pendingBusyTokens.value.filter(t => t !== item.token)
   }
 }
 
-async function retryPending() {
-  const pending = pendingCreate.value
-  if (!pending) return
-  if (!pendingOwnedByCurrentAccount()) {
+async function retryPending(pending: PendingCreateEntry | null = null) {
+  const item = pending ?? pendingCreate.value
+  if (!item) return
+  if (!pendingOwnedByCurrentAccount(item)) {
     // R1：换号只取消资格，不删除原命令，更不改用新账号重发。
-    warnPendingOwnedByOtherAccount()
+    warnPendingOwnedByOtherAccount(item)
     return
   }
-  pendingBusy.value = true
+  pendingBusyTokens.value = [...pendingBusyTokens.value, item.token]
   try {
     // 同一令牌、同一份冻结命令：服务端认得出来是同一次操作。
     // 原命令的持有/消费与结果呈现都由 submitCreation 统一负责——包括
     // "后一次被拒不否定前一次未知"（R2）与"发送前先落命令"（R3）。
-    await submitCreation(pending.data, pending.preview, pending.token, pending.scope)
+    await submitCreation(item.data, item.preview, item.token, item.scope)
   } finally {
-    pendingBusy.value = false
+    pendingBusyTokens.value = pendingBusyTokens.value.filter(t => t !== item.token)
   }
 }
 

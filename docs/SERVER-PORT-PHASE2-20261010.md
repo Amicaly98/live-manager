@@ -182,8 +182,9 @@
   窄验证脚本口径同步更正。按复核要求未重跑完整浏览器矩阵。
 
 第二轮返修验证与证据：`deliveries/desktop-port-phase2-create-fix2-20261010/`（两套
-冻结探针原样复跑 9/9 + 5/5、类型检查与前端构建；浏览器窄用例因本机 Electron GPU
-子系统当日故障未复跑，环境发现与驱动就绪状态如实登记）。
+冻结探针原样复跑 9/9 + 5/5、类型检查与前端构建；浏览器窄用例未复跑——本次应用
+Electron 启动失败（`GPU process isn't usable`），**原因未定位**（复核不接受
+"机器级 GPU 子系统损坏"归因），日志保留在证据目录）。
 
 ## 九、仓库事件记录（2026-10-10）
 
@@ -202,3 +203,30 @@
   run2 恢复、run3 file:// 等
 - `run1.main.stdout/stderr.log`、`run1.renderer.log`、`vite.stdout.log`、`platform.*.log`
 - `run1.final-state.json`、`run1.platform-final.json`、`run2.platform-final.json`
+
+## 十、第三轮返修：待核对记录集合化（2026-10-10）
+
+复核（`deliveries/desktop-port-phase2-rereview-fbf6775-20261010/`）确认 S3 接受，
+仅一处 P1：单槽在保护旧命令时丢掉了新命令的核对依据——槽位被 A 占用时，
+B 的 `holdPendingCreate` 被拒但 B 仍照发，B 的原 UID/令牌/载荷丢失（U1：B 三次
+同令牌尝试全部未知后存储里只有 A；U2：B 请求在途时存储里没有 B）。
+
+**修复（只动持有/恢复/消费职责，无 attempt 表、无后台队列、无新状态机、
+不禁止创建其他任务）**：
+
+- `pendingCreate` 单槽 → `pendingList` **按操作保存的集合**（每项 = 原 UID +
+  原令牌 + 原冻结载荷）；`holdPendingCreate` 变为按令牌 upsert（同令牌原位更新、
+  新令牌追加，不再拒绝任何一项）；`releasePendingCreate(token)`、回执命中消费、
+  刷新恢复（先 `v2` 集合键、兜 `v1` 旧单条迁移）、逐项展示与逐项核对/重试全部
+  共用这份集合。
+- 存储双键兼容：`pending_task_create_v2` 存集合数组；恰一条时 `v1`
+  （`pending_task_create_v1`）镜像该条旧形态，旧记录与旧读取方继续可读。
+- `pendingOwnedByCurrentAccount`/`checkPending`/`retryPending` 带条目参数，
+  逐项资格判定；busy 按令牌逐项标记。
+
+验证：三套冻结探针（9 项 + 5 项 + 本轮 3 项）与原件 `cmp` 逐字节一致后原样
+复跑 **17/17 全 PASS**（U1/U2 转绿，G1 守卫保持）；vue-tsc 0、前端构建、
+overwrite-precondition 5/5、auth-settings-negative / file-url-shell /
+frontendChain 全过、mjs 12/12。证据 `deliveries/desktop-port-phase2-create-fix3-20261010/`。
+浏览器窄用例继续按复核减负范围记为未取得（应用 Electron 启动失败原因未定位，
+见第八节表述更正）。
