@@ -70,12 +70,20 @@
               <template v-else>
                 发起时尚未取得账号身份，这项待核对只能按当前账号核对。
               </template>
+              <span v-if="pendingCreate.scope.uid != null && !pendingOwnedByCurrentAccount()"
+                    class="muted">
+                当前登录的是其他账号：核对与重发已停用（不会清除原命令）；
+                切回 UID {{ pendingCreate.scope.uid }} 后可继续。
+              </span>
             </span>
             <span class="pending-create-actions">
-              <el-button size="small" :loading="pendingBusy" @click="checkPending">
+              <el-button size="small" :loading="pendingBusy"
+                         :disabled="!pendingOwnedByCurrentAccount()"
+                         @click="checkPending">
                 核对结果
               </el-button>
               <el-button size="small" type="primary" :loading="pendingBusy"
+                         :disabled="!pendingOwnedByCurrentAccount()"
                          @click="retryPending">
                 重试提交
               </el-button>
@@ -285,8 +293,9 @@
  *    令牌）"；
  *  - 回包丢失时**持有**原 UID + 原令牌 + 原冻结载荷，只提供"核对 / 重试"两个
  *    动作；`found=false` 只表示尚未查到，不倒推成创建失败；
- *  - **待核对项跨页面刷新仍然存在**：按发起时的账号落在会话存储里，换号后一律
- *    丢弃，**绝不**在新账号下重放旧命令；
+ *  - **待核对项跨页面刷新仍然存在**：按发起时的账号落在会话存储里；换号**不清除**
+ *    原命令，只是停用当前账号的核对/重发并如实说明——**绝不**在新账号下重放，
+ *    也绝不因换号销毁回到原账号后的核对依据（R1）；
  *  - 分区历史只查请求所属账号的库（不联网聚合、不接受任意 UID 参数）。
  */
 import { ref, reactive, computed, onMounted, onUnmounted } from 'vue'
@@ -420,11 +429,13 @@ const editingScope = ref<FrozenWriteScope | undefined>(undefined)
 /**
  * 待核对项（原 UID + 原令牌 + 原冻结载荷）。
  *
- * 只有**确定**的结果才移除它：查到持久回执（确定已提交）、或原请求自己被明确
- * 以"预检过期"拒绝。下列情况一律**继续持有**：
+ * 写请求**发送之前**就已持有（R3）；只有**确定**的结果才移除它：查到持久回执
+ * （确定已提交）、或无前序未知的首次明确拒绝（结果确定为"没受理"）。下列情况
+ * 一律**继续持有**：
  *  - 回执 `found=false`（只表示尚未查到）；
  *  - 查询本身暂时失败；
- *  - 后一次重试被拒（那只说明"这一次没受理"）。
+ *  - 后一次重试被拒（那只说明"这一次没受理"，R2）；
+ *  - 回包落点发现页面已卸载或账号已换（R4/R1：死页面不清账，换号不清账）。
  */
 const pendingCreate = ref<{
   zoneName: string
@@ -456,8 +467,11 @@ function currentUid(): number | null {
 /**
  * 刷新页面后恢复待核对项。
  *
- * 判据只有一条：**原命令所属账号**必须仍是当前账号。换号后立刻丢弃并清除——
- * 否则一次旧账号的未知创建会被包装成新账号的"重试"，那正是要挡的那种错。
+ * 唯一的清除条件是**这份记录本身损坏**（解析失败/缺关键字段）——那是垃圾数据，
+ * 不是任何操作的核对依据。账号不符**不清除**（R1）：UID/令牌/载荷是"那次未知
+ * 创建"仅存的核对依据，换号只能取消当前账号核对/重发的资格（见
+ * `pendingOwnedByCurrentAccount`），不能推导出旧操作不存在。切回原账号后，
+ * 这里恢复的这份仍然可核对。
  */
 function restorePendingCreate(): void {
   let parsed: unknown = null
@@ -482,10 +496,7 @@ function restorePendingCreate(): void {
     uid: candidate.scope?.uid ?? null,
     businessDate: String(candidate.scope?.businessDate || ''),
   }
-  if ((scope.uid ?? null) !== currentUid()) {
-    try { sessionStorage.removeItem(PENDING_CREATE_KEY) } catch { /* 忽略 */ }
-    return
-  }
+  // 换号不清除（R1）：保留原命令，资格判定推迟到动作入口。
   pendingCreate.value = {
     zoneName: candidate.zoneName,
     data: candidate.data,
@@ -496,11 +507,27 @@ function restorePendingCreate(): void {
   }
 }
 
-/** 按**原身份**核对：换号之后这次待核对已经不属于当前页面。 */
-function pendingBelongsToCurrentAccount(): boolean {
+/**
+ * 待核对项能否由**当前账号**核对/重发。
+ *
+ * 原命令带账号归属（UID）时必须与当前账号一致：换号后既不能核对也不能重发，
+ * 更不能改用新账号重放——原命令继续保留，切回原账号后恢复可操作（R1）。
+ * 发起时尚未取得账号身份（uid=null）的命令只能按当前账号核对（见模板说明）。
+ */
+function pendingOwnedByCurrentAccount(): boolean {
   const pending = pendingCreate.value
   if (!pending) return false
-  return (pending.scope?.uid ?? null) === currentUid()
+  const uid = pending.scope?.uid
+  if (uid == null) return true
+  return uid === currentUid()
+}
+
+/** 账号不符时的统一说明（不删除原命令，只取消当前账号的动作资格）。 */
+function warnPendingOwnedByOtherAccount(): void {
+  const pending = pendingCreate.value
+  ElMessage.warning(
+    `这项待核对属于发起时的账号（UID ${pending?.scope?.uid ?? '未取得'}）：`
+    + `当前账号不能核对或重发，也不会在新账号下重放；原命令已保留，切回原账号后可继续。`)
 }
 
 /** 按分区名找当前列表里那条记录的稳定 id（找不到就返回 undefined）。 */
@@ -748,9 +775,12 @@ async function runCreateFlow(data: TaskCreate, scope: FrozenWriteScope): Promise
   try {
     preview = await taskStore.fetchCreationPreview(data.zone_name, scope)
   } catch (error: unknown) {
-    ElMessage.error(detailOf(error) || '无法取得该分区的当前状态，请稍后重试')
+    if (pageAlive.value) ElMessage.error(detailOf(error) || '无法取得该分区的当前状态，请稍后重试')
     return false
   }
+  // R4：每个 await 之后都是页面可能已经不在的边界——死页面不弹旧结果、
+  // 不继续新投递。
+  if (!pageAlive.value) return false
   // 服务端以真实原因拒绝（例如该分区任务正在执行）：如实展示并结束本次创建。
   if (!preview.creation_allowed) {
     ElMessage.error(preview.reason || '当前无法在该分区创建任务')
@@ -766,6 +796,8 @@ async function runCreateFlow(data: TaskCreate, scope: FrozenWriteScope): Promise
   }
   if (frozen.existing_is_unfinished) {
     const confirmed = await confirmReplaceTask(preview, frozen)
+    // R4：确认框回来时页面可能已经卸载——不放行旧确认续体，不再发出新的写请求。
+    if (!pageAlive.value) return false
     if (!confirmed) {
       ElMessage.info('已取消创建')
       return false
@@ -776,16 +808,37 @@ async function runCreateFlow(data: TaskCreate, scope: FrozenWriteScope): Promise
 
 async function submitCreation(data: TaskCreate, preview: FrozenCreationPreview,
                               token: string, scope: FrozenWriteScope): Promise<boolean> {
+  // 这次提交是否在重放**一份已持有的未知命令**（同一个令牌）：是的话，本轮收到的
+  // 任何明确拒绝都只说明"这一轮没受理"，不能否定此前那次未知尝试（R2）。
+  const wasHeld = pendingCreate.value?.token === token
+  // R3：写请求可能离手**之前**，先把原命令（原 UID + 原令牌 + 原冻结载荷）落进
+  // 会话存储。页面在请求在途时刷新/崩溃，catch 根本来不及执行——核对依据必须
+  // 已经在。只有确定终态（成功，或无前序未知时的明确拒绝）才消费这一项。
+  let attemptLost = false
+  holdPendingCreate({ zoneName: data.zone_name, data, preview, token, scope })
   try {
-    const res = await taskStore.createNewTask(data, preview, token, scope)
+    const res = await taskStore.createNewTask(data, preview, token, scope, {
+      // R2：拦截器内部有物理尝试在途丢失时置位——后续收到的拒绝只是那一轮的
+      // 结果，不能当作原操作的终态。
+      onAttemptLost: () => { attemptLost = true },
+    })
+    // 回包落点（R4）：页面已卸载或账号已换 → 不在当前上下文弹结果、清账或关框。
+    // 请求已发出、不回滚；原命令保持持有（发送前已落），由回到原账号后的
+    // "待核对"条收敛。
+    if (!pageAlive.value || !taskStore.writeScopeIsCurrent(scope)) return false
     reportCreated(res)
     holdPendingCreate(null)
     return true
   } catch (error: unknown) {
-    if (isResultUnknown(error)) {
-      // 回包丢失：先查同一令牌的已提交回执；查不到就是"结果待核对"，**不**重取
-      // 预检、**不**换令牌、**不**自动重新覆盖。
+    if (!pageAlive.value || !taskStore.writeScopeIsCurrent(scope)) {
+      // R4：死页面/换号不处理这次尝试的结果——原命令保持持有，不弹任何提示。
+      return false
+    }
+    if (isResultUnknown(error) || attemptLost) {
+      // 回包丢失（或本轮有物理尝试在途丢失）：先按原 UID + 原令牌查已提交回执；
+      // 查不到就是"结果待核对"，**不**重取预检、**不**换令牌、**不**自动重新覆盖。
       const resolved = await lookupReceipt(token, scope)
+      if (!pageAlive.value || !taskStore.writeScopeIsCurrent(scope)) return false
       if (resolved) {
         holdPendingCreate(null)
         return true
@@ -794,18 +847,33 @@ async function submitCreation(data: TaskCreate, preview: FrozenCreationPreview,
       // 关掉新建框：这次操作已经离开表单，结果由"待核对"条统一跟进——
       // 否则模态遮罩会把那条提示压在下面，用户根本看不到。
       showCreateDialog.value = false
+      ElMessage.warning('本次创建仍未取得确定结果：原命令已保留，请用「核对结果」确认')
       return false
     }
     const detail = detailOf(error)
     if (isStaleCreate(detail)) {
-      // 确认已过期：刷新并请用户重新发起——不暗中换最新版本自动覆盖。
-      // 这是**原请求自己**被明确拒绝（预检前置条件已经变了），因此可以销掉
-      // 这次待核对；与"后一次重试被拒"不是一回事。
+      if (wasHeld) {
+        // 这是对**已持有未知命令**的重试被拒（R2）：只说明这一轮没受理，此前那
+        // 次尝试的效果仍然未知——原命令继续保留，交给"核对结果"收敛。
+        ElMessage.warning(`重试被拒（${detail}）：此前一次尝试的效果仍未知，原命令继续保留`)
+        await taskStore.fetchTasks()
+        return false
+      }
+      // 原请求自己被明确拒绝（预检前置条件已经变了），因此可以销掉这次待核对；
+      // 与"后一次重试被拒"不是一回事（G1 钉住这一点）。
       holdPendingCreate(null)
       await taskStore.fetchTasks()
       ElMessage.warning(detail)
       return false
     }
+    if (wasHeld) {
+      // R2：重试的明确拒绝同样只覆盖这一轮。
+      ElMessage.error(`重试被拒（${detail || '原因未说明'}）：此前一次尝试的效果仍未知，原命令继续保留`)
+      return false
+    }
+    // 无前序未知的明确拒绝（响应已收到、结果确定）：发送前持有的这一项现在消费掉
+    // （R3 的对称面——不留下一条已知被拒、永远核对不到的僵尸命令）。
+    holdPendingCreate(null)
     ElMessage.error(detail || '创建失败（数据未变更）')
     return false
   }
@@ -834,6 +902,9 @@ function reportCreated(res: CreateTaskResponse) {
 async function lookupReceipt(token: string, scope: FrozenWriteScope): Promise<boolean> {
   try {
     const receipt = await taskStore.lookupCreationReceipt(token, scope)
+    // 回包落点（R4）：页面已卸载或账号已换 → 这份回执不在当前上下文消费，
+    // 不弹结果、不刷新展示；原命令保持持有，由回到原账号后的待核对条收敛。
+    if (!pageAlive.value || !taskStore.writeScopeIsCurrent(scope)) return false
     if (!receipt.found) return false
     const result = receipt.result || {}
     reportReceipt(result)
@@ -857,16 +928,16 @@ function reportReceipt(result: Record<string, unknown>) {
 async function checkPending() {
   const pending = pendingCreate.value
   if (!pending) return
-  if (!pendingBelongsToCurrentAccount()) {
-    ElMessage.warning('这项待核对属于另一个账号：已按账号丢弃，请按当前账号重新操作')
-    holdPendingCreate(null)
+  if (!pendingOwnedByCurrentAccount()) {
+    // R1：换号只取消资格，不删除原命令。
+    warnPendingOwnedByOtherAccount()
     return
   }
   pendingBusy.value = true
   try {
     if (await lookupReceipt(pending.token, pending.scope)) {
       holdPendingCreate(null)
-    } else {
+    } else if (pageAlive.value && taskStore.writeScopeIsCurrent(pending.scope)) {
       ElMessage.warning('还没有查到这次创建的成功回执：不能据此认为没有执行，原命令继续保留')
     }
   } finally {
@@ -877,21 +948,17 @@ async function checkPending() {
 async function retryPending() {
   const pending = pendingCreate.value
   if (!pending) return
-  if (!pendingBelongsToCurrentAccount()) {
-    ElMessage.warning('这项待核对属于另一个账号：已按账号丢弃，请按当前账号重新操作')
-    holdPendingCreate(null)
+  if (!pendingOwnedByCurrentAccount()) {
+    // R1：换号只取消资格，不删除原命令，更不改用新账号重发。
+    warnPendingOwnedByOtherAccount()
     return
   }
   pendingBusy.value = true
   try {
     // 同一令牌、同一份冻结命令：服务端认得出来是同一次操作。
-    if (await submitCreation(pending.data, pending.preview, pending.token,
-                             pending.scope)) {
-      holdPendingCreate(null)
-    } else if (pendingCreate.value === pending) {
-      // 仍未确认：保持待核对状态，不新增后台任务。
-      ElMessage.warning('重试仍未取得确定结果，原命令继续保留；请稍后再核对')
-    }
+    // 原命令的持有/消费与结果呈现都由 submitCreation 统一负责——包括
+    // "后一次被拒不否定前一次未知"（R2）与"发送前先落命令"（R3）。
+    await submitCreation(pending.data, pending.preview, pending.token, pending.scope)
   } finally {
     pendingBusy.value = false
   }
