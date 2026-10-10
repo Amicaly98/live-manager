@@ -61,28 +61,90 @@
 `pidAlive` / `sleep` / `countFfmpegFor` / `api` / `platform`"，因此复核方原有的
 `probe_media_evidence.cjs` 可以**原样**再跑（见第五节）。
 
+### 第二轮返修（独立复核 `e0f23c7` → 本轮）
+
+复核结论：正常升级路径已经修好，但 A 包还有两处 P1、B 包还有两处采证遗漏。
+四条都成立，处置如下。
+
+**A1：保全失败仍会继续安装。** 原实现的 `CreateDirectory` 与各次 `CopyFiles` 都不消费
+失败，宏照常返回，安装继续走到清空 `$INSTDIR` 的旧卸载。现在**每次复制后都核对目标与
+源的大小一致**，任何一份没落地或不完整，就把原因写进 `$legacyRescueError`；
+`legacyRescueAbortIfFailed` 在旧卸载**之前** `SetErrorLevel 3` + `Quit` 中止这次升级
+（此刻原件还在）。中止时若保全目录是**这一次**新建的，把它整个删掉——半份副本比没有
+副本更危险，下次启动会被当成一份完整的旧资料接管。
+
+**A2：保全发生在停写确证之前。** 原实现挂在 `.onInit` 的 `customInit`，而模板的
+`CHECK_APP_RUNNING` 到后面的安装 Section 才执行，于是可能对着**仍在写**的旧库逐个复制
+主库/WAL/SHM，拼出一个从未存在过的时刻（复核的受控交错里源库只出现过
+`(0,0)→(1,0)→(1,1)`，副本却是 `(0,1)`，而 `integrity_check` 仍然是 ok；
+之后再调 backup API 也救不回来）。现在入口改挂在模板的 `customCheckAppRunning` 上：
+它在 `installSection.nsh` 里**恰好**位于"按既有流程关掉正在运行的应用"之后、
+`uninstallOldVersion` 之前——复用产品既有的关闭流程，不新造停写机制。宏体先
+`!insertmacro _CHECK_APP_RUNNING`（行为不变），再做保全；复制前用 `CreateFileW`
+（共享模式 0）打开旧主库**确证这一刻没有别的进程持有它**，打不开就重试若干次后中止。
+**确证不了就不复制**，而不是"先复制、回头再对齐"。
+
+> 附带一处必须补的：定义了 `customCheckAppRunning` 就等于接管了模板的进程信息供给
+> （模板的 `!ifmacrondef` 分支因此跳过），`getProcessInfo.nsh` 与 `Var pid` 由本文件
+> 补上，并用 `!ifdef APP_GUID` 兜住——那是由构建器 `-D` 传入的，所以这份文件仍然可以
+> 被"直接 include 的独立小探针"使用。
+
+**B1：存活观察失败被当成已退出。** `pidAlive` 原来忽略 `error` / 非零退出 / 超时，
+空输出即返回 false，外层据此声称"原对象确证退出"。现在改成**三态**
+（`true` 在跑 / `false` 确证不在 / `null` 读不出），"确证不在"一律走 `pidGone()`；
+进程清单读取也收进共同的观察入口 `queryProcessCommandLines`（`countFfmpegFor` 与
+按数据目录找 run.exe 都走它），失败即抛出，只有"命令成功且结果为空"才允许是空清单。
+（覆盖范围就是本段依赖的那两样：**PID 观察**与**进程清单观察**。）
+
+**B2：媒体退出遮住了应用退出。** 中断段里新声明的 `const exited`（媒体）在同一块里
+遮住了外层由 Electron `exit` 事件更新的 `exited`（应用），于是"媒体确已退出、应用还
+活着"时 2.18 照样通过。现在媒体退出叫 `mediaExited`，2.18 回到应用自己的退出事实，
+并保留原来的有界等待——超时也如实落一条判据，不再把结论吞掉。
+
+夹具侧同轮修掉两处（都不是产品缺陷）：
+
+- **合成旧资料的日期口径**：原来用 `toISOString()`（UTC），而产品判"同日半场"用
+  **本地业务日**。东八区本地 00:00–08:00 两边差一天，迁移就会走"停止目标下的旧日半场：
+  丢弃无意义秒数"这一支，**Run 根本不建**，`2.06` / `4.13` 的恢复入口不出现。
+  本轮跨过本地午夜后真的撞上（同一份夹具、同一份产品代码由绿转红），已改为本地日。
+- **本机残留的同 appId 卸载登记**：留着它，**旧**安装包一启动就会在
+  `uninstallOldVersion` 处 `SetErrorLevel 2` 退出、什么都不装，而驱动的症状只是
+  "旧版安装产物超时"。已确认清理后修复。
+
 ### 返修后的实测
 
 | 事项 | 结果 |
 |---|---|
-| 真实 1.0.0 → 返修后 1.1.1 覆盖升级（`smoke-r2`，`--only=legacy,upgrade`） | A 包 4.00–4.15 全通过；B 包 2.13c 如实报红（见下） |
-| `--only=legacy` 重跑（`smoke-r3`，媒体夹具修正后） | **40/40**，`errors: []`，2.13c–2.17 全部真实取得 |
-| 复核方自己的 `probe_media_evidence.cjs` 对返修后驱动再跑 | 4 run / 0 failure / 0 ERROR（T1/G1/T2/G2 全 PASS） |
+| 真实 1.0.0 → **本轮新包** 1.1.1 覆盖升级（`smoke-r6`，`--only=legacy,upgrade`） | **61/61**，`errors: []` |
+| 宏级三态窄证（`rescue-macro-run.mjs`：真实 makensis 编译本文件里的保全宏） | 3/3 —— 正常保全逐字节一致且继续；**复制失败 → 中止**；**停写未确证 → 中止** |
+| 复核方自己的 `probe_media_evidence.cjs`（原件）对返修后驱动再跑 | 4 run / 0 failure / 0 ERROR |
+| 复核方自己的 `probe_media_remaining.cjs`（原件）对返修后驱动再跑 | 3 run / 0 failure / 0 ERROR |
 
-A 包的关键判据（`smoke-r2/aggregate.json`）：保全目录
+A2 的两条判据（`smoke-r6/aggregate.json`）：
+
+- **停写确证不起作用时必须拒绝升级**：4.02c 在旧库被另一进程真实持有的情况下再装一次，
+  安装器 **exit=3**、五份旧资料**一份未动**；紧接着释放句柄后的 4.03/4.05 就正常升级并
+  保全——同一轮里"持有→拒绝 / 释放→继续"是一对受控对照。
+- **拒绝时不留下半份副本**：4.02d 确认此刻没有 `legacy-rescue` 目录（半份副本会被下次
+  启动当成一份完整旧资料接管）。
+
+正常路径的关键判据（同一份 `aggregate.json`）：保全目录
 `C:\Users\chenz\AppData\Roaming\bilibili-live-manager\legacy-rescue` 里五份文件与安装前
 原件**逐字节相同**；同一时刻安装根目录里的原件**已被清掉**（`survived=[]`）——两条合起来
 才是"删除之前先复制"；应用认定的落点与安装器实际写入的目录**是同一个**；五份文件经既有
 入口进入数据目录；接管后任务参数与完成天数原样（`3 / 12 / 7 / 2026-12-01`）；保全目录里的
-原件在接管后仍在且未变（来源可恢复）；升级后启动零自动开播；受控退出后端收回、8000 释放。
+原件在接管后仍在且未变（来源可恢复）；升级后启动零自动开播、呈现恢复入口；受控退出后端
+收回、8000 释放。
 
-B 包那一条如实报红是因为**夹具前提当时不成立**（见上一节），不是产品缺陷——这正是被
-指出的空过被堵上之后应有的表现。
+B 包的实测（`smoke-r6` 内）：2.13c 本次是**真中断**
+（`pid=… alive_before=true taskkill /F /T status=0 alive_after=false liveness=1读/0存活`），
+2.14–2.17 四项由前提门放行后真实取得；2.18 报 `app_exited=true`，读的是**应用自己**的退出
+事实（不再是媒体的那个布尔）。
 
 ### 仍然成立的两条既有事实
 
 - **PyInstaller 单文件不逐字节可复现**：本次构建 `run.exe` 又是新的哈希与字节数
-  （`3c746a0e…` / 46,051,537），与前三次都不同。绑定判据仍然只能是同一次构建内比对。
+  （`c249e31d…` / 46,053,460），与前四次都不同。绑定判据仍然只能是同一次构建内比对。
 - `--only=backend` 也会清掉 `release/win-unpacked/resources/backend/run.exe`（有意保守）。
 
 
@@ -143,14 +205,17 @@ B 包那一条如实报红是因为**夹具前提当时不成立**（见上一�
 
 | 产物 | 路径 | 字节 | SHA256 |
 |---|---|---|---|
-| 安装版（NSIS） | `release/直播控制系统 Setup 1.1.1.exe` | 128,426,353 | `5faf628fc75906a0d958e9bad21392cdbc6b94855fed0b9ebb46973dacc33b5c` |
-| 便携版 | `release/直播控制系统 1.1.1.exe` | 128,209,574 | `ce57c7dffb43f066fa14bf84145581c0210bdae79409013730f9c48967f62349` |
-| 包内后端 | `release/win-unpacked/resources/backend/run.exe`（与两个包内同一文件） | 46,051,537 | `3c746a0ee4be46d8db7fcb46ba4e9c02a59ad7884a1a05fbc385413d0c6f6e87` |
+| 安装版（NSIS） | `release/直播控制系统 Setup 1.1.1.exe` | 128,430,255 | `09d335df8641f25d0e256417426dcda128e10240d024d8ca6377a50975fcd8ca` |
+| 便携版 | `release/直播控制系统 1.1.1.exe` | 128,211,651 | `6814608ab1284ce4ec05367d19713d0b97ddfbcdcdf2df023fafb48455d78ff8` |
+| 包内后端 | `release/win-unpacked/resources/backend/run.exe`（与两个包内同一文件） | 46,053,460 | `c249e31d4209befeb3d17232363884542e0e327fb530c1a45c978b931da4813e` |
 | 构建输入：分区种子 | `backend/build-inputs/bili_areas_full.json`（未跟踪） | 72,654 | `648ac56d76938bde5601e6c3e1b912affc7aed5862ac586de4229d79be94c768` |
 
-> **勘误**：上表是**返修后**（父提交 `efb9f4b` + 本轮两包）的构建。返修前那一版
-> （`Setup` 128,427,593 / `9e0a8fe8…`，便携 128,211,507 / `b6692165…`，`run.exe`
-> 46,053,813 / `26cee87a…`）已被本次构建覆盖，从未推送或发布，仅在本说明的历史版本里出现过。
+> **勘误（第二轮返修后）**：上表是**本轮**（第二轮复核后的 A 包返修）的构建，安装/便携两个包
+> 因为改的是安装器脚本所以字节变了，`run.exe` 也换了（PyInstaller 单文件不可复现）。
+> 第一轮返修那一版（`5faf628f…` / 128,426,353、`ce57c7df…` / 128,209,574、
+> `3c746a0e…` / 46,051,537）与最初那一版（`9e0a8fe8…` / `b6692165…` / `26cee87a…`）
+> 都从未推送或发布，已被本次构建覆盖。
+
 
 构建环境：Node `v22.20.0`（`tools/node-v22.20.0-win-x64`）、Python `3.12.2` +
 PyInstaller `6.19.0`（`F:/python/python.exe`）。三者都记在 `build-manifest.json` 里。
@@ -337,21 +402,26 @@ NEGATIVE_CONTROL_EXIT=1
 
 - `packaged-smoke.mjs`（返修后的驱动）、`smoke-final.log`、`smoke-final/aggregate.json`
   与截图、各场景的 main/stdout/stderr 日志、`platform.*.log`
-- `smoke-r2.log` / `smoke-r2/`：返修后 `--only=legacy,upgrade` 的窄跑。A 包 4.00–4.15
-  全通过；B 包 2.13c 如实报红（夹具前提不成立，见第零节）
-- `smoke-r3.log` / `smoke-r3/`：媒体夹具修正后 `--only=legacy` 重跑，**40/40**、
-  `errors: []`，2.13c–2.17 真实取得
+- **`smoke-r6.log` / `smoke-r6/`：本轮（第二轮复核后）的窄跑，`--only=legacy,upgrade`，
+  `61/61`、`errors: []`**；其中 4.02c/4.02d 是"停写未确证→拒绝升级"的实际流程窄证
+- **`smoke-r7.log` / `smoke-r7/`：本轮 `--only=install,single`**，覆盖被改过的公共观察入口
+- **`rescue-macro-harness.nsi` / `rescue-macro-run.mjs` / `rescue-macro-facts.json` /
+  `rescue-macro-work/`**：A 包的宏级三态窄证（真实 makensis 编译本文件的保全宏；
+  只在本目录里读写，不安装、不卸载、不写注册表、不碰 `%APPDATA%`）
 - `probe_media_evidence.cjs` / `media-evidence-rerun.log` / `media-evidence-summary.json`：
-  **复核方原有的探针原件**，`SMOKE_SOURCE` 指向返修后的驱动再跑一次，4 run / 0 failure /
-  0 ERROR（T1/G1/T2/G2 全 PASS）
-- `rescue-probe.mjs`：A 包的快速独立探针（只验安装器侧保全，用真实两个安装包）
+  **复核方原有的探针原件**，`SMOKE_SOURCE` 指向返修后的驱动再跑，4 run / 0 failure / 0 ERROR
+- `probe_media_remaining.cjs` / `media-remaining-summary.json`：**复核方第二轮的探针原件**，
+  同样指向返修后的驱动再跑，3 run / 0 failure / 0 ERROR
+- `smoke-r2` / `smoke-r3` / `smoke-r5`：第一轮返修的窄跑与跨午夜那次（4.13 由绿转红，
+  原因见第零节夹具日期口径，不是产品缺陷）——保留对照
+- `rescue-probe.mjs`：A 包第一轮的快速独立探针（只验安装器侧保全）
 - `probe_upgrade_facts_r2.py`：按复核 A 项的两条判据审计 `smoke-r2` 的字段，5/5 OK。
   复核方原版 `probe_upgrade_facts.py` 读的是返修前那轮的字段名；**旧证据
   `smoke-final/` 原样保留**，用原版审计器跑它仍然复现出原来那条失败
 - `smoke-dup-check.log` / `smoke-dup-check/`：第一轮 `--only=legacy` 的窄跑
 - `upgrade-repro.ps1` / `upgrade-repro.log`（覆盖安装清空安装目录的受控复现，返修前）
-- `artifacts/`（返修后的安装版、便携版、包内 `run.exe`、`build-manifest.json`、`SHA256SUMS.txt`）
-- `full-build.log`：返修后的整链构建日志
+- `artifacts/`（**本轮**的安装版、便携版、包内 `run.exe`、`build-manifest.json`、`SHA256SUMS.txt`）
+- `full-build-r2.log`：本轮的整链构建日志（`full-build.log` 是第一轮的）
 - 中间轮次的 `smoke-*.log` / `smoke-*/` 一并保留，便于对照（不删除既有 release 内容）
 
 ## 七、边界
