@@ -183,7 +183,7 @@ B 包的实测（`smoke-r6` 内）：2.13c 本次是**真中断**
 
 ### 第三轮返修后的实测（A 包）
 
-宏级窄证现在有 7 条，全部用**真实 makensis 编译本文件里的保全宏**（只在交付目录里读写，
+宏级窄证现在有 9 条，全部用**真实 makensis 编译本文件里的保全宏**（只在交付目录里读写，
 不安装、不卸载、不写注册表、不碰 `%APPDATA%`）：
 
 | 事项（`rescue-macro-run.mjs`） | 结果 |
@@ -514,10 +514,10 @@ NEGATIVE_CONTROL_EXIT=1
   `make-trace-variant.py`、`check-guard-released.py`。**这些都不是产品代码**；
   `installer-r3-final.nsh` 才是仓库里那一份（sha256 `4a5f9196…`）。
 - **`rescue-macro-harness.nsi` / `rescue-macro-run.mjs` / `rescue-macro-facts.json` /
-  `rescue-macro-work/`**：A 包的宏级窄证，7 条（正常 / 复制失败中止 / 停写未确证中止 /
-  候选建不出中止 / 已有保全被占用 ×2 中止且一个字节未变 / 已有保全没被占用时整体替换）；
-  真实 makensis 编译本文件的保全宏，只在本目录里读写，不安装、不卸载、不写注册表、
-  不碰 `%APPDATA%`
+  `rescue-macro-work/`**：A 包的宏级窄证，9 条（正常 / 复制失败中止 / 停写未确证中止 /
+  候选建不出中止 / 已有保全被占用 ×2 中止且一个字节未变 / 已有保全没被占用时整体替换 /
+  选来源命中与未命中）；真实 makensis 编译本文件的保全宏，只在本目录里读写，不安装、
+  不卸载、不写注册表、不碰 `%APPDATA%`
 - **`rescue-r3-probe.mjs` / `rescue-r3-writer.py` / `rescue-r3-facts.json` /
   `rescue-r3-work/` / `rescue-r3-repo/` / `OBSERVATION-DIFF-r3.txt`**：排写保护覆盖复制窗口的
   窄证（真实 SQLite + 真实 NSIS 复制 + 真实独立写者进程；观察闸门是从当前文件机械生成的
