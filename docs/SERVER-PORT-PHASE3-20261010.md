@@ -345,6 +345,9 @@ NEGATIVE_CONTROL_EXIT=1
   **复核方原有的探针原件**，`SMOKE_SOURCE` 指向返修后的驱动再跑一次，4 run / 0 failure /
   0 ERROR（T1/G1/T2/G2 全 PASS）
 - `rescue-probe.mjs`：A 包的快速独立探针（只验安装器侧保全，用真实两个安装包）
+- `probe_upgrade_facts_r2.py`：按复核 A 项的两条判据审计 `smoke-r2` 的字段，5/5 OK。
+  复核方原版 `probe_upgrade_facts.py` 读的是返修前那轮的字段名；**旧证据
+  `smoke-final/` 原样保留**，用原版审计器跑它仍然复现出原来那条失败
 - `smoke-dup-check.log` / `smoke-dup-check/`：第一轮 `--only=legacy` 的窄跑
 - `upgrade-repro.ps1` / `upgrade-repro.log`（覆盖安装清空安装目录的受控复现，返修前）
 - `artifacts/`（返修后的安装版、便携版、包内 `run.exe`、`build-manifest.json`、`SHA256SUMS.txt`）
