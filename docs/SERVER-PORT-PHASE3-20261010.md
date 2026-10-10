@@ -1,20 +1,24 @@
 # 桌面移植第三阶段交付说明（打包与精简收尾）
 
-- 日期：2026-10-10（含当日独立复核后的返修）
+- 日期：2026-10-10（含当日两轮独立复核后的返修；第二轮返修的窄跑跨到 2026-10-11 凌晨）
 - 分支：`port-server-core-20261009`（入场 HEAD `4880123c474db9081de6ffc057fa43599c41b155`）
 - 提交：正文 `26354aaf07b5d5dee915776b41627fb11a2ad3b7`，文档补记 `734fa91`、`efb9f4b`；
-  **独立复核后的返修见第零节**（`7681aeb`，父提交 `efb9f4b`）
+  **两轮独立复核后的返修见第零节**（`7681aeb`，父 `efb9f4b`；`f65b9ba`，父 `e0f23c7`）
 - 状态：**第三阶段候选完成，待独立复核**。未推送、未公开发布、未改服务端、未触碰日常数据目录。
 
 ## 零、独立复核后的两包返修（本轮新增）
 
-独立复核（`F:/livestream/deliveries/desktop-port-phase3-review-efb9f4b-20261010/REVIEW.md`）
+第一轮独立复核
+（`F:/livestream/deliveries/desktop-port-phase3-review-efb9f4b-20261010/REVIEW.md`）
 结论为「暂不通过」，两条：**A 覆盖升级会删除旧资料**（原计划的"升级资料不丢"未满足）、
 **B 媒体采证工具存在假绿**（结束命令失败也照样判通过；进程查询失败被当成 0）。
-本轮只修这两处，不重刷整仓、不重跑历史阶段。
+第二轮独立复核
+（`F:/livestream/deliveries/desktop-port-phase3-rework-review-e0f23c7-20261010/REVIEW.md`）
+确认正常路径已修好，但 A 包还有两处 P1、B 包还有两处采证遗漏（见本节末的"第二轮返修"）。
+每轮只修被指出的那几处，不重刷整仓、不重跑历史阶段。
 
-- **A 包改产品** → 仓库提交 `7681aeb`（`build/installer.nsh`、`electron/main.ts`、
-  `backend/app/core/data_migration.py`）。
+- **A 包改产品** → 仓库提交 `7681aeb`（第一轮）与 `f65b9ba`（第二轮）
+  （`build/installer.nsh`、`electron/main.ts`、`backend/app/core/data_migration.py`）。
 - **B 包只改采证工具** → 不进仓库；改动与证据全在
   `F:/livestream/deliveries/desktop-port-phase3-20261010/`（`packaged-smoke.mjs` 等），
   因此仓库里没有对应提交。
