@@ -129,9 +129,12 @@ function createStub() {
     }
 
     if (p === '/api/auth/qrcode') {
+      // 新扫码协议：每张二维码是一个**扫码代次**（generation），旧代次回包作废。
+      state.qrGeneration = (state.qrGeneration || 0) + 1
       return json(res, {
-        qrcode_key: `synthetic-${state.pollCount + 1}`,
-        qrcode_url: 'data:image/png;base64,AA==',
+        qrcode_key: `synthetic-${state.qrGeneration}`,
+        qr_url: 'data:image/png;base64,AA==',
+        generation: state.qrGeneration,
       })
     }
 
@@ -194,11 +197,20 @@ function createStub() {
     }
 
     if (p === '/api/live/status') {
+      // 新控制协议：GET 返回同一份只读投影（桌面合成场景：已停止、无场次）。
       return json(res, {
-        is_streaming: false,
-        elapsed_seconds: 0,
-        current_zone: '',
-        backend_events: [],
+        has_active: false, has_run: false, resumable: false,
+        resume_blocked_reason: '', step: 'idle', goal: null, run: null,
+        current_zone: '', run_id: null, task_id: null, business_day: '',
+        mode: '', push_source: '', target_seconds: 0, confirmed_seconds: 0,
+        display_seconds: 0, display_advancing: false, display_valid_seconds: 0,
+        display_source: 'frozen', duration_known: false, room_id: null,
+        end: null, wait_reason: '',
+        account: (state.authLoggedIn
+          ? { uid: state.currentUser.uid, room_id: 55001,
+              display_name: state.currentUser.uname }
+          : null),
+        boot_id: 'synthetic-boot', backend_events: [], face: null,
       })
     }
     if (p === '/api/live/events') return json(res, { events: [] })
@@ -337,7 +349,7 @@ async function loginByQr(page, base, stub, user, { gotoFirst = true } = {}) {
   stub.state.nextUser = { ...user }
   if (gotoFirst) await page.goto(`${base}/#/login`)
   else await waitHash(page, '#/login')
-  await page.getByText('等待扫码...', { exact: true }).waitFor({ state: 'visible', timeout: 15000 })
+  await page.getByText('等待扫码…', { exact: true }).waitFor({ state: 'visible', timeout: 15000 })
   const before = stub.state.pollCount
   await waitFor(() => stub.state.pollCount > before, '二维码轮询')
   await waitHash(page, '#/')
@@ -408,14 +420,21 @@ async function run() {
     await waitFor(() => stub.state.logoutSeen >= 1, 'logout 请求到达')
     await sleep(700)
     const duringLogout = await observe(pageLogout)
-    record('退出期间不重读 auth/status', stub.count('/api/auth/status') === statusBeforeLogout,
+    record('退出受理前不重读 auth/status', stub.count('/api/auth/status') === statusBeforeLogout,
            `before=${statusBeforeLogout} after=${stub.count('/api/auth/status')}`)
-    record('退出期间本地身份与任务读取立即停止', duringLogout.loggedIn === false
-      && duringLogout.cached === null
-      && stub.count('/api/tasks') - tasksBeforeLogout <= 1,
-    JSON.stringify({ duringLogout, taskDelta: stub.count('/api/tasks') - tasksBeforeLogout }))
+    // 新语义（阶段 2）：退出请求**未受理**时本地身份保留——旧实现先清本地再等
+    // 服务端，会在"服务端仍有旧账号、界面已经不认它"之间留一道裂缝。
+    record('退出受理前本地身份与缓存保留', duringLogout.loggedIn === true
+      && duringLogout.cached !== null
+      && duringLogout.userInfo?.uname === 'OLD',
+    JSON.stringify(duringLogout))
     stub.releaseLogout()
     await waitHash(pageLogout, '#/login')
+    // 服务端**受理**之后才撤销本地身份：这一次清空发生在受理之后。
+    const afterLogout = await observe(pageLogout)
+    record('退出受理后撤销本地身份并回登录页', afterLogout.loggedIn === false
+      && afterLogout.cached === null && afterLogout.hash === '#/login',
+      JSON.stringify(afterLogout))
     await ctxLogout.close()
 
     // 3. auth_logout_blocked restores identity and allows task reads again.
@@ -426,15 +445,23 @@ async function run() {
     const pageBlocked = await ctxBlocked.newPage()
     await loginByQr(pageBlocked, base, stub, { uid: 11, uname: 'LIVE', face: '', level: 1 })
     const taskBeforeBlocked = stub.count('/api/tasks')
+    const statusBeforeBlocked = stub.count('/api/auth/status')
     stub.state.logoutMode = 'blocked'
     await clickLogout(pageBlocked)
     await waitFor(() => stub.state.logoutSeen >= 1, 'blocked logout 请求')
     await sleep(1000)
     const blocked = await observe(pageBlocked)
-    record('auth_logout_blocked 恢复账号且留在控制台', blocked.loggedIn === true
+    record('退出被拒保留账号且留在控制台', blocked.loggedIn === true
       && blocked.userInfo?.uname === 'LIVE' && blocked.hash === '#/', JSON.stringify(blocked))
-    record('auth_logout_blocked 后任务读取恢复', stub.count('/api/tasks') > taskBeforeBlocked,
-           `before=${taskBeforeBlocked} after=${stub.count('/api/tasks')}`)
+    // 被拒之后用只读 /api/auth/status 核对一次实际账号事实（而不是再发一次退出）。
+    record('退出被拒后按只读状态核对一次',
+           stub.count('/api/auth/status') === statusBeforeBlocked + 1,
+           `before=${statusBeforeBlocked} after=${stub.count('/api/auth/status')}`)
+    // 新语义：身份保留 → 启动快照不被作废 → 业务读取**不被打断**（旧实现靠
+    // "清了再恢复"让读取重跑一遍）。这里核对的是"当前账号的任务仍在界面上"。
+    record('退出被拒后任务读取不被打断', blocked.taskCount === 1
+      && stub.count('/api/tasks') >= taskBeforeBlocked,
+      `before=${taskBeforeBlocked} after=${stub.count('/api/tasks')} tasks=${blocked.taskCount}`)
     await ctxBlocked.close()
 
     // 4. A QR response already in flight before logout must not restore login.

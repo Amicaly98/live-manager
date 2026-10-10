@@ -81,6 +81,14 @@ _ENDPOINTS = (
     ('start', '/startLive'),
     ('stop', '/stopLive'),
     ('query', '/get_info'),
+    # 阶段 2 桌面端到端新增（**只增不改**）：真实登录链路的四个平台出口。
+    # 二维码 generate/poll 命中 passport 主机路径，用户/房间核验命中
+    # api.bilibili.com 与 room/getRoomInfoOld —— 全部经 _AttemptPolicy.rewrite
+    # 指到本桩（主机替换、路径原样），同一份 URL 构造路径不变。
+    ('qrcode_generate', 'qrcode/generate'),
+    ('qrcode_poll', 'qrcode/poll'),
+    ('myinfo', '/space/myinfo'),
+    ('roominfo', 'getRoomInfoOld'),
 )
 
 
@@ -243,6 +251,13 @@ class LoopbackPlatform:
 
     def handle(self, handler: 'BaseHTTPRequestHandler', method: str) -> None:
         parsed = urlsplit(handler.path)
+        # ===== 验收控制面（不记入平台轨迹、不施加房间副作用） =====
+        # 同一端口既是"平台"也是驱动器的控制通道：/control/* 让端到端驱动
+        # 能编排响应计划、闸门并读取房间/轨迹状态。平台请求永远看不到这条路
+        # 径（它们只会命中上面 _ENDPOINTS 的真实形状）。
+        if parsed.path.startswith('/control/'):
+            self._handle_control(handler, method, parsed)
+            return
         endpoint = endpoint_of(parsed.path)
         length = int(handler.headers.get('Content-Length') or 0)
         raw = handler.rfile.read(length) if length else b''
@@ -328,6 +343,25 @@ class LoopbackPlatform:
                 },
             }
             return body
+        if endpoint == 'qrcode_generate':
+            return {'code': 0,
+                    'data': {'url': 'https://synthetic.invalid/qr',
+                             'qrcode_key': 'synthetic-key'}}
+        if endpoint == 'qrcode_poll':
+            # data.code: 86101 未扫码 / 86090 已扫未确认 / 0 已确认。
+            # 已确认时 url 查询串携带候选凭据（真实协议形状）。
+            return {'code': 0,
+                    'data': {'code': plan.code if plan.code is not None else 0,
+                             'message': '',
+                             'url': 'https://synthetic.invalid/scan?'
+                                    'SESSDATA=isolated-sessdata&'
+                                    'bili_jct=isolated-jct&DedeUserID=7001'}}
+        if endpoint == 'myinfo':
+            return {'code': 0,
+                    'data': {'mid': 7001, 'name': '合成验收',
+                             'face': '', 'level': 1}}
+        if endpoint == 'roominfo':
+            return {'code': 0, 'data': {'room_id': 93001}}
         return {'code': 0}
 
     def _apply_side(self, side: str, room_id: Optional[int], plan: Plan,
@@ -339,6 +373,61 @@ class LoopbackPlatform:
             self.set_room(room_id, True, area)
         elif side == 'close':
             self.set_room(room_id, False)
+
+    # ---------------------------------------------------------------- 控制面
+
+    def _handle_control(self, handler: 'BaseHTTPRequestHandler', method: str,
+                        parsed) -> None:
+        """驱动器编排接口：计划 / 闸门 / 状态 / 退出。全部 JSON。"""
+        length = int(handler.headers.get('Content-Length') or 0)
+        raw = handler.rfile.read(length) if length else b''
+        body = json.loads(raw.decode('utf-8', 'replace')) if raw else {}
+        action = parsed.path[len('/control/'):]
+        result: Any = {'ok': True}
+        with self._lock:
+            if method == 'POST' and action == 'plan':
+                endpoint = str(body.get('endpoint') or '')
+                if not endpoint:
+                    result = {'ok': False, 'error': 'endpoint required'}
+                else:
+                    kwargs = {k: body[k] for k in
+                              ('code', 'body', 'raw_body', 'status', 'delay',
+                               'body_delay', 'drop', 'side', 'area_id')
+                              if k in body}
+                    self.plans.setdefault(endpoint, []).append(Plan(**kwargs))
+            elif method == 'POST' and action == 'gate':
+                endpoint = str(body.get('endpoint') or '')
+                if body.get('block'):
+                    gate = self.gates.get(endpoint)
+                    if gate is None:
+                        self.gates[endpoint] = threading.Event()
+                else:
+                    gate = self.gates.pop(endpoint, None)
+                    if gate is not None:
+                        gate.set()
+            elif method == 'GET' and action == 'state':
+                result = {
+                    'rooms': {str(k): dict(v) for k, v in self.rooms.items()},
+                    'max_inflight': self.max_inflight,
+                    'plans_pending': {k: len(v)
+                                      for k, v in self.plans.items() if v},
+                    'gates': sorted(self.gates),
+                    'timeline': self.timeline(),
+                }
+            elif method == 'POST' and action == 'quit':
+                self._quit_requested = True
+            else:
+                result = {'ok': False, 'error': f'unknown {method} {action}'}
+        data = json.dumps(result, ensure_ascii=False).encode('utf-8')
+        handler.send_response(200)
+        handler.send_header('Content-Type', 'application/json; charset=utf-8')
+        handler.send_header('Content-Length', str(len(data)))
+        handler.end_headers()
+        handler.wfile.write(data)
+        handler.close_connection = True
+
+    #: 控制面置位；由独立服务进程轮询后退出。
+    _quit_requested = False
 
 
 class _Handler(BaseHTTPRequestHandler):

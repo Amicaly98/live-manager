@@ -1,158 +1,125 @@
 /**
- * 指定任务开播的确认流程（2026-09-28 收口，工作包 B 前端半场）。
+ * startTaskFlow.ts - "点哪条开哪条"的确认流程（阶段 4C 返修 R2）。
  *
- * 核心规则：
- * 1. 目标在**任何弹框之前**冻结一次（id + expected_revision + business_date）；
- *    弹框后的任务列表刷新/后台结算都不得改它——用户确认的是他当时看到的那一条；
- * 2. 存在进行中的任务时，冲突事实来自**服务端状态快照**（不虚构数字），
- *    用户确认"覆盖"后携带完整冻结凭证（old_* 五元组 + confirm_id + stop_epoch）；
- * 3. 服务端 409（确认已过期/竞态）→ 重取快照 → 再次确认 → **复用同一个
- *    target** 重发：绝不重新冻结（那等于把用户确认的内容悄悄换掉）。
+ * 抽成纯流程模块的原因与旧版相同：确认框打开期间后台随时可能换场、换目标版本——
+ * **绝不允许**在确认之后重读当前 Run/Goal/revision 再发请求，把新状态与旧的用户
+ * 确认拼在一起。所有权规则只有一条，且必须在**第一次确认 UI 之前**完成：
+ *
+ *   目标身份（id + 版本 + 业务日）、原场上下文（run/goal/selection）、账号、推流
+ *   来源，全部一次冻结成**一份完整的 `FrozenOperation`**（含客户端令牌）；此后
+ *   弹框、重发、网络重试只消费这一份。
+ *
+ * 返修前的问题是"注释写冻结、执行位置在弹框之后"：`freezeStartTarget` 在模式选择
+ * 弹窗结束之后才调用，`buildRestart` 回调还忽略流程传入的冻结 abandon 参数、
+ * 改去读当前投影。于是"用户确认 A、实际放弃 B"能真实发生（复核 R2 的两条浏览器
+ * 反例）。现在冻结与构建合并成一次 `freezePlan()`，**由调用方在打开任何确认 UI
+ * 之前调用**；本模块只负责"确认 → 派发这一份"。
+ *
+ * 其余三点不变：
+ * 1. **没有"再取一张票"这一步**：令牌在冻结那一刻由客户端生成（`api/liveControl.ts`）。
+ * 2. **放弃与新开是同一项请求**：`restart-after-abandon` 里带上冻结的原场。
+ * 3. **被拒绝不自动重来**：版本过期只会得到"请刷新后重新确认"。
  */
+import type { FrozenOperation } from '@/api/liveControl'
+import type { FrozenAbandonRef } from '@/stores/live'
 
-export interface FrozenStartTarget {
-  id: number
+/** 弹框之前冻结的**目标身份**（来自同一次任务列表快照）。 */
+export interface FrozenTaskTarget {
+  taskId: number
   expectedRevision: number
   businessDate: string
 }
 
-export interface AbandonConflictInfo {
-  hasSaved: boolean
-  oldRunId?: string
-  oldTaskId?: number | null
-  oldZoneName?: string
-  oldExecutionDate?: string
-  oldElapsedSeconds?: number
-}
+/** 弹框之前冻结的**原场上下文**（来自同一次投影快照）。 */
+export type FrozenAbandonContext = FrozenAbandonRef
 
-export interface StartOutcome {
-  success: boolean
-  message: string
-  needFaceVerify?: boolean
-  qrData?: string
-  /** 服务端拒绝原因码（409 分类用）。 */
-  refusal?: string
-}
-
-export interface AbandonSavedClaimBody {
-  old_run_id?: string
-  old_task_id?: number | null
-  old_zone_name?: string
-  old_execution_date?: string
-  old_elapsed_seconds?: number
-  confirm_id?: string
-  stop_epoch?: number
+/**
+ * **第一次确认 UI 之前**构建好的整份操作。
+ *
+ * `operation` 是唯一权威载荷；`abandon` 只用于生成确认文案，不参与建 body。
+ */
+export interface FrozenStartPlan {
+  operation: FrozenOperation
+  abandon: FrozenAbandonContext | null
+  target: FrozenTaskTarget
+  pushSource: 'ffmpeg' | 'obs'
 }
 
 export interface StartTaskFlowDeps {
-  /** 冻结当前目标（任何弹框之前调用一次）。返回 null 表示目标不明确。 */
-  freezeStartTarget: () => FrozenStartTarget | null
-  /** 服务端状态快照：有进行中的任务时返回其完整身份，否则 null。 */
-  fetchSavedState: () => Promise<AbandonConflictInfo | null>
-  /** 发起指定开播。 */
-  start: (target: FrozenStartTarget,
-          abandonSaved?: AbandonSavedClaimBody) => Promise<StartOutcome>
-  /** 冲突确认框：用户确认"覆盖旧进度"返回 true。 */
-  confirmAbandon: (info: AbandonConflictInfo) => Promise<boolean>
-  /** 当前控制代际（凭证里的 stop_epoch）。 */
-  fetchControlEpoch: () => Promise<number | null>
-  /** 一次性确认 id。 */
-  newConfirmId: () => string
-  /** 轻提示。 */
-  notify: (message: string, kind?: 'info' | 'warning' | 'error') => void
-}
-
-/** 从服务端状态快照提取冲突事实（字段缺失按"未知"处理，不虚构数字）。 */
-export function conflictInfoFromState(
-  state: Record<string, unknown> | null | undefined,
-): AbandonConflictInfo | null {
-  if (!state || state.has_active !== true) return null
-  return {
-    hasSaved: true,
-    oldRunId: typeof state.run_id === 'string' ? state.run_id : undefined,
-    oldTaskId: typeof state.task_id === 'number' ? state.task_id : null,
-    oldZoneName: typeof state.current_zone === 'string'
-      ? state.current_zone : undefined,
-    oldExecutionDate: typeof state.execution_date === 'string'
-      ? state.execution_date : undefined,
-    oldElapsedSeconds: typeof state.elapsed_seconds === 'number'
-      ? state.elapsed_seconds : undefined,
-  }
-}
-
-function claimFromConflict(
-  info: AbandonConflictInfo,
-  deps: Pick<StartTaskFlowDeps, 'newConfirmId' | 'fetchControlEpoch'>,
-): AbandonSavedClaimBody | null {
-  // 返回 null = 凭证事实不完整；调用方拒绝发送而不是猜。
-  // 凭证必须完整（后端逐项核对，缺失/变化即 409）——不完整就拒绝发送而不是猜。
-  if (!info.oldRunId || !info.oldTaskId
-      || typeof info.oldElapsedSeconds !== 'number') {
-    return null
-  }
-  return {
-    old_run_id: info.oldRunId,
-    old_task_id: info.oldTaskId,
-    old_zone_name: info.oldZoneName,
-    old_execution_date: info.oldExecutionDate,
-    old_elapsed_seconds: info.oldElapsedSeconds,
-    confirm_id: deps.newConfirmId(),
-  }
+  /**
+   * 取回**已经冻结**的整份操作。调用方必须在打开任何确认 UI **之前**完成冻结
+   * （`runSpecifiedTaskStart` 一进来就调用它，绝不放在弹框之后）。
+   * 返回 null = 无法冻结（缺稳定身份等），流程不弹框、不发请求。
+   */
+  plan: () => FrozenStartPlan | null
+  /** 真实控制入口（继续复用 `liveStore.dispatch`，不另建第二套请求）。 */
+  start: (operation: FrozenOperation) => Promise<{
+    superseded: boolean
+    notice: { level: 'success' | 'warning' | 'error' | 'info'; message: string } | null
+    status: string
+  }>
+  /** 结果反馈（ElMessage 注入口），缺省为空实现。 */
+  notify?: (kind: 'success' | 'warning' | 'error' | 'info',
+            message: string) => void
+  /** 确认放弃旧场；resolve(true)=用户确认。只在 plan.abandon 非空时调用。 */
+  confirmAbandon?: (info: { zone: string; day: string; targetTaskId: number })
+    => Promise<boolean>
 }
 
 /**
- * 运行一次"从这一行开始"的完整流程。
- * 目标冻结一次 → 查服务端快照 → 有保存进度先确认再带凭证开播；
- * 服务端 409 冲突时重取快照、重新确认、复用同一 target 重发。
+ * 从指定任务开始任务模式。全程不发 `/clear-state`、不重建任务身份。
+ *
+ * 返回本次实际发出的**冻结操作**（没有发出则为 null），供调用方记录日志。
  */
 export async function runSpecifiedTaskStart(
   deps: StartTaskFlowDeps,
-): Promise<StartOutcome> {
-  // 1) 弹框之前冻结一次；之后的一切确认/重发复用它。
-  const target = deps.freezeStartTarget()
-  if (!target || !Number.isFinite(target.id)) {
-    deps.notify('目标任务不明确：请刷新任务列表后重试', 'error')
-    return { success: false, message: '目标不明确' }
+): Promise<FrozenOperation | null> {
+  const notify = deps.notify ?? (() => {})
+  // 1) 取回**已经冻结**的整份操作。它由调用方在第一次确认 UI 之前构建好；
+  //    这里再晚一步读 store 就等于把用户没看到的版本塞进已确认的请求。
+  const plan = deps.plan()
+  if (!plan) {
+    notify('error', '无法冻结本次开播请求：任务身份或原场上下文缺失，请刷新后重试')
+    return null
   }
-
-  let claim: AbandonSavedClaimBody | undefined
-  const saved = await deps.fetchSavedState()
-  if (saved) {
-    const confirmed = await deps.confirmAbandon(saved)
+  // 2) 有原场才多一次"放弃"确认；确认的是**已冻结**的那一份（文案与载荷同源）。
+  if (plan.abandon) {
+    const confirmed = deps.confirmAbandon
+      ? await deps.confirmAbandon({ zone: plan.abandon.zoneName || '上一次任务',
+                                    day: plan.abandon.businessDate || '未取得',
+                                    targetTaskId: plan.target.taskId })
+      : true
     if (!confirmed) {
-      deps.notify('已保留原任务进度', 'info')
-      return { success: false, message: '已取消' }
+      notify('info', '已取消，旧进度未做任何改动')
+      return null
     }
-    claim = claimFromConflict(saved, deps) ?? undefined
-    if (!claim) {
-      deps.notify('无法确定旧进度凭证：请刷新任务列表后重试', 'warning')
-      return { success: false, message: '凭证不完整' }
-    }
-    const epoch = await deps.fetchControlEpoch()
-    claim.stop_epoch = epoch ?? undefined
   }
+  // 3) 发出。冻结载荷已经是唯一的权威：这里不再重读任何 store 值。
+  const result = await deps.start(plan.operation)
+  if (result.superseded) return plan.operation  // 结果属于别的账号代次：不提示
+  const notice = result.notice
+  if (result.status === 'rejected') {
+    // 版本过期一类：提示用户**重新查看并确认**，绝不用最新 revision 偷偷重发。
+    // 已有具体原因时**带上它**（不覆盖、不另发一条互相矛盾的"已过期"）；
+    // 回执没给原因时才用通用的过期文案。
+    notify('warning', notice?.message
+      ? `${notice.message}。请刷新任务列表后重新确认`
+      : '这次确认已经过期（任务或目标有变化）。请刷新后重新确认。')
+  } else if (notice) {
+    notify(notice.level, notice.message)
+  }
+  return plan.operation
+}
 
-  const first = await deps.start(target, claim)
-  if (first.success || first.needFaceVerify) return first
-  // 409 竞态（检查与受理之间出现了进行中的任务/确认过期）：
-  // 重取快照 → 重新确认 → **复用同一个 target** 重发。
-  if (first.refusal === 'already_streaming'
-      || first.message.includes('已有直播进行中')) {
-    const conflict = await deps.fetchSavedState()
-    if (!conflict) return first
-    const confirmed = await deps.confirmAbandon(conflict)
-    if (!confirmed) {
-      deps.notify('已保留原任务进度', 'info')
-      return { success: false, message: '已取消' }
-    }
-    const retryClaim = claimFromConflict(conflict, deps)
-    if (!retryClaim) {
-      deps.notify('无法确定旧进度凭证：请刷新任务列表后重试', 'warning')
-      return { success: false, message: '凭证不完整' }
-    }
-    const retryEpoch = await deps.fetchControlEpoch()
-    retryClaim.stop_epoch = retryEpoch ?? undefined
-    return deps.start(target, retryClaim)
+/** 从**已有**的冻结目标启动（例如不需要二次确认的场景）。不读任何 store。 */
+export async function startWithFrozenOperation(
+  deps: Pick<StartTaskFlowDeps, 'start' | 'notify'>,
+  operation: FrozenOperation,
+): Promise<FrozenOperation> {
+  const result = await deps.start(operation)
+  if (!result.superseded && result.notice) {
+    const notify = deps.notify ?? (() => {})
+    notify(result.notice.level, result.notice.message)
   }
-  return first
+  return operation
 }

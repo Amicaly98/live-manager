@@ -116,11 +116,8 @@ RETIRED_MODULES = {
         '旧控制器桌面收口语义；等价行为由共享链 + test_desktop_port_phase1 承担',
     'test_desktop_sync_matrix.py':
         '双仓同步矩阵的旧控制器列；迁移后同一矩阵应在共享链上重建（**未重建**）',
-    'test_desktop_email_notifications_111.py':
-        '旧控制器上的桌面通知措辞（不进正文的实例端口/快照元数据、简报篇幅）。'
-        '新链的文案由事实事件经 NotificationAdapter → EmailSender 生成，'
-        '**尚无**可运行的替代用例：需要一次真实 EmailSender 模板演练（只换投递出口、'
-        '不换文案层），留待第二阶段随真实链路取证',
+    # 2026-10-10 第二阶段：桌面通知措辞的替代守卫已在新链上重建
+    # （真实 EmailSender 模板 + 队列演练，只换物理投递出口），恢复收集。
     'test_cross_repo_contracts.py':
         '共同契约仍走 stability-contracts/scenarios/adapter_desktop.py（旧控制器）；'
         '适配器需按共享链重接后才能恢复',

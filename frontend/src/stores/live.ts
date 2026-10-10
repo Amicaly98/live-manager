@@ -1,35 +1,44 @@
+/**
+ * live.ts - 本场运行事实的**唯一**前端持有者（桌面移植阶段 2 / 服务端阶段 4C）。
+ *
+ * 桌面适配点只有一处：**默认推流来源是本机 FFmpeg**（`startNextTask` 等的缺省
+ * 参数）。服务器版把缺省写成 `obs`（多实例操作台按目标自己的设置推流），桌面
+ * 没有操作台，推流方式只由设置页决定，缺省必须落到产品默认。
+ *
+ * 设计口径：
+ *
+ * 1. **唯一后端投影**：`projection` 是 GET `/api/live/status` 返回的那份只读投影
+ *    的最近一次快照。前端不持有第二份 Goal/Run/Clock 权威，不结算、不跨日轮转、
+ *    不改进度文件。
+ * 2. **唯一应用路径** `applyStatus()`：所有状态写入（轮询 / 短观察 / 控制回执后的
+ *    刷新）都经过它；它负责账号代次门、读取代次门与事件摄取。
+ * 3. **状态读取单飞 + 可取消**：`refreshStatus()` 同时只有一个在途请求，离开页面
+ *    或换账号时真正中止（abort），迟到响应没有应用资格。
+ * 4. **显示秒表只画不做**：`display_seconds` 是服务端给的基数，
+ *    `display_advancing` / `display_valid_seconds` 是服务端给的许可与**剩余**预算；
+ *    浏览器只用 `performance.now()` 做绘制外推。**任何分支都不发 Stop/Start/Settle，
+ *    也不写业务秒数。**
+ */
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import { useRequest } from '@/api/request'
 import { operationEvents } from '@/stores/operationEvents'
+import {
+  CONTROL_URLS, freezeOperation, sendControl,
+  type ControlOutcome, type FrozenOperation,
+} from '@/api/liveControl'
 import type {
-  LiveStatus,
-  StartLiveResponse,
-  StopLiveResponse,
-  StartLiveRequest,
-} from '@/types/api'
-
-/** 受理冻结基线的最小形状（测试替身也只需给这些字段）。 */
-interface AcceptedIntentLike {
-  run_id?: string
-  confirmed_elapsed_seconds?: number
-}
+  AbandonRequest, AccountContext, ControlReceipt, FaceConfirmRequest, PushSource,
+  SessionProjection, StartNamedTaskRequest, StartSingleRequest,
+} from '@/types/session'
 
 /**
- * 本地**单调耗时源**（毫秒）——外推有效期的唯一时间来源（2026-09-20 监督 E3）。
+ * 本地**单调耗时源**（毫秒）——绘制外推与"预算已经用掉多少"的唯一时间来源。
  *
- * 为什么不能继续用 `Date.now()`：外推窗口的"已消耗量"由**本地耗时**推导，这个值必须
- * 只增不减。日历时间会被校时（NTP 校准、用户改表、时区/夏令时调整）回拨，回拨一次
- * 就等于把已经用掉的窗口还给页面（显示重新开始增长），也会把请求已经花掉的时间藏起来
- * （一条早就过期的快照被当成新鲜的，重新领到一整段外推）。`performance.now()` 单调且
- * 与系统时间无关，正好是这里需要的语义。
- *
- * 兜底路径只在宿主没有 `performance.now()` 时启用（浏览器与 Node 都有，正常走不到）：
- * 退回墙钟但**单向钳制**（只取历史最大值），保证它仍然单调不减——宁可少走也不倒退，
- * 因此回拨同样既还不了窗口、也藏不了请求耗时。
- *
- * 单位全程为毫秒。日历时间仍用于日志/时间戳（如 `backend_events` 的显示时间），
- * 只是不参与外推有效期。
+ * 不能用 `Date.now()`：日历时间会被校时回拨，回拨一次就等于把已经用掉的显示预算
+ * 还给页面（显示重新开始增长），也会把请求已经花掉的时间藏起来。
+ * `performance.now()` 单调且与系统时间无关，正好是这里需要的语义。
+ * 单位全程为毫秒；日历时间仍用于日志时间戳。
  */
 let _monoFallbackMs = 0
 let _monoFallbackSeen = false
@@ -49,380 +58,355 @@ function monoNowMs(): number {
   return _monoFallback()
 }
 
+/** 状态读取的总尝试预算：贯通传输层，一次轮询最多实际发出 3 次请求。 */
+const STATUS_MAX_ATTEMPTS = 3
+/** 有界观察：开播/停止/放弃后的收敛短轮询（最多 20 次 × 1 秒）。 */
+const SETTLE_WATCH_MAX_TICKS = 20
+const SETTLE_WATCH_INTERVAL_MS = 1000
+/** 首次确认时"确认前显示值"的收敛时间（既有 45 秒口径）。 */
+const FIRST_CONFIRM_CONVERGE_SEC = 45
+/** 同一次首次确认允许保留的最大领先量（与后端展示预算同量级）。 */
+const FIRST_CONFIRM_MAX_LEAD_SEC = 120
+
+/** 一次控制操作的**冻结**载荷 + 它的展示承诺。 */
+export interface DispatchResult {
+  outcome: ControlOutcome
+  /** 由调用方决定如何呈现；`null` = 无需提示（取消或被账号换代丢弃）。 */
+  notice: { level: 'success' | 'warning' | 'error' | 'info'; message: string } | null
+  /** 结果属于**另一个**账号代次，已被丢弃，不得写入当前界面。 */
+  superseded: boolean
+}
+
+/**
+ * 弹框**之前**冻结的一份"原场"上下文（阶段 4C 返修 R2）。
+ *
+ * `run_id` / `goal_revision` / `selection` 都不是前端能重建的东西：它们必须来自
+ * 用户**看到弹框那一刻**的投影。弹框期间后台完全可能换了一整场（新 Run / 新
+ * Goal），确认之后再去读当前投影就会把 B 的上下文塞进 A 的确认里。
+ */
+export interface FrozenAbandonRef {
+  runId: string
+  goalRevision: number
+  /** 原场选择：**原样**取自后端投影，不从分区文案重建。 */
+  selection: Record<string, unknown>
+  zoneName: string
+  businessDate: string
+}
+
 export const useLiveStore = defineStore('live', () => {
-  const status = ref<LiveStatus>({
-    is_streaming: false,
-    current_zone: '',
-    elapsed_seconds: 0,
-    remaining_seconds: 0,
-    room_id: 0,
-    is_anomaly: false,
-    ffmpeg_active: false,
-    ffmpeg_current_video: '',
-  })
+  const request = useRequest()
+
+  // ==================== 唯一投影 ====================
+
+  const projection = ref<SessionProjection | null>(null)
+  /** 是否已经拿到过**至少一份**状态（首屏未收到任何响应时为 false）。 */
+  const statusLoaded = ref(false)
+  /** 最近一次状态读是否失败（浏览器↔服务器失联）：只影响提示，不影响服务器计时。 */
+  const statusStale = ref(false)
   const isStarting = ref(false)
   const isStopping = ref(false)
 
-  // 会话身份与计时锚点（跨页面持久）
-  // 计时模型（2026-09-20 起）：显示值 = **服务端已确认的有效时长** +
-  // **有界外推的待确认区间**。计数器仍然靠"锚点 + 当前耗时"插值（后台标签页
-  // 节流会让 setInterval++ 越走越慢），但这里的"当前耗时"取的是**单调耗时源**
-  // （`monoNowMs()`）而不是日历时间：系统校时既不能让外推倒退重来，也不能把
-  // 请求的真实耗时藏起来。外推量被服务端给出的窗口夹住：
-  //   - pending_extrapolatable=false 或窗口用尽 → 立刻冻结在已确认值上；
-  //   - 浏览器失联时窗口照样会走完，因此失联后自然冻结，不需要额外的本地判断。
-  // 已确认值在同一会话内只增不减：待确认段被撤回时显示可以小幅回退，
-  // 但永远不会退到 0。
-  const localElapsed = ref(0)
-  const fixedTotal = ref(0)
-  /** 目标时长是否已知：未知（null）≠ 不限时（0）。 */
-  const durationKnown = ref(false)
-  /** 会话身份：同一 run_id 才允许继承/校正，旧响应不得覆盖新会话。 */
-  const sessionId = ref('')
-  const tickActive = ref(false)
-  /** 最近一次状态读是否失败（浏览器↔服务器失联）：只影响提示与冻结，不影响服务器计时。 */
-  const statusStale = ref(false)
-  let tickTimer: ReturnType<typeof setInterval> | null = null
-  // 显示锚点是否已建立。**用布尔量、不用 0 值判断**：单调时钟的起点完全可以是 0
-  // （测试注入的时钟就常常从 0 起算），把 0 当成"未初始化"会让外推永远停在第 0 秒。
-  let _displayArmed = false
-  let _confirmedAtAnchor = 0        // 锚点时刻的**已确认**有效时长（秒）
-  let _pendingAtAnchor = 0          // 锚点时刻的待确认区间（秒）
-  let _sessionConfirmedMax = 0      // 本会话见过的最大已确认值（防旧响应把进度拉回去）
-  // 外推窗口的**授予**（2026-09-20 监督 E2）：
-  // `pending_valid_seconds` 是"**快照生成那一刻**还剩多少可以外推"，不是"收到快照时
-  // 还剩多少"。响应在路上花掉的时间（含 Axios 重试与退避）必须从窗口里扣掉，否则一条
-  // 迟到的响应会凭空换来一段全新的外推时间，页面会在窗口早已耗尽时继续往前跳。
-  // 窗口一旦授予就只减不增：已消耗的量单独记账，因此
-  //   - 同一缓存快照被重复应用（重复 applyStatus / syncFromServer）不会重新授予；
-  //   - 计时器重启（startLocalTick 重设锚点）不会把用掉的窗口还回来。
-  // 这里涉及的三处时间（请求起点、窗口起点、窗口消耗）全部走 `monoNowMs()`
-  // （单调耗时源，见文件顶部说明），没有任何一处使用日历时间。
-  let _armedSnapshot: unknown = null  // 窗口是为哪一份快照授予的（按响应式对象身份）
-  let _windowArmed = false            // 是否已授予过窗口（同样**不用 0 值判断**）
-  let _windowBudgetSec = 0            // 这份快照授予的外推窗口（秒，已扣除请求耗时）
-  let _windowStartMonoMs = 0          // 窗口的本地起算时刻（单调毫秒，**只在重新授予时更新**）
-  let _eventPollTimer: ReturnType<typeof setInterval> | null = null
+  // ---- 账号代次：投影里的 (uid, room_id) 一变就前进 ----
+  const accountGeneration = ref(0)
+  let _accountKey = 'anon'
 
-  // ---- 状态一致性协议 ----
-  // 1) 请求序号：同一页面内向服务端发出的状态读顺序。晚发出的请求已经应用过
-  //    更新的快照，此时**先发出但后返回**的旧响应必须丢弃（否则进度会回零）。
-  // 2) 服务身份 + 快照版本：服务重启（boot_id 变）或同一 run 的旧 session_version
-  //    同样按迟到处理。
-  // 3) 单飞：轮询/事件/启动观察共用同一个在途读，慢请求不会叠成请求风暴。
-  const serverBootId = ref('')
-  const snapshotVersion = ref(0)
+  function accountKeyOf(p: SessionProjection | null): string {
+    const account = p?.account
+    return account && account.uid > 0 ? `u${account.uid}:${account.room_id}` : 'anon'
+  }
+
+  // ==================== 显示秒表（只画） ====================
+
+  /** 服务端给的展示基数（快照生成那一刻的 `display_seconds`）。 */
+  let _serverSeconds = 0
+  /** 快照的单调接收时刻——绘制外推的本地起点。 */
+  let _receivedAtMonoMs = 0
+  /** 服务端给的**剩余**外推预算（秒）；请求路上花掉的时间要扣掉。 */
+  let _budgetSec = 0
+  /** 这份许可属于哪个 Run，以及是否允许外推。 */
+  let _displayRunId = ''
+  let _mayAdvance = false
+  /** 已经扣掉本次传输耗时的预算（同一份快照只授予一次）。 */
+  let _displayArmedSnapshot: SessionProjection | null = null
+
+  // ---- 首次确认的视觉 carry：确认前的显示值不直接跳回 0 ----
+  let _preConfirmShownSec = 0
+  let _preConfirmRunId = ''
+  let _carryActive = false
+  let _carryRunId = ''
+  let _carryLeadSec = 0
+  let _carryStartMonoMs = 0
+
+  const displaySeconds = ref(0)
+
+  function clearCarry(): void {
+    _preConfirmShownSec = 0
+    _preConfirmRunId = ''
+    _carryActive = false
+    _carryRunId = ''
+    _carryLeadSec = 0
+    _carryStartMonoMs = 0
+  }
+
+  function carryForDisplay(nowMs: number): number {
+    if (!_carryActive) return 0
+    const since = (nowMs - _carryStartMonoMs) / 1000
+    const remaining = _carryLeadSec
+      * Math.max(0, 1 - since / FIRST_CONFIRM_CONVERGE_SEC)
+    return Math.max(0, remaining)
+  }
+
+  function budgetGrowth(nowMs: number): number {
+    if (!_mayAdvance || _budgetSec <= 0) return 0
+    return Math.min(Math.max(0, (nowMs - _receivedAtMonoMs) / 1000), _budgetSec)
+  }
+
+  /** 纯绘制函数：服务器基数 + 有界外推 + 首次确认 carry。不做任何业务动作。 */
+  function readDisplaySeconds(nowMs: number = monoNowMs()): number {
+    const value = _serverSeconds + budgetGrowth(nowMs) + carryForDisplay(nowMs)
+    return Math.max(0, value)
+  }
+
+  /** 预算耗尽（服务端许可仍在，但页面已经用完了它的剩余量）→ 冻结并提示。 */
+  const displayFrozen = computed(() => {
+    // 依赖 displaySeconds：每一帧重画时同步重算，否则这个 computed 永远不更新。
+    void displaySeconds.value
+    if (!_mayAdvance) return false
+    return budgetGrowth(monoNowMs()) >= _budgetSec
+  })
+
+  const confirmedSeconds = computed(
+    () => Number(projection.value?.confirmed_seconds ?? 0) || 0)
+
+  // ==================== 投影派生（页面只读这些） ====================
+
+  const step = computed(() => String(projection.value?.step ?? ''))
+  const goalWanted = computed(() => String(projection.value?.goal?.wanted ?? ''))
+  const goalRevision = computed(
+    () => Number(projection.value?.goal?.revision ?? 0) || 0)
+  const runId = computed(() => String(projection.value?.run_id ?? ''))
+  const taskId = computed(() => {
+    const value = projection.value?.task_id
+    return typeof value === 'number' ? value : null
+  })
+  const zoneName = computed(() => String(projection.value?.current_zone ?? ''))
+  const sessionMode = computed(() => String(projection.value?.mode ?? ''))
+  const pushSource = computed(() => String(projection.value?.push_source ?? ''))
+  const hasRun = computed(() => projection.value?.has_run === true)
+  const durationKnown = computed(() => projection.value?.duration_known === true)
+  const targetSeconds = computed(
+    () => Number(projection.value?.target_seconds ?? 0) || 0)
+  const resumable = computed(() => projection.value?.resumable === true)
+  const resumeBlockedReason = computed(
+    () => String(projection.value?.resume_blocked_reason ?? ''))
+  const face = computed(() => projection.value?.face ?? null)
+  const backendEvents = computed(() => projection.value?.backend_events ?? [])
+  const account = computed(() => projection.value?.account ?? null)
+
+  /** 用户在跑但暂时没有可执行任务：**不是**用户停播，浏览器也不反复 Start。 */
+  const waitingTasks = computed(
+    () => goalWanted.value === 'running' && step.value === 'wait_tasks')
+  /** 用户目标是在跑（含等待任务与切换过程中）。 */
+  const running = computed(() => goalWanted.value === 'running')
+  /** 平台已确认在播。 */
+  const live = computed(() => step.value === 'live')
+  /** 停止收尾中（目标已停止，房间尚未核对完成）。 */
+  const closing = computed(
+    () => goalWanted.value === 'stopped'
+      && step.value.startsWith('close') && step.value !== '')
+  /** 彻底空闲：目标停止且没有任何在途步骤。 */
+  const idle = computed(() => goalWanted.value === 'stopped' && step.value === 'idle')
+
+  /** 进度百分比：**已确认**秒数达标才算 100；外推最多画到 99。 */
+  const progressPercent = computed(() => {
+    const total = targetSeconds.value
+    if (!hasRun.value || !Number.isFinite(total) || total <= 0) return 0
+    if (confirmedSeconds.value >= total) return 100
+    const shown = Number(displaySeconds.value) || 0
+    if (!Number.isFinite(shown) || shown <= 0) return 0
+    return Math.max(0, Math.min(99, Math.round((shown / total) * 100)))
+  })
+
+  /** 已确认秒数超过目标：只做展示提示，**不触发任何完成动作**。 */
+  const overtime = computed(() => {
+    const total = targetSeconds.value
+    return hasRun.value && Number.isFinite(total) && total > 0
+      && confirmedSeconds.value > total
+  })
+
+  /**
+   * 计时区的一句话说明。全部来自投影事实，不新增术语：
+   * - 失联只说"连接中"，不把未知当停播；
+   * - `optimistic` 是"已派出 Start、等首次确认"；有已确认进度时才是"恢复中"；
+   * - `frozen` 且有场次 = 可信检查点，不再外推。
+   */
+  const timerHint = computed(() => {
+    const p = projection.value
+    if (!p) return ''
+    if (statusStale.value) return '连接中'
+    if (p.display_source === 'frozen' && p.has_run && p.goal?.wanted === 'running') {
+      return ''
+    }
+    if (p.display_source === 'optimistic') {
+      return p.confirmed_seconds > 0 ? '恢复中' : '开播确认中'
+    }
+    return ''
+  })
+
+  // ==================== 状态读取（单飞 + 代次） ====================
+
   let _requestSeq = 0
   let _appliedSeq = 0
-  let _pollInflight: Promise<LiveStatus | undefined> | null = null
+  let _pollInflight: Promise<SessionProjection | undefined> | null = null
   let _pollGeneration = 0
-  /** 状态读的**总尝试预算**：贯通传输层，最多实际发出 3 次。 */
-  const STATUS_MAX_ATTEMPTS = 3
-  /** 在途状态读的取消器：取消要同时中止请求与退避，而不只是丢弃结果。 */
   let _statusAbort: AbortController | null = null
-  // 启动观察（已受理 → 真正开播）的有界刷新
-  const START_WATCH_MAX_TICKS = 20
-  const START_WATCH_INTERVAL_MS = 1000
-  let _startWatchTimer: ReturnType<typeof setTimeout> | null = null
-  let _startWatchToken = 0
-  const startWatching = ref(false)
-
-  // ---- 受理即有界显示（2026-09-28 收口，B01/B02） ----
-  // 受理响应携带冻结基线（confirmed_elapsed_seconds）。首次可信观察到达之前，
-  // 显示从冻结基线起按单调时间**有界**推算（上限 120 秒）；权威观察到达后，
-  // 领先量在 45 秒内线性收敛到 0。乐观值只存在于显示层：它永远不会写入
-  // `_confirmedAtAnchor` / `_sessionConfirmedMax`，失败/停止/换会话立即撤除，
-  // 显示自然回落到权威值——受理永远不冒充"已确认成功"。
-  const OPTIMISTIC_MAX_LEAD_SEC = 120
-  const OPTIMISTIC_CONVERGE_SEC = 45
-  const optimisticRunId = ref('')
-  let _optimisticBaseSec = 0
-  let _optimisticAcceptedMonoMs = 0
-  /** 首次权威观察冻结的领先量与收敛起点（0 = 尚未冻结）。 */
-  let _optimisticLeadSec = 0
-  let _optimisticConvergeStartMs = 0
-
-  function armOptimistic(accepted?: AcceptedIntentLike | null) {
-    clearOptimistic()
-    if (!accepted || !accepted.run_id) return
-    optimisticRunId.value = String(accepted.run_id)
-    _optimisticBaseSec = Math.max(0, Number(accepted.confirmed_elapsed_seconds) || 0)
-    _optimisticAcceptedMonoMs = monoNowMs()
-  }
-
-  function clearOptimistic() {
-    optimisticRunId.value = ''
-    _optimisticBaseSec = 0
-    _optimisticAcceptedMonoMs = 0
-    _optimisticLeadSec = 0
-    _optimisticConvergeStartMs = 0
-  }
-
-  /** 受理起算的乐观地板：冻结基线 + 有界流逝量（封顶 +120 秒）。 */
-  function optimisticFloorSec(): number | null {
-    if (!optimisticRunId.value) return null
-    const elapsedSec = Math.max(0, (monoNowMs() - _optimisticAcceptedMonoMs) / 1000)
-    return _optimisticBaseSec + Math.min(elapsedSec, OPTIMISTIC_MAX_LEAD_SEC)
-  }
-
-  /**
-   * 显示值 = max(权威显示模型, 有界乐观)。
-   * 权威观察（同 run）到达后冻结领先量并在 OPTIMISTIC_CONVERGE_SEC 内线性收敛；
-   * 换会话/停止/失败由调用方 clearOptimistic，显示直接回到权威值。
-   */
-  function boundedDisplaySec(authoritative: number): number {
-    const floor = optimisticFloorSec()
-    if (floor === null) return authoritative
-    if (authoritative >= floor) {
-      // 权威已接管：乐观使命结束（不回写任何权威记账）。
-      clearOptimistic()
-      return authoritative
-    }
-    if (_optimisticLeadSec <= 0) {
-      // 首次权威观察：冻结当前领先量，开始线性收敛。
-      _optimisticLeadSec = Math.max(0, floor - authoritative)
-      _optimisticConvergeStartMs = monoNowMs()
-    }
-    const convergeElapsed = Math.max(0, (monoNowMs() - _optimisticConvergeStartMs) / 1000)
-    const remainingLead = _optimisticLeadSec
-      * Math.max(0, 1 - convergeElapsed / OPTIMISTIC_CONVERGE_SEC)
-    return Math.max(authoritative, Math.min(floor, authoritative + remainingLead))
-  }
-
-  const request = useRequest()
-
-  // 后台事件轮询（跨页面持续运行）：只负责**驱动** pollStatus；事件的摄取
-  // 统一发生在 applyStatus 受控路径里（2026-09-21 工作包 A），这里不再有
-  // 第二条写 localStorage 的路径。
-  function startEventPolling() {
-    if (_eventPollTimer) return
-    _eventPollTimer = setInterval(async () => {
-      try {
-        // 走**同一个**状态入口：事件轮询取得的状态快照不再被丢掉，
-        // 迟到的响应同样受请求序号约束。
-        await pollStatus()
-      } catch { /* silent */ }
-    }, 30000)
-  }
-
-  function stopEventPolling() {
-    if (_eventPollTimer) { clearInterval(_eventPollTimer); _eventPollTimer = null }
-  }
-
-  /**
-   * 为一份快照授予外推窗口（**只减不增**）。
-   *
-   * ``startedMonoMs``：这次逻辑请求的**单调**发起时刻（含重试/退避的总耗时由它界定）。
-   * 只用本地单调耗时差值，不假设浏览器与服务端时钟同步；同一份快照对象再次进来时
-   * 不重新授予。
-   */
-  function armWindow(snapshot: unknown, startedMonoMs?: number) {
-    if (!snapshot || snapshot === _armedSnapshot) return
-    const s = snapshot as {
-      pending_valid_seconds?: number, pending_extrapolatable?: boolean,
-    }
-    _armedSnapshot = snapshot
-    _windowArmed = true
-    _windowStartMonoMs = monoNowMs()
-    const raw = Number(s.pending_valid_seconds ?? 0)
-    if (s.pending_extrapolatable !== true || !Number.isFinite(raw) || raw <= 0) {
-      // 服务端没给窗口（暂停/冻结）：立刻封住，不许外推。
-      _windowBudgetSec = 0
-      return
-    }
-    // 请求起点 → 应用时刻的本地耗时。单调时钟保证这个差值不会因校时被抹掉
-    // （回拨会把它变小甚至变负，等于把过期快照当成新鲜的），因此不存在"夹成 0"的兜底。
-    const spentSec = (typeof startedMonoMs === 'number'
-                      && Number.isFinite(startedMonoMs))
-      ? Math.max(0, monoNowMs() - startedMonoMs) / 1000
-      : 0
-    _windowBudgetSec = Math.max(0, raw - spentSec)
-  }
-
-  /**
-   * 这份快照已经用掉的外推秒数 = 从**窗口起算时刻**到现在的单调耗时，被窗口夹住。
-   *
-   * 关键是它不看显示锚点：计时器重启（重设锚点）不会把它清零，因此"重启计时器"换不来
-   * 新的外推时间。窗口用尽后恒等于上限，页面自然冻结；校时前后也取不到更大的值。
-   */
-  function windowConsumedSec() {
-    if (!_windowArmed || _windowBudgetSec <= 0) return 0
-    const elapsed = Math.max(0,
-      Math.floor((monoNowMs() - _windowStartMonoMs) / 1000))
-    return Math.min(_windowBudgetSec, elapsed)
-  }
+  let _eventPollTimer: ReturnType<typeof setInterval> | null = null
+  let _tickTimer: ReturnType<typeof setInterval> | null = null
 
   /**
    * 所有状态响应的**唯一**应用入口。
    *
-   * 只要服务端真的回了快照就立刻更新计时显示（不等下一次轮询），并按会话
-   * 身份决定"继承 / 重置 / 拒绝旧响应"：
-   * - 同一 run_id：校正锚点，不打断正在推进的计时；
-   * - 换 run_id（新会话）：重建锚点；
-   * - 响应里没有 run_id 但正在推流：按分区名兜底，不做无谓重置。
-   *
-   * ``startedMonoMs``：请求的**单调**发起时刻，用来把窗口折算成"剩余有效期"（见 armWindow）。
+   * `generation` 是发起这次读取时捕获的读取代次：取消/离开页面之后晚到的响应
+   * **没有应用资格**（判断在应用**之前**，不是在补救里）。
    */
-  function applyStatus(res: LiveStatus, seq?: number, startedMonoMs?: number) {
-    const incoming = res as LiveStatus & {
-      run_id?: string, duration_known?: boolean,
-      duration_seconds?: number, elapsed_seconds?: number,
-      remaining_seconds?: number | null, phase?: string,
-      boot_id?: string, session_version?: number,
-      pending_seconds?: number, pending_valid_seconds?: number,
-      pending_extrapolatable?: boolean, timer_state?: string,
-    }
-    // 迟到响应：晚发出的请求已经应用过更新的快照，这个更旧的必须丢弃。
-    // 旧实现只在注释里写"拒绝旧响应"，实际没有任何序号判断，两次并发读
-    // 只要后发先至就会把进度倒回旧会话。
+  function applyStatus(next: SessionProjection, seq?: number, generation?: number): void {
+    if (typeof generation === 'number' && generation !== _pollGeneration) return
     if (typeof seq === 'number') {
-      if (seq < _appliedSeq) return
+      if (seq < _appliedSeq) return      // 后发先至的旧响应不得把状态拉回去
       _appliedSeq = seq
     }
-    const boot = String(incoming.boot_id || '')
-    if (boot) serverBootId.value = boot
-    const nextSession = incoming.run_id || ''
-    const incomingVersion = Number(incoming.session_version)
-    if (nextSession && nextSession === sessionId.value
-        && Number.isFinite(incomingVersion)) {
-      if (incomingVersion < snapshotVersion.value) return  // 同一会话的旧版本快照
-      snapshotVersion.value = incomingVersion
-    }
-    const incomingElapsed = Number(incoming.elapsed_seconds ?? 0)
-    const known = incoming.duration_known === true
 
-    const newSession = Boolean(nextSession) && nextSession !== sessionId.value
-    if (newSession) {
-      sessionId.value = nextSession
-      snapshotVersion.value = Number.isFinite(incomingVersion) ? incomingVersion : 0
-      _sessionConfirmedMax = 0
-      // 乐观会话只属于受理时的那个 run；换 run 即撤除，显示回落权威值。
-      if (optimisticRunId.value && nextSession
-          && nextSession !== optimisticRunId.value) {
-        clearOptimistic()
-      }
+    const previousShown = readDisplaySeconds()
+    const nextAgeKey = accountKeyOf(next)
+    const accountChanged = nextAgeKey !== _accountKey
+    if (accountChanged) {
+      _accountKey = nextAgeKey
+      accountGeneration.value += 1
+      // 换账号：显示锚点、视觉 carry、在途意图一律作废，绝不继承上一账号的秒表。
+      clearCarry()
+      _displayArmedSnapshot = null
+      _displayRunId = ''
+      _mayAdvance = false
+      _serverSeconds = 0
+      _budgetSec = 0
+      cancelPendingIntents('account-changed')
     }
-    status.value = res
+    const nextRunId = String(next.run_id ?? '')
+    if (!accountChanged && nextRunId !== _displayRunId && _displayRunId !== '') {
+      // 换场：同一账号内的新 Run 也不得继承上一场的显示。
+      clearCarry()
+      _displayArmedSnapshot = null
+      _budgetSec = 0
+    }
+
+    projection.value = next
     statusStale.value = false
-    durationKnown.value = known
+    statusLoaded.value = true
 
-    // 近期操作日志的**唯一摄取点**（2026-09-21 工作包 A）：能走到这里的
-    // 响应都已通过代际/取消/会话版本门，backend_events 立即并入响应式
-    // 事件 store——旧实现要再等一个独立 30 秒定时器写 localStorage、
-    // 再等页面轮询读缓存，首屏日志因此固定延迟半分钟。
+    // 近期操作日志的**唯一**摄取点（响应已通过代次/取消门）。
     try {
-      const be = (incoming as { backend_events?: unknown }).backend_events
-      if (be) operationEvents.ingestFromStatus(be)
+      operationEvents.ingestFromStatus(next.backend_events)
     } catch { /* 事件摄取失败不影响状态应用 */ }
 
-    if (known) {
-      const dur = Number(incoming.duration_seconds ?? 0)
-      fixedTotal.value = Number.isFinite(dur) && dur >= 0 ? dur : 0
-    } else {
-      // 未知时长：不猜测，也不把 0 显示成"不限时"
-      fixedTotal.value = 0
+    // ---- 绑定展示口径 ----
+    _displayRunId = nextRunId
+    _serverSeconds = Number(next.display_seconds) || 0
+    _mayAdvance = next.display_advancing === true
+    if (_displayArmedSnapshot !== next) {
+      // 一份**新**快照 = 一次新的许可授予：重置绘制起点与预算。
+      // 同一份快照被再次应用（同一对象）**不**重新授予——否则"重新应用"
+      // 就能把已经用掉的预算还回来。
+      _displayArmedSnapshot = next
+      _receivedAtMonoMs = monoNowMs()
+      _budgetSec = _mayAdvance ? Math.max(0, Number(next.display_valid_seconds) || 0) : 0
     }
 
-    if (incoming.is_streaming) {
-      // 已确认值在同一会话内只增不减：晚到的旧快照即使序号更"新"，
-      // 也不能把用户看到的已确认进度拉回去。
-      const confirmedRaw = Number.isFinite(incomingElapsed) && incomingElapsed >= 0
-        ? incomingElapsed : 0
-      const confirmed = Math.max(confirmedRaw, _sessionConfirmedMax)
-      _sessionConfirmedMax = confirmed
-      const pendingRaw = Number(incoming.pending_seconds ?? 0)
-      _pendingAtAnchor = Number.isFinite(pendingRaw) && pendingRaw > 0 ? pendingRaw : 0
-      // 窗口按"剩余有效期"授予：请求已经花掉的时间不再重复授予。
-      // 这里传 `status.value`（Vue 对同一对象缓存同一个响应式代理）而不是原始 `res`：
-      // 之后 startLocalTick / syncFromServer 读到的也是 `status.value`，身份必须一致，
-      // 否则同一份缓存快照会被误判成新快照、把窗口重新给满。
-      armWindow(status.value, startedMonoMs)
-      _confirmedAtAnchor = confirmed
-      _displayArmed = true
-      // 受理即有界显示：权威显示模型与乐观地板取大（领先量有界、可收敛、
-      // 永不写回已确认记账）。换会话的旧响应在上面已被身份门丢弃。
-      localElapsed.value = boundedDisplaySec(
-        _confirmedAtAnchor + _pendingAtAnchor + windowConsumedSec())
-      if (!tickActive.value) startLocalTick(true)
-      else refreshFromAnchor()
-    } else if (!incoming.is_starting) {
-      // 真的停了（不是"正在开播"）才清显示；"停止中"保留现场
-      clearOptimistic()
-      localElapsed.value = 0
-      fixedTotal.value = 0
-      sessionId.value = ''
-      _sessionConfirmedMax = 0
-      _confirmedAtAnchor = 0
-      _pendingAtAnchor = 0
-      _armedSnapshot = null
-      _windowArmed = false
-      _windowBudgetSec = 0
-      _windowStartMonoMs = 0
-      stopLocalTick(false)
+    if (!_mayAdvance) {
+      // unknown / closed / 停止 / End / 没有场次：立即采用服务器可信检查点，
+      // 不保留历史最大值，也不继续外推。
+      clearCarry()
+    } else if (next.display_source === 'optimistic') {
+      // 乐观阶段（Start 已派出、待首次确认）：记录"确认前最后显示值"，
+      // 供首次确认时算 carry。
+      _preConfirmRunId = nextRunId
+      _preConfirmShownSec = Math.max(_preConfirmShownSec, previousShown)
+    } else if (next.display_source === 'confirmed') {
+      if (_preConfirmRunId === nextRunId && !_carryActive
+          && _carryRunId !== nextRunId
+          && _preConfirmShownSec > _serverSeconds) {
+        _carryActive = true
+        _carryRunId = nextRunId
+        _carryStartMonoMs = monoNowMs()
+        _carryLeadSec = Math.min(FIRST_CONFIRM_MAX_LEAD_SEC,
+          _preConfirmShownSec - _serverSeconds)
+      }
     }
+
+    displaySeconds.value = readDisplaySeconds()
+    startTick()
   }
 
-  function refreshFromAnchor() {
-    if (!_displayArmed) return
-    const shown = _confirmedAtAnchor + _pendingAtAnchor + windowConsumedSec()
-    // 已确认进度不得归零；待确认段允许小幅回退（服务端撤回时）。
-    // 有界乐观只抬高显示，不抬高已确认锚点。
-    localElapsed.value = Math.max(_confirmedAtAnchor, boundedDisplaySec(shown))
+  function startTick(): void {
+    if (_tickTimer) return
+    _tickTimer = setInterval(() => {
+      // 只重画。不发请求、不做业务判断。
+      displaySeconds.value = readDisplaySeconds()
+    }, 1000)
+  }
+
+  function stopTick(): void {
+    if (_tickTimer) { clearInterval(_tickTimer); _tickTimer = null }
   }
 
   /**
    * 获取直播状态（成功接收即应用，不依赖外部再调一次 tick）。
    *
-   * ``generation``/``signal`` 由轮询方传入：取消之后**晚到的响应不得应用**。
-   * 判断放在 applyStatus **之前**（不是在里面补救）——旧实现只清 Promise 引用，
-   * 被取消的在途请求照样把旧快照写进页面。
-   *
-   * ``startedMonoMs`` 在**发请求之前**取（单调时钟）：它到应用时刻的本地耗时（含传输层
-   * 重试与退避）就是这份快照的年龄，用来把外推窗口折算成"剩余有效期"。用单调时钟而不是
-   * 日历时间，是为了让校时既不能把这段年龄抹掉、也不能把它虚增。
+   * `startedMonoMs` 在**发请求之前**取：它到应用时刻的本地耗时就是这份快照的年龄，
+   * 用来把服务端给的**剩余**预算折算成"页面还能外推多少"。
    */
-  async function fetchStatus(options: { signal?: AbortSignal;
-                                        generation?: number;
-                                        maxAttempts?: number } = {}) {
+  async function fetchStatus(options: {
+    signal?: AbortSignal; generation?: number; maxAttempts?: number
+  } = {}): Promise<SessionProjection | undefined> {
     const seq = ++_requestSeq
     const startedMonoMs = monoNowMs()
     const generation = options.generation ?? _pollGeneration
     try {
-      const res = await request.get<LiveStatus>('/api/live/status', undefined, {
+      const res = await request.get<SessionProjection>('/api/live/status', undefined, {
         signal: options.signal,
         maxAttempts: options.maxAttempts ?? STATUS_MAX_ATTEMPTS,
       })
       if (generation !== _pollGeneration) return undefined
       if (options.signal?.aborted) return undefined
-      applyStatus(res, seq, startedMonoMs)
+      const spentSec = Math.max(0, monoNowMs() - startedMonoMs) / 1000
+      // 传输耗时从**剩余**预算里扣掉：迟到的快照不能凭空换来一段新的外推时间。
+      if (res && typeof res.display_valid_seconds === 'number') {
+        // 先在本地折一次；applyStatus 里再按快照身份只授予一次。
+        applyStatus({
+          ...res,
+          display_valid_seconds: Math.max(0, Number(res.display_valid_seconds) - spentSec),
+        }, seq, generation)
+      } else {
+        applyStatus(res, seq, generation)
+      }
       return res
     } catch (error) {
+      if (generation !== _pollGeneration) return undefined
       console.error('获取直播状态失败:', error)
-      // 请求失败不等于停播：保留陈旧显示，绝不归零（离线时页面不应显示已停止）。
-      // 但要把"页面已失去新鲜快照"记下来，供短状态提示使用；服务器计时不受影响。
+      // 请求失败不等于停播：保留陈旧显示，绝不归零。但如实标记"已失去新鲜快照"，
+      // 并且**不**重新授予预算（预算只能由服务器给的新快照续）。
       statusStale.value = true
       return undefined
     }
   }
 
-  /**
-   * 轮询用的状态读：单飞 + 总尝试预算 + 可取消。
-   *
-   * - 单飞：同时只有一个在途请求，慢请求不会叠加；
-   * - 总预算：**下沉到传输层**（``maxAttempts``），一次轮询最多实际发出
-   *   STATUS_MAX_ATTEMPTS 次请求。旧实现外层限 3 次、内层 Axios 无限重放，
-   *   叠加后一次轮询真的发了 15 次；
-   * - 取消：stopStatusReads() 中止在途请求与退避等待，并让响应失去应用资格。
-   */
-  async function pollStatus(): Promise<LiveStatus | undefined> {
+  /** 轮询用的状态读：单飞 + 总预算 + 可取消。 */
+  async function pollStatus(): Promise<SessionProjection | undefined> {
     if (_pollInflight) return _pollInflight
     const generation = _pollGeneration
     const controller = new AbortController()
     _statusAbort = controller
     const run = fetchStatus({
-      signal: controller.signal,
-      generation,
-      maxAttempts: STATUS_MAX_ATTEMPTS,
+      signal: controller.signal, generation, maxAttempts: STATUS_MAX_ATTEMPTS,
     })
     _pollInflight = run
     try {
@@ -433,14 +417,19 @@ export const useLiveStore = defineStore('live', () => {
     }
   }
 
+  /** 唯一的"刷新状态"入口：控制回执之后也走这里，不套回执快照。 */
+  async function refreshStatus(): Promise<SessionProjection | undefined> {
+    return pollStatus()
+  }
+
   /**
-   * 取消状态读（页面离开 / 订阅取消）。
+   * 取消状态读（页面离开 / 登出 / 换账号）。
    *
-   * 三件事一起做：作废旧响应（generation）、中断在途请求与退避（abort）、
-   * 断开单飞引用（下一次订阅能立刻发起新读）。只做其中一件都会留下"取消后
-   * 页面仍被旧数据改写"或"重新进入后一直读到旧读的结果"。
+   * 三件事一起做：作废旧响应（generation）、中止在途请求与退避（abort）、
+   * 断开单飞引用（下一次订阅能立刻发起新读）。只做其中一件都会留下
+   * "取消后页面仍被旧数据改写"或"重新进入后一直读到旧读的结果"。
    */
-  function stopStatusReads() {
+  function stopStatusReads(): void {
     _pollGeneration += 1
     const controller = _statusAbort
     _statusAbort = null
@@ -450,344 +439,362 @@ export const useLiveStore = defineStore('live', () => {
     }
   }
 
-  /**
-   * 开播/恢复"已受理但未真正开始"期间的有限、可取消刷新。
-   *
-   * 旧实现只在 start 返回后 GET 一次，若那一刻仍在 starting，就要等默认 30 秒
-   * 轮询才看到真正的进度与目标时长。这里做有界（最多 20 次 × 1 秒）的短轮询，
-   * 一旦确认已经在播就交给常规轮询；停止会取消**此前**的观察，但不会取消之后
-   * 用户新发起的那一次。
-   */
-  function stopStartWatch() {
-    _startWatchToken += 1
-    startWatching.value = false
-    if (_startWatchTimer) { clearTimeout(_startWatchTimer); _startWatchTimer = null }
+  function startEventPolling(intervalMs = 30000): void {
+    if (_eventPollTimer) return
+    _eventPollTimer = setInterval(() => {
+      void pollStatus().catch(() => { /* silent */ })
+    }, intervalMs)
   }
 
-  function beginStartWatch() {
-    stopStartWatch()
-    startWatching.value = true
-    const token = ++_startWatchToken
+  function stopEventPolling(): void {
+    if (_eventPollTimer) { clearInterval(_eventPollTimer); _eventPollTimer = null }
+  }
+
+  // ==================== 有界收敛观察 ====================
+
+  let _settleTimer: ReturnType<typeof setTimeout> | null = null
+  let _settleToken = 0
+  const watching = ref(false)
+
+  function stopSettleWatch(): void {
+    _settleToken += 1
+    watching.value = false
+    if (_settleTimer) { clearTimeout(_settleTimer); _settleTimer = null }
+  }
+
+  /**
+   * 受理之后的有界观察：控制入口只回"已受理"，真实状态要靠读收敛。
+   *
+   * 判据全部来自投影（不是本地猜测），最多 20 次 × 1 秒；停止会取消**此前**的
+   * 观察，但不会取消之后用户新发起的那一次。
+   */
+  function beginSettleWatch(settled: () => boolean,
+                            maxTicks = SETTLE_WATCH_MAX_TICKS): void {
+    stopSettleWatch()
+    watching.value = true
+    const token = ++_settleToken
     let ticks = 0
-    const step = async () => {
-      if (token !== _startWatchToken) return
+    const stepOnce = async () => {
+      if (token !== _settleToken) return
       ticks += 1
       await pollStatus()
-      if (token !== _startWatchToken) return
-      if (status.value.is_streaming && !status.value.is_starting) {
-        stopStartWatch()
-        return
-      }
-      if (ticks >= START_WATCH_MAX_TICKS) {
-        stopStartWatch()
-        return
-      }
-      _startWatchTimer = setTimeout(step, START_WATCH_INTERVAL_MS)
+      if (token !== _settleToken) return
+      if (settled() || ticks >= maxTicks) { stopSettleWatch(); return }
+      _settleTimer = setTimeout(stepOnce, SETTLE_WATCH_INTERVAL_MS)
     }
-    _startWatchTimer = setTimeout(step, 300)
+    _settleTimer = setTimeout(stepOnce, 300)
   }
 
-  // 在途控制意图的取消器：
-  // 停止必须能中止尚在取票/重试中的 start / resume / run-next / 验证后恢复，
-  // 否则慢取票完成后请求会带着新代际票到达，被服务端当成用户新意图执行，
-  // 复活已经被取消的操作。
+  // ==================== 在途意图（Stop 取消的是"此前"的启动类操作） ====================
+
   const _intents = new Set<AbortController>()
 
-  function _newIntent() {
+  function _newIntent(): AbortController {
     const controller = new AbortController()
     _intents.add(controller)
     return controller
   }
 
-  /** 取消此前**所有**尚未完成的启动类意图（停止时调用）。 */
-  function cancelPendingIntents(reason = 'stop') {
+  function cancelPendingIntents(reason = 'stop'): void {
     for (const controller of Array.from(_intents)) {
-      try {
-        controller.abort(reason)
-      } catch { /* 已结束则忽略 */ }
+      try { controller.abort(reason) } catch { /* 已结束则忽略 */ }
     }
     _intents.clear()
   }
 
-  function isAbortError(error: unknown): boolean {
-    const candidate = error as { code?: string; name?: string } | null
-    return candidate?.code === 'ERR_CANCELED'
-      || candidate?.name === 'CanceledError'
-      || candidate?.name === 'AbortError'
+  /** 停止/放弃是**取消语义**：先撤掉此前尚未完成的启动类意图。 */
+  function _cancelStartIntents(reason: string): void {
+    cancelPendingIntents(reason)
+    stopSettleWatch()
   }
 
-  // 开始直播（zoneName 非空=手动模式；specifiedTask 携带确认时冻结的目标）
-  async function startLive(zoneName?: string, durationSeconds?: number,
-                           specifiedTask?: {
-                             taskId: number
-                             expectedRevision: number
-                             businessDate: string
-                             abandonSaved?: StartLiveRequest['abandon_saved']
-                           }) {
-    isStarting.value = true
-    const startAbort = _newIntent()
-    try {
-      const body: StartLiveRequest = specifiedTask
-        ? {
-            task_id: specifiedTask.taskId,
-            expected_revision: specifiedTask.expectedRevision,
-            business_date: specifiedTask.businessDate,
-            ...(specifiedTask.abandonSaved
-              ? { abandon_saved: specifiedTask.abandonSaved } : {}),
-          }
-        : zoneName
-          ? { zone_name: zoneName, duration_seconds: durationSeconds }
-          : {}
-      const res = await request.post<StartLiveResponse>('/api/live/start', body,
-        { signal: startAbort.signal })
-      if (res.success) {
-        // 受理即有界显示：先用冻结基线建乐观会话，再拉权威状态
-        // （顺序约束——pollStatus 的权威观察要能冻结乐观领先量）。
-        armOptimistic(res.accepted)
-        await pollStatus()
-        // "已受理"不等于"已开播"：启动有界短轮询，真正开播后立刻显示进度。
-        beginStartWatch()
-        return { success: true, message: res.message, needFaceVerify: false, qrData: '' }
-      }
-      // 受理失败：不存在任何乐观显示可保留（也从未 arm）。
-      return {
-        success: false,
-        message: res.message,
-        needFaceVerify: res.need_face_verification || false,
-        qrData: res.qr_data || '',
-        refusal: res.refusal || '',
-      }
-    } catch (error: unknown) {
-      if (isAbortError(error)) {
-        return { success: false, message: '已取消开播', needFaceVerify: false, qrData: '' }
-      }
-      const msg = error instanceof Error ? error.message : '开播失败'
-      return { success: false, message: msg, needFaceVerify: false, qrData: '' }
-    } finally {
-      _intents.delete(startAbort)
-      isStarting.value = false
+  // ==================== 操作冻结（确认之前取值，之后只复用） ====================
+
+  function accountContext(): AccountContext | null {
+    const account = projection.value?.account
+    if (!account || account.uid <= 0 || account.room_id <= 0) return null
+    // 只取 uid/room_id：把带 display_name 的展示对象整份回传会被 DTO 的
+    // extra='forbid' 拒绝。
+    return { uid: account.uid, room_id: account.room_id }
+  }
+
+  function freezeStart(body: Record<string, unknown>, label: string): FrozenOperation {
+    return freezeOperation(CONTROL_URLS.start, withAccount(body),
+                           accountGeneration.value, label)
+  }
+
+  function withAccount(body: Record<string, unknown>): Record<string, unknown> {
+    const context = accountContext()
+    return context ? { ...body, account_context: context } : { ...body }
+  }
+
+  /** 自动任务（服务端按当前业务日排序选取）。任务身份与推流来源**独立**。 */
+  function buildAutoTaskOp(pushSource: PushSource): FrozenOperation {
+    return freezeStart({ mode: 'task', push_source: pushSource }, '开始下一任务')
+  }
+
+  /**
+   * **指定任务**：`task_id / expected_revision / business_date` 必须来自
+   * **同一次任务列表快照**，并且在弹窗之前冻结好。
+   */
+  function buildNamedTaskOp(target: {
+    taskId: number; expectedRevision: number; businessDate: string
+  }, pushSource: PushSource): FrozenOperation {
+    const body: StartNamedTaskRequest = {
+      mode: 'task', task_id: target.taskId,
+      expected_revision: target.expectedRevision,
+      business_date: target.businessDate, push_source: pushSource,
+    }
+    return freezeStart({ ...body }, '指定任务开播')
+  }
+
+  /** 单次（界面称"手动模式"）。`targetSeconds === 0` = 不限时。 */
+  function buildSingleOp(payload: {
+    zoneName: string; durationSeconds: number; areaId?: number
+  }, pushSource: PushSource): FrozenOperation {
+    const body: StartSingleRequest = {
+      mode: 'single', zone_name: payload.zoneName,
+      target_seconds: Math.max(0, Math.floor(payload.durationSeconds)),
+      push_source: pushSource,
+    }
+    if (typeof payload.areaId === 'number') body.area_id = payload.areaId
+    return freezeStart({ ...body }, '单次开播')
+  }
+
+  /** 恢复原场：必须携带**用户看到的那一份** run_id 与 goal_revision。 */
+  function buildResumeOp(source: {
+    runId: string; goalRevision: number
+  }): FrozenOperation {
+    const body = withAccount({
+      run_id: source.runId, goal_revision: source.goalRevision,
+    })
+    return freezeOperation(CONTROL_URLS.resume, body, accountGeneration.value, '恢复直播')
+  }
+
+  /**
+   * 冻结当前投影里的"原场"上下文（`null` = 当前没有**已停止但保留**的场次）。
+   *
+   * 必须在**任何确认弹框之前**调用一次；弹框之后的确认只允许消费这份返回值，
+   * 不再回读投影（复核 R2）。
+   */
+  function freezeAbandonRef(p: SessionProjection | null): FrozenAbandonRef | null {
+    const run = p?.run
+    const goal = p?.goal
+    if (!run || !goal || p?.resumable !== true) return null
+    return {
+      runId: String(run.id),
+      goalRevision: Number(goal.revision),
+      selection: { ...(goal.selection ?? {}) },
+      zoneName: String(run.zone_name || ''),
+      businessDate: String(run.business_day || ''),
     }
   }
 
-  // 恢复进行中的任务（与 start 共用同一套在途意图管理）
-  async function resumeLive() {
-    isStarting.value = true
-    const abort = _newIntent()
-    try {
-      const res = await request.post<StartLiveResponse>('/api/live/resume',
-        undefined, { signal: abort.signal })
-      if (res.success) {
-        armOptimistic(res.accepted)
-        await pollStatus()
-        beginStartWatch()
-        return { success: true, message: res.message, needFaceVerify: false, qrData: '' }
-      }
-      return {
-        success: false,
-        message: res.message,
-        needFaceVerify: res.need_face_verification || false,
-        qrData: res.qr_data || '',
-      }
-    } catch (error: unknown) {
-      if (isAbortError(error)) {
-        return { success: false, message: '已取消恢复', needFaceVerify: false, qrData: '' }
-      }
-      const msg = error instanceof Error ? error.message : '恢复失败'
-      return { success: false, message: msg, needFaceVerify: false, qrData: '' }
-    } finally {
-      _intents.delete(abort)
-      isStarting.value = false
+  /**
+   * 放弃原场：**只**接受已经冻结的三件套。
+   *
+   * 参数是值而不是"去读 store"：调用方无法在确认之后"顺手"读一份更新的 Run/Goal
+   * 拼进这份已经给用户看过的载荷。
+   */
+  function buildAbandonOp(ref: FrozenAbandonRef,
+                          label = '放弃原场'): FrozenOperation {
+    const body: AbandonRequest = {
+      run_id: ref.runId, goal_revision: ref.goalRevision,
+      selection: { ...ref.selection },
     }
+    return freezeOperation(CONTROL_URLS.abandon, body, accountGeneration.value, label)
   }
 
-  // 执行下一个任务（同样受停止取消约束）
-  async function runNext() {
-    isStarting.value = true
-    const abort = _newIntent()
-    try {
-      const res = await request.post<StartLiveResponse & { task?: unknown }>(
-        '/api/live/run-next', undefined, { signal: abort.signal })
-      if (res?.success) {
-        armOptimistic(res.accepted)
-        await pollStatus()
-        beginStartWatch()
-      } else {
-        await pollStatus()
-      }
-      return res
-    } catch (error: unknown) {
-      if (isAbortError(error)) {
-        return { success: false, message: '已取消执行', }
-      }
-      const msg = error instanceof Error ? error.message : '执行任务失败'
-      return { success: false, message: msg }
-    } finally {
-      _intents.delete(abort)
-      isStarting.value = false
-    }
+  /**
+   * 放弃并一步新开：**一项**请求同时携带**冻结的**原场上下文与新选择。
+   * `startBody` 与 `ref` 都必须由调用方在确认框之前取好（见 §5.4）。
+   */
+  function buildRestartAfterAbandonOp(startBody: Record<string, unknown>,
+                                      ref: FrozenAbandonRef,
+                                      label = '放弃并重新开播'): FrozenOperation {
+    const body = withAccount({
+      ...startBody,
+      abandon: {
+        run_id: ref.runId, goal_revision: ref.goalRevision,
+        selection: { ...ref.selection },
+      },
+    })
+    return freezeOperation(CONTROL_URLS.restartAfterAbandon, body,
+                           accountGeneration.value, label)
   }
 
-  // 停止直播
-  async function stopLive() {
-    isStopping.value = true
-    // 用户明确的停止意图：中止**此前**所有尚未完成的启动类意图
-    // （开播/恢复/下一任务/验证后重试，含取票等待与传输重试）。
-    // 之后用户新发起的意图不受影响——它们会拿到新的控制器。
-    cancelPendingIntents('user-stop')
-    // 只取消**此前**的启动观察：之后用户新发起的开播会重新 beginStartWatch。
-    stopStartWatch()
-    // 停止撤除乐观显示：显示立即回到权威值（受理不冒充成功）。
-    clearOptimistic()
+  /**
+   * 人脸确认：**冻结**当刻的 goal_revision / uid / room_id。
+   * 弹窗打开时取一次，提交时不再读当前投影补齐。
+   */
+  function buildFaceConfirmOp(frozen: FaceConfirmRequest): FrozenOperation {
+    return freezeOperation(CONTROL_URLS.confirmFace, { ...frozen },
+                           accountGeneration.value, '人脸确认')
+  }
+
+  /** 停止：随时可达；不携带必需字段（可带冻结账号上下文）。 */
+  function buildStopOp(): FrozenOperation {
+    return freezeOperation(CONTROL_URLS.stop, withAccount({}),
+                           accountGeneration.value, '停止直播')
+  }
+
+  // ==================== 派发（唯一执行路径） ====================
+
+  /**
+   * 派发一次**已冻结**的操作。
+   *
+   * - 结果属于另一个账号代次 → 丢弃（不写新账号界面、不提示）；
+   * - 回执：只说明受理/待确认/拒绝，**不**在这一层宣告"已开播/已停止"；
+   * - 之后一律走 `refreshStatus()` 的单一 GET 路径（不把回执快照当状态）；
+   * - 无论回执还是传输未知，都**不**自动换新令牌再次 Start。
+   */
+  async function dispatch(frozen: FrozenOperation): Promise<DispatchResult> {
+    // 派发**之前**的账号代次门：确认框期间换了账号，这份为旧账号冻结的操作
+    // 连发都不发（"不得发向新账号"）。迟到的结果同样按代次丢弃。
+    if (frozen.accountGeneration !== accountGeneration.value) {
+      return { outcome: { kind: 'cancelled' }, notice: null, superseded: true }
+    }
+    const isStop = frozen.url === CONTROL_URLS.stop
+    if (isStop) { isStopping.value = true } else { isStarting.value = true }
+    const intent = _newIntent()
     try {
-      const res = await request.post<StopLiveResponse>('/api/live/stop')
-      if (res.success) {
-        // 后端返回的是“已接收”，清理在后台线程进行。这里不能立即清空状态，
-        // 否则面板会在推流仍在收尾时误报已停止并放行冲突操作；改由状态轮询收敛。
-        status.value.is_cancelling = true
-        await pollStatus()
+      const outcome = await sendControl(frozen, { signal: intent.signal })
+      if (frozen.accountGeneration !== accountGeneration.value) {
+        return { outcome, notice: null, superseded: true }
       }
-      return res
-    } catch (error: unknown) {
-      const msg = error instanceof Error ? error.message : '停止失败'
-      return { success: false, message: msg }
+      const notice = noticeForOperation(outcome, frozen)
+      await refreshStatus()
+      if (outcome.kind === 'receipt'
+          && (outcome.receipt.accepted || outcome.receipt.status === 'pending')) {
+        beginSettleWatch(() => (isStop ? settleStopped() : settleStarted()))
+      }
+      return { outcome, notice, superseded: false }
     } finally {
+      _intents.delete(intent)
+      isStarting.value = false
       isStopping.value = false
     }
   }
 
-  // 本地计时器：内部只有一个，用 ref 暴露存活状态（普通 let 不会被 setup
-  // store 的返回对象更新，外部判断会永远读到初始值）。
-  function startLocalTick(keepAnchor = false) {
-    if (tickTimer) { clearInterval(tickTimer); tickTimer = null }
-    if (!keepAnchor) {
-      // 从状态快照重建锚点（已确认值只增不减）。
-      // 注意这里读的是 `status.value`——很可能就是刚才授予过窗口的那份快照，
-      // 因此 armWindow 会直接返回：**重启计时器不会重新授予窗口**，已消耗的量
-      // 也保留着，页面不会因为重启而多涨一段。
-      const s = status.value as LiveStatus & {
-        pending_seconds?: number, pending_valid_seconds?: number,
-        pending_extrapolatable?: boolean,
-      }
-      const confirmed = Number(s.elapsed_seconds) || 0
-      _confirmedAtAnchor = Math.max(_confirmedAtAnchor, confirmed)
-      _sessionConfirmedMax = Math.max(_sessionConfirmedMax, _confirmedAtAnchor)
-      const pending = Number(s.pending_seconds ?? 0)
-      _pendingAtAnchor = Number.isFinite(pending) && pending > 0 ? pending : 0
-      armWindow(s)
-      _displayArmed = true
-      localElapsed.value = boundedDisplaySec(
-        _confirmedAtAnchor + _pendingAtAnchor + windowConsumedSec())
-      const dur = Number((status.value as any).duration_seconds ?? 0)
-      fixedTotal.value = Number.isFinite(dur) && dur > 0 ? dur : 0
-    }
-    tickActive.value = true
-    tickTimer = setInterval(() => {
-      if (status.value.is_streaming && !status.value.is_anomaly) {
-        refreshFromAnchor()
-      }
-    }, 1000)
+  function settleStarted(): boolean {
+    return live.value || waitingTasks.value
   }
 
-  function stopLocalTick(clearDisplay = true) {
-    if (tickTimer) { clearInterval(tickTimer); tickTimer = null }
-    tickActive.value = false
-    if (clearDisplay) {
-      localElapsed.value = 0
-      fixedTotal.value = 0
-      durationKnown.value = false
-      _confirmedAtAnchor = 0
-      _pendingAtAnchor = 0
-      _armedSnapshot = null
-      _windowArmed = false
-      _windowBudgetSec = 0
-      _windowStartMonoMs = 0
-      _displayArmed = false
+  function settleStopped(): boolean {
+    return idle.value
+  }
+
+  function noticeForOperation(outcome: ControlOutcome, frozen: FrozenOperation)
+    : DispatchResult['notice'] {
+    if (outcome.kind === 'cancelled') return null
+    if (outcome.kind === 'unknown') {
+      return { level: 'warning', message: outcome.message }
+    }
+    const receipt: ControlReceipt = outcome.receipt
+    const reason = receipt.reason || ''
+    switch (receipt.status) {
+      case 'accepted':
+        // 受理回执不弹提示：受理≠成功，真实结果由随后的状态收敛表达；
+        // 失败时状态自然退回原状（服务端事实为准），不再先报"已受理"。
+        return null
+      case 'pending':
+        return { level: 'info', message: `${frozen.label || '控制'}仍在处理中，结果待确认` }
+      case 'ignored':
+        return { level: 'warning',
+                 message: `该输入与当前事实无关，未改变任何状态${reason ? `（${reason}）` : ''}` }
+      case 'token_conflict':
+        return { level: 'error', message: '同一操作令牌已用于不同请求，请重新操作' }
+      case 'rejected':
+      default:
+        return { level: 'error',
+                 message: `未被受理${reason ? `：${reason}` : ''}` }
     }
   }
+
+  // ==================== 便捷操作 ====================
 
   /**
-   * 兼容旧调用：用**新鲜权威快照**校正显示锚点。
+   * 桌面默认推流来源：**本机 FFmpeg**。
    *
-   * 注意不能再用"|本地 - 服务端| > 2 就拉回"的判据：本地值本来就合法地领先于
-   * 已确认值（它包含有界外推的待确认区间），那样会把正在推进的显示按回已确认值。
-   * 只有服务端已确认值**超过了**本地已确认值时，才重建锚点向前校正。
+   * 推流方式只由设置页决定（`manual` → obs/自行推流，其余 → ffmpeg）；面板不另
+   * 设来源选择，因此这里不能硬编码 `obs`（那会让"立即开播"在没有 OBS 的机器上
+   * 按错误的来源开工）。调用方（页面）显式传入时以传入值为准。
    */
-  function syncFromServer() {
-    if (!status.value.is_streaming) return
-    const s = status.value as LiveStatus & {
-      pending_seconds?: number, pending_valid_seconds?: number,
-      pending_extrapolatable?: boolean,
-    }
-    const serverConfirmed = Number(s.elapsed_seconds || 0)
-    const dur = Number((status.value as any).duration_seconds ?? 0)
-    if (Number.isFinite(dur) && dur > 0) fixedTotal.value = dur
-    if (!Number.isFinite(serverConfirmed) || serverConfirmed <= 0) return
-    if (serverConfirmed > _confirmedAtAnchor
-        || serverConfirmed > _sessionConfirmedMax) {
-      const pending = Number(s.pending_seconds ?? 0)
-      _pendingAtAnchor = Number.isFinite(pending) && pending > 0 ? pending : 0
-      // 同一份快照再次同步：不重新授予窗口，也不清空已消耗的量。
-      armWindow(s)
-      _confirmedAtAnchor = Math.max(serverConfirmed, _sessionConfirmedMax)
-      _sessionConfirmedMax = _confirmedAtAnchor
-      _displayArmed = true
-      refreshFromAnchor()
-    }
+  async function startNextTask(pushSource: PushSource = 'ffmpeg') {
+    return dispatch(buildAutoTaskOp(pushSource))
   }
 
-  /**
-   * 异常时的短状态文案（复用页面已有位置，不新增术语/弹窗）。
-   * 正常直播返回空串，由页面显示原有的"直播进度"。
-   */
-  const timerHint = computed(() => {
-    const s = status.value
-    if (!s.is_streaming) return ''
-    if (statusStale.value) return '连接中'
-    if ((s as any).recovery_blocked || (s as any).phase === 'recovering') return '恢复中'
-    if ((s as any).takeover_pending === true) return '开播确认中'
-    const ts = String((s as any).timer_state || '')
-    if (ts === 'paused_closed') return '已暂停'
-    if (ts === 'paused_blocked') return '恢复中'
-    if (ts === 'paused_pusher') return '恢复中'
-    if (ts === 'paused_unknown') return '连接中'
-    return ''
-  })
+  async function startNamedTask(
+    target: { taskId: number; expectedRevision: number; businessDate: string },
+    pushSource: PushSource = 'ffmpeg') {
+    return dispatch(buildNamedTaskOp(target, pushSource))
+  }
+
+  async function startSingle(
+    payload: { zoneName: string; durationSeconds: number; areaId?: number },
+    pushSource: PushSource = 'ffmpeg') {
+    return dispatch(buildSingleOp(payload, pushSource))
+  }
+
+  async function resumeLive() {
+    const p = projection.value
+    if (!p?.run || !p.goal) {
+      return { outcome: { kind: 'cancelled' } as ControlOutcome,
+               notice: { level: 'error' as const, message: '当前没有可恢复的原场' },
+               superseded: false }
+    }
+    return dispatch(buildResumeOp({
+      runId: String(p.run.id), goalRevision: Number(p.goal.revision),
+    }))
+  }
+
+  async function abandonRun(ref: FrozenAbandonRef) {
+    return dispatch(buildAbandonOp(ref))
+  }
+
+  /** 放弃并重新开播：`startBody` 与 `ref` 都必须已经冻结（见 §5.4）。 */
+  async function restartAfterAbandon(startBody: Record<string, unknown>,
+                                     ref: FrozenAbandonRef) {
+    return dispatch(buildRestartAfterAbandonOp(startBody, ref))
+  }
+
+  async function stopLive() {
+    _cancelStartIntents('user-stop')
+    return dispatch(buildStopOp())
+  }
+
+  async function confirmFace(frozen: FaceConfirmRequest) {
+    return dispatch(buildFaceConfirmOp(frozen))
+  }
+
+  /** 登出/换账号时由 App 调用：停掉页面轮询与本地绘制。 */
+  function teardown(): void {
+    stopEventPolling()
+    stopStatusReads()
+    stopSettleWatch()
+    stopTick()
+  }
 
   return {
-    status,
-    isStarting,
-    isStopping,
-    localElapsed,
-    fixedTotal,
-    durationKnown,
-    sessionId,
-    // 计时器存活状态用 ref 暴露：外部据此判断是否已启动，不再依赖普通变量。
-    tickActive,
-    // 页面是否已失去新鲜快照（浏览器↔服务器失联）；只影响提示，不影响服务器计时。
-    statusStale,
-    timerHint,
-    applyStatus,
-    fetchStatus,
-    pollStatus,
-    stopStatusReads,
-    refreshFromAnchor,
-    serverBootId,
-    snapshotVersion,
-    startWatching,
-    beginStartWatch,
-    stopStartWatch,
-    startLive,
-    resumeLive,
-    runNext,
-    stopLive,
-    optimisticRunId,
-    armOptimistic,
-    clearOptimistic,
+    // 唯一投影与读取状态
+    projection, statusLoaded, statusStale, accountGeneration,
+    refreshStatus, pollStatus, fetchStatus, stopStatusReads,
+    startEventPolling, stopEventPolling, applyStatus,
+    // 在途标记与观察
+    isStarting, isStopping, watching, beginSettleWatch, stopSettleWatch,
     cancelPendingIntents,
-    startLocalTick,
-    stopLocalTick,
-    syncFromServer,
-    startEventPolling,
-    stopEventPolling,
+    // 派生事实（页面只读）
+    step, goalWanted, goalRevision, runId, taskId, zoneName, sessionMode,
+    pushSource, hasRun, durationKnown, targetSeconds, resumable,
+    resumeBlockedReason, face, backendEvents, account,
+    waitingTasks, running, live, closing, idle, timerHint, displayFrozen,
+    // 显示秒表（只画）
+    displaySeconds, confirmedSeconds, progressPercent, overtime,
+    // 操作
+    accountContext, buildAutoTaskOp, buildNamedTaskOp, buildSingleOp,
+    buildResumeOp, freezeAbandonRef, buildAbandonOp, buildRestartAfterAbandonOp,
+    buildFaceConfirmOp, buildStopOp,
+    dispatch, startNextTask, startNamedTask, startSingle, resumeLive,
+    abandonRun, restartAfterAbandon, stopLive, confirmFace, teardown,
   }
 })

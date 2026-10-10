@@ -39,6 +39,17 @@ function loadTs(file, overrides = {}) {
   const module = { exports: {} }
   const req = (name) => {
     if (Object.prototype.hasOwnProperty.call(overrides, name)) return overrides[name]
+    // 递归解析 `@/`（auth store 依赖 authWire / operationToken 等纯模块）：
+    // 这些模块不参与本套件的"撤保护"对照，直接装载同一份副本。
+    if (name.startsWith('@/')) {
+      // `@/` 相对的是 **src 根**，不是当前文件所在目录（stores/api/... 是错误路径）。
+      let dir = path.dirname(file)
+      while (dir !== path.dirname(dir) && path.basename(dir) !== 'src') {
+        dir = path.dirname(dir)
+      }
+      const srcRoot = path.basename(dir) === 'src' ? dir : sourceRoot
+      return loadTs(path.join(srcRoot, name.slice(2) + '.ts'), overrides)
+    }
     return require(name)
   }
   const fn = vm.runInThisContext(`(function(require,module,exports){${compiled}\n})`, {
@@ -55,10 +66,18 @@ function makeAuthWorld(authFile) {
   const cacheData = new Map()
   const boot = { generation: 0, invalidate() { this.generation += 1 } }
   const operationEvents = { handleContextSwitch() {} }
+  // 一次 status GET 可以被**挂起**：用来构造"发起于退出之前、解析于退出受理之后"
+  // 的迟到读取 —— 这正是意图代次门要挡的那种回包。
+  let holdArmed = false
+  let pendingStatus = null
   const transport = {
     get: async (url) => {
       assert.equal(url, '/api/auth/status')
       statusCalls += 1
+      if (holdArmed) {
+        holdArmed = false
+        await new Promise((resolve) => { pendingStatus = resolve })
+      }
       return {
         logged_in: true,
         user_info: { uid: 7, uname: 'LIVE', face: '', level: 1 },
@@ -84,15 +103,38 @@ function makeAuthWorld(authFile) {
     'element-plus': { ElMessage: { warning() {}, error() {}, success() {} } },
   })
   const auth = authModule.useAuthStore()
-  return { auth, statusCalls: () => statusCalls }
+  return {
+    auth,
+    statusCalls: () => statusCalls,
+    /** 挂起**下一次** status GET（调用一次只挂起一次）。 */
+    holdNextStatus() { holdArmed = true },
+    /** 放行当前挂起的那次 GET。 */
+    releaseStatus() {
+      const release = pendingStatus
+      pendingStatus = null
+      if (release) release()
+    },
+  }
 }
 
 async function runAuthScenario(authFile) {
   const world = makeAuthWorld(authFile)
-  await world.auth.checkLoginStatus()
-  await world.auth.logout()
-  const afterLogoutStatus = await world.auth.checkLoginStatus()
-  return { afterLogoutStatus, statusCalls: world.statusCalls() }
+  // 启动期的一次 status 读取（尚未登录）被挂起在途；退出在它解析之前受理。
+  // 这正是"启动读取 vs 受理退出"的真实交错。
+  world.holdNextStatus()
+  const lateRead = world.auth.checkLoginStatus()
+  for (let i = 0; i < 200 && world.statusCalls() < 1; i += 1) {
+    await new Promise((r) => setTimeout(r, 1))
+  }
+  assert.equal(world.statusCalls() >= 1, true, '迟到读取必须已在途')
+  await world.auth.logout()                    // 受理：撤销本地身份 + 前进代次
+  world.releaseStatus()
+  const lateResult = await lateRead
+  return {
+    lateResult,
+    afterLogoutStatus: world.auth.isLoggedIn,
+    statusCalls: world.statusCalls(),
+  }
 }
 
 function settingsFixture(overrides = {}) {
@@ -164,19 +206,24 @@ async function main() {
   const authFile = path.join(tempRoot, 'src', 'stores', 'auth.ts')
   const settingsFile = path.join(tempRoot, 'src', 'stores', 'settings.ts')
 
+  // 新退出语义（阶段 2）：退出**受理之后**才撤销本地身份。此后的一次重新读取
+  // 是合法的复核，但它**不得**把已受理的退出翻回去——写回前的意图代次门是那道
+  // 唯一的闸，撤掉它场景必须失败。
   const fixedAuth = await runAuthScenario(authFile)
   rows.push({
-    case: '修复后：退出意图期间不重读 auth/status',
+    case: '修复后：退出受理前的在途读取不得恢复登录',
     ...fixedAuth,
-    sensitive: fixedAuth.afterLogoutStatus === false && fixedAuth.statusCalls === 1,
+    sensitive: fixedAuth.afterLogoutStatus === false
+      && fixedAuth.lateResult === false,
   })
 
-  patchFile(authFile, '    if (_logoutIntent) return false\n', '')
+  patchFile(authFile,
+    '      if (intentSeq !== _authIntentSeq) return isLoggedIn.value\n', '')
   const oldAuth = await runAuthScenario(authFile)
   rows.push({
-    case: '旧行为：退出意图期间重新读取并恢复登录',
+    case: '旧行为：退出受理前的在途读取把账号装回去',
     ...oldAuth,
-    sensitive: oldAuth.afterLogoutStatus === true && oldAuth.statusCalls === 2,
+    sensitive: oldAuth.afterLogoutStatus === true,
   })
 
   // Restore a clean settings copy before testing the settings mutation.

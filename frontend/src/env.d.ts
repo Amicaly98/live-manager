@@ -22,8 +22,13 @@ declare global {
       isElectron: boolean
       onConfirmClose: (callback: () => void) => void
       onTrayQuit: (callback: () => void) => void
-      confirmQuit: (stopLive: boolean) => Promise<{ success: boolean }>
-      forceQuit: () => void
+      /** 优雅退出；失败时给出原因（页面据此显示失败/待核验并允许重试）。 */
+      confirmQuit: (stopLive: boolean) => Promise<{ success: boolean; reason?: string }>
+      /**
+       * 显式放弃等待后端确认并结束应用。**不是**已确认的安全退出：
+       * `reclaimed=false` 表示自有后端进程树也没能确认回收。
+       */
+      forceQuit: () => Promise<{ success: boolean; confirmed: boolean; reclaimed?: boolean }>
     }
   }
 }

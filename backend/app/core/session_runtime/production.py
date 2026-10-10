@@ -1482,8 +1482,15 @@ def _boundary_evidence(boundaries: BoundaryOverrides) -> Dict[str, Any]:
 
 # ==================== 默认组装入口 ====================
 
-def build_application_owner(*, data_dir: Path) -> ApplicationOwner:
-    """构造应用 owner。**只构造**，不启动账号实例、不接管数据。"""
+def build_application_owner(*, data_dir: Path,
+                            notifier_policy: Optional[Callable[[Any], None]] = None,
+                            ) -> ApplicationOwner:
+    """构造应用 owner。**只构造**，不启动账号实例、不接管数据。
+
+    ``notifier_policy`` 是**桌面适配点**（第 4 处接缝，默认 ``None``）：给定时在
+    ``EmailSender`` 预热**之前**调用一次，让装配方先声明本产品对通知器的要求。
+    默认 ``None`` 时本函数与服务端逐字一致——预热顺序、探测行为都不变。
+    """
     from app.api.settings import load_settings
     from .. import config as app_config
     from ..task_manager import TaskManager
@@ -1514,6 +1521,10 @@ def build_application_owner(*, data_dir: Path) -> ApplicationOwner:
     else:
         from ..email_sender import EmailSender
         email_sender = EmailSender()
+        # 桌面适配点（默认 None：服务端语义逐字不变）。策略必须在预热**之前**生效：
+        # 预热会触发一次后台探测，事后禁用只能拦住"下一次"，拦不住这一次的连接。
+        if notifier_policy is not None:
+            notifier_policy(email_sender)
         warmup = getattr(email_sender, 'warmup_host', None)
         if callable(warmup):
             warmup()

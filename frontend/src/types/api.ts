@@ -1,124 +1,77 @@
 /**
  * api.ts - API 请求/响应类型定义
  *
- * 与后端 app/models/schemas.py 对应，
+ * 与后端 app/models/schemas.py、app/models/control_dto.py 对应，
  * 统一管理前端所有 API 接口的入参出参类型。
+ *
+ * 桌面移植阶段 2：旧 `LiveStatus` 一族（`is_streaming` / `elapsed_seconds` /
+ * `pending_*` / `timer_state` …）已随旧控制器退役。运行事实的唯一形状是
+ * `SessionProjection`（见 `types/session.ts`），由 `GET /api/live/status` 返回。
  */
 
 // ==================== Auth 认证 ====================
 
+/**
+ * 已登录账号的**展示**资料（后端 `/api/auth/status` 只报内存里已核验的事实，
+ * 只带 uid/uname/room_id；face/level 是旧字段，仅用于向后兼容显示）。
+ */
 export interface UserInfo {
   uid: number
   uname: string
-  face: string
-  level: number
+  room_id?: number
+  face?: string
+  level?: number
 }
 
 export interface LoginStatusResponse {
   logged_in: boolean
   user_info?: UserInfo
+  /** 'memory' | 'cached' —— 只用于展示口径，不参与鉴权判断。 */
+  source?: string
 }
 
+/**
+ * `GET /api/auth/qrcode`。
+ *
+ * `generation` 是**扫码代次**：再次获取二维码会前进一代，旧代次的轮询回包
+ * 一律失效（`stale_generation`）。
+ */
 export interface QRCodeResponse {
-  qrcode_url: string
   qrcode_key: string
+  qr_url: string
+  generation: number
 }
 
+/**
+ * `POST /api/auth/poll/{key}` 与 `GET /api/auth/status` 的**归一化**结果
+ * （`api/authWire.ts` 是唯一转换点）。
+ *
+ * **不是**所有 `logged_in=false` 都等于"还没扫"：`status` 携带真实原因。
+ * 取值：`86101`（未扫）/`86090`（已扫待确认）/`86038`（已过期）/
+ * `stale_generation`（已被更新的二维码取代）/`candidate_rejected`（无法核验）/
+ * `no_session`/`poll_failed`/`rejected`/`installed`。
+ */
 export interface PollLoginResponse {
   logged_in: boolean
   user_info?: UserInfo
-  expired?: boolean
+  status?: string
   message?: string
 }
 
 export interface LogoutResponse {
   success: boolean
   message: string
+  operation_token?: string
+  projection?: Record<string, unknown> | null
 }
 
 // ==================== Live 直播 ====================
+//
+// 运行事实的唯一形状是 `SessionProjection`（`GET /api/live/status` 返回）。
+// 旧的 `LiveStatus` / `StartLiveResponse` / `AcceptedIntent` / `BackendEvent`
+// 已退役：后端不再有旧控制器，那些字段名在新链上根本不会出现。
 
-export interface LiveStatus {
-  is_streaming: boolean
-  /** Whether the saved session can be resumed by an explicit user action. */
-  resumable?: boolean
-  resume_blocked_reason?: string
-  is_starting?: boolean
-  is_cancelling?: boolean
-  recovery_blocked?: string
-  current_zone: string
-  /**
-   * **权威有效时长**：服务端已确认（平台连续回报在播）的累计秒数。
-   * 不含待确认区间；同一个字段不会有时代表已确认值、有时代表墙钟总时长。
-   */
-  elapsed_seconds: number
-  remaining_seconds: number
-  room_id: number
-  duration_seconds?: number
-  is_anomaly?: boolean
-  stream_mode?: string  // 'task' | 'manual' | ''
-  ffmpeg_active?: boolean
-  ffmpeg_current_video?: string
-  pending_face_verify?: boolean
-  face_verify_url?: string
-  /** 最近一次可信观察之后的待确认区间（秒）：只可**有界**外推显示。 */
-  pending_seconds?: number
-  /** 还能继续外推多久（秒）；0 表示页面必须冻结在已确认值上。 */
-  pending_valid_seconds?: number
-  /** 单段待确认区间上限（页面外推的硬边界）。 */
-  pending_limit_seconds?: number
-  /** 服务端是否允许对这段待确认区间做显示外推。 */
-  pending_extrapolatable?: boolean
-  /** 'running' | 'paused_closed' | 'paused_unknown' | 'paused_blocked' | 'paused_pusher' */
-  timer_state?: string
-  phase?: string
-  run_id?: string
-  session_version?: number
-  boot_id?: string
-  duration_known?: boolean
-  backend_events?: BackendEvent[]
-}
-
-export interface BackendEvent {
-  tag: string
-  type: 'success' | 'danger' | 'warning' | 'info'
-  message: string
-  time: string
-}
-
-export interface StartLiveResponse {
-  success: boolean
-  room_id?: number
-  message: string
-  need_face_verification?: boolean
-  qr_data?: string
-  /** 2026-09-28 收口：受理冻结基线（受理即有界显示；权威值仍以轮询为准）。 */
-  accepted?: AcceptedIntent
-  /** 受理拒绝原因码（失败可见，不静默）。 */
-  refusal?: string
-}
-
-/** 受理冻结基线：受理成功即刻返回，供前端"受理即有界显示"。 */
-export interface AcceptedIntent {
-  run_id?: string
-  task_id?: number | null
-  zone_name?: string
-  confirmed_elapsed_seconds: number
-  duration_seconds: number
-  duration_known: boolean
-  source?: string
-  accepted_epoch?: number
-}
-
-export interface StopLiveResponse {
-  success: boolean
-  message: string
-}
-
-export interface RunNextResponse {
-  success: boolean
-  message: string
-}
+export type { SessionProjection } from './session'
 
 // ==================== Tasks 任务 ====================
 
@@ -192,9 +145,11 @@ export interface TaskDetail extends TaskItem {
 /** 覆盖确认时冻结的目标：稳定身份 + 当时看到的版本与业务日。
  *
  * 只冻结 id 不够：同一条记录在用户确认之后可能已经被结算/编辑（后台任务或
- * 别的面板），旧载荷带着同一个 id 照写就会抹掉刚提交的完成进度。版本与业务日
- * 必须在**弹框之前**与 id 一起取，不能在发请求时现取——现取等于把用户确认的
- * 那份状态悄悄换成最新的。
+ * 别的页面），旧载荷带着同一个 id 照写就会抹掉刚提交的完成进度。版本与业务日
+ * 必须在**弹框之前**与 id 一起取，不能在发请求时现取
+ * ——现取等于把用户确认的那份状态悄悄换成最新的。
+ *
+ * 新流程改用 `CreationPreview` 的冻结件（见下）；本类型保留给兼容形状。
  */
 export interface OverwriteTarget {
   id: number
@@ -202,13 +157,145 @@ export interface OverwriteTarget {
   businessDate: string
 }
 
+/** `GET /api/tasks/creation-preview` 的一致预检。
+ *
+ * 行、版本、业务日与占用事实来自目标库**同一份读快照**；`uid` 是服务端此刻的
+ * 账号绑定，调用方必须核对它仍等于自己冻结的范围，否则不得据此弹框或提交。
+ */
+export interface CreationPreview {
+  uid: number | null
+  instance_key: string
+  zone_name: string
+  tasks_revision: number | null
+  business_day: string
+  existing_task: {
+    id: number
+    category: number
+    total_days: number
+    days_done: number
+    deadline_raw: string
+    last_done_date?: string | null
+  } | null
+  /** 任务**总体**未完成（`category > 0 且 days_done < total_days`）。
+   *  不是"今天是否需要执行"：今天已完成但总体 3/7 仍为 true，仍要确认。 */
+  existing_is_unfinished: boolean
+  is_currently_reserved: boolean
+  creation_allowed: boolean
+  reason: string
+}
+
+/** 弹框之前冻结的预检：提交时后端在同一事务里逐项复核。 */
+export interface FrozenCreationPreview {
+  task_id: number | null
+  revision: number | null
+  business_day: string
+  existing_is_unfinished: boolean
+}
+
+/** 创建结果（`POST /api/tasks`）。 */
+export interface CreateTaskResponse {
+  success: boolean
+  message: string
+  task_id: number | null
+  replaced_task_id: number | null
+  replayed: boolean
+  revision: number | null
+  /** 数据库提交与唤醒投递是**两件事实**；投递失败照样返回创建成功。 */
+  wakeup: { delivered: boolean; reason?: string; result?: string }
+}
+
+/** `GET /api/tasks/creation-receipt`：缺记录只表示尚未查到成功。 */
+export interface CreationReceiptResponse {
+  found: boolean
+  token: string
+  result?: {
+    task_id?: number
+    replaced_task_id?: number | null
+    zone_name?: string
+    revision?: number | null
+  }
+  /** 服务端**领取这次读取的那份绑定**的 UID（命中回执时返回）。 */
+  uid?: number | null
+}
+
+/** 分区历史里的终结口径（只认已经发生的事实）。 */
+export type TerminalCode =
+  | 'ongoing' | 'natural_complete' | 'manual_complete' | 'manual_all_done'
+  | 'moved_out' | 'replaced' | 'deleted' | 'unknown'
+
+export interface ZoneHistoryEvent {
+  id: number
+  task_id: number
+  event: string
+  at: string
+  zone_name: string
+  category_before: number | null
+  total_days_before: number | null
+  days_done_before: number | null
+  deadline_before: string | null
+  category_after: number | null
+  total_days_after: number | null
+  days_done_after: number | null
+  deadline_after: string | null
+  source: string
+  detail: string
+}
+
+export interface ZoneHistoryLedgerRow {
+  id: number
+  task_id: number
+  business_day: string
+  source: string
+  zone_name: string
+  target_seconds: number
+  effective_seconds: number
+  completed_at: string | null
+  committed_at: string
+  days_done_after: number
+  total_days_after: number
+}
+
+export interface ZoneHistoryGroup {
+  task_id: number
+  zone_name: string
+  is_current: boolean
+  params: {
+    category: number | null
+    total_days: number | null
+    days_done: number | null
+    deadline_raw: string | null
+  }
+  /** 'created' = 真实创建时刻；'baseline' = 现状收录；'unknown' = 未记录。 */
+  origin: { code: 'created' | 'baseline' | 'unknown'; at: string | null }
+  terminal: { code: TerminalCode; at: string | null; detail: string }
+  last_at: string | null
+  events: ZoneHistoryEvent[]
+  ledger: ZoneHistoryLedgerRow[]
+}
+
+export interface ZoneHistoryResponse {
+  zone_name: string
+  groups: ZoneHistoryGroup[]
+  total: number
+  offset: number
+  limit: number
+  has_more: boolean
+  /** 服务端**领取这次读取的那份绑定**的 UID：调用方据此核对来源未换账号。 */
+  uid?: number | null
+}
+
 export interface TaskCreate {
-  /** 覆盖（overwrite=true）时必填：被覆盖那一条记录的稳定身份。 */
+  /** 兼容形状：带 `overwrite=true` 时用 `id`/`expected_revision`/`business_date`
+   *  组装同一份预检。新流程用 `preview` + `confirm_replace`。 */
   id?: number
-  /** 覆盖请求的前置条件：确认时的 tasks_revision（界面渲染的那份快照）。 */
   expected_revision?: number
-  /** 覆盖请求的前置条件：确认时的业务日（YYYY-MM-DD）。 */
   business_date?: string
+  /** 弹框之前冻结的预检。 */
+  preview?: FrozenCreationPreview
+  /** 用户对"替换这一条未完成任务"的明确确认语义。 */
+  confirm_replace?: boolean
+  /** 客户端生成的一次性令牌；回包丢失后凭它取回原来那份已提交结果。 */
+  operation_token?: string
   zone_name: string
   category?: number
   total_days?: number
@@ -262,30 +349,13 @@ export interface ExportResult {
 }
 
 // ==================== StartLive 请求体 ====================
-
-export interface StartLiveRequest {
-  zone_name?: string
-  duration_seconds?: number  // 手动模式时长，0=不限时，上限86400
-  // ---- 2026-09-28 收口：指定任务开播（点哪条开哪条） ----
-  task_id?: number
-  /** 确认弹框前冻结的任务库版本。 */
-  expected_revision?: number
-  /** 确认弹框前冻结的业务日。 */
-  business_date?: string
-  /** 放弃旧进度的确认凭证（完整冻结身份）。 */
-  abandon_saved?: AbandonSavedClaim
-}
-
-/** 放弃旧存档进度的确认凭证（确认弹框时刻冻结的完整身份）。 */
-export interface AbandonSavedClaim {
-  old_run_id?: string
-  old_task_id?: number | null
-  old_zone_name?: string
-  old_execution_date?: string
-  old_elapsed_seconds?: number
-  confirm_id?: string
-  stop_epoch?: number
-}
+//
+// 请求体形状已全部迁到 `types/session.ts`
+// （`StartRequest` / `ResumeRequest` / `AbandonRequest` /
+// `RestartAfterAbandonRequest` / `FaceConfirmRequest` / `StopRequest`）。
+// 旧的 `StartLiveRequest`（zone_name/duration_seconds/task_id/
+// expected_revision/business_date/abandon_saved）已退役：`elapsed_seconds`、
+// `stop_epoch`、`abandon_saved` 等旧字段会被 DTO 的 `extra='forbid'` 直接 422。
 
 // ==================== Areas 分区 ====================
 
@@ -352,13 +422,20 @@ export interface AppSettings {
   email_notify_error: boolean
   email_notify_complete: boolean
   email_daily_summary: boolean
-  /** 默认关闭；可选接收一轮本地 FFmpeg 短断流通知 */
+  /** 默认关闭；只通知一轮本地 FFmpeg 重试，严重连续失败另发需处理通知 */
   email_notify_ffmpeg_retry: boolean
   email_face_verify_port: number
   // Server酱
   serverchan_sendkey: string
   // 服务器公网地址（域名或IP），留空自动检测
+  server_host: string
   duration_distribution: 'uniform' | 'normal' | 'beta'
   duration_multiplier_min: number
   duration_multiplier_max: number
+  // 旁路诊断（后端默认全部关闭；可选字段，旧版本后端不返回也不影响）
+  diagnostics_enabled?: boolean
+  diagnostics_media_progress?: boolean
+  diagnostics_host_sampling?: boolean
+  diagnostics_max_file_mb?: number
+  diagnostics_retain_days?: number
 }

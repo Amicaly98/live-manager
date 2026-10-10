@@ -25,10 +25,12 @@ import vm from 'node:vm'
 import assert from 'node:assert/strict'
 import { createRequire } from 'node:module'
 import { fileURLToPath } from 'node:url'
+import { makeAliasFallback } from './cjs-alias.mjs'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const root = path.resolve(here, '..')
 const req = createRequire(path.join(root, 'package.json'))
+const loadCjs = makeAliasFallback(req)
 const ts = req('typescript')
 const { createPinia, setActivePinia } = req('pinia')
 
@@ -142,7 +144,7 @@ function buildWorld() {
     if (name === '@/boot') return bootModule
     if (name === '@/stores/operationEvents') return opEventsModule
     if (name === 'element-plus') return { ElMessage: elStub }
-    return req(name)
+    return loadCjs(name)
   })
   const tasksModule = loadTsModule('src/stores/tasks.ts', (name) => {
     if (name === '@/stores/auth') return authModule
@@ -151,7 +153,7 @@ function buildWorld() {
     if (name === '@/boot') return bootModule
     if (name === '@/stores/operationEvents') return opEventsModule
     if (name === 'element-plus') return { ElMessage: elStub }
-    return req(name)
+    return loadCjs(name)
   })
 
   const auth = authModule.useAuthStore()

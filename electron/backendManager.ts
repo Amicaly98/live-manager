@@ -71,9 +71,17 @@ export class BackendLifecycle {
   getPid(): number | null { return this.current ? this.current.pid : null; }
   isQuitting(): boolean { return this.quitting; }
 
-  setQuitting(): void {
-    this.quitting = true;
-    this.cancelAutoRestart();
+  /**
+   * 标记/取消"正在退出"。
+   *
+   * `value=false` 只在**一次失败的退出尝试被放弃**时使用（阶段 2）：本地收尾
+   * 没有确认完成，应用仍要继续运行，因此必须解除退出态，否则后续退出动作会被
+   * 自己的上一次失败挡住，连重试都发不出去。取消退出态**不等于**"已回收"——
+   * 进程引用与状态原样保留。
+   */
+  setQuitting(value: boolean = true): void {
+    this.quitting = value;
+    if (value) this.cancelAutoRestart();
   }
 
   cancelAutoRestart(): void {

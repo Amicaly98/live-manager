@@ -49,10 +49,23 @@ const electronAPI = {
     ipcRenderer.removeAllListeners('tray-quit')
     ipcRenderer.on('tray-quit', () => callback())
   },
-  confirmQuit: (stopLive: boolean): Promise<{ success: boolean }> =>
+  /**
+   * 优雅退出。`stopLive=true` = "停止并退出"（请后端停播并核对关房）；
+   * `stopLive=false` = "不停止并退出"（不发平台 Stop，只回收自有资源）。
+   *
+   * 失败时**同时**给出原因：调用方据此显示"失败/待核验"并允许重试，
+   * 而不是把它当成"已安全退出"。
+   */
+  confirmQuit: (stopLive: boolean): Promise<{ success: boolean; reason?: string }> =>
     ipcRenderer.invoke('confirm-quit', stopLive),
-  forceQuit: (): void =>
-    ipcRenderer.send('force-quit'),
+  /**
+   * **显式**强制退出：只有在优雅退出已经失败、用户再次明确选择之后才调用。
+   *
+   * 它**不是**"安全退出"：后端可能仍在收尾，本应用只是不再等它。返回
+   * `confirmed=false` 表示连这次放弃等待都没能落实（调用方不得据此宣称已退出）。
+   */
+  forceQuit: (): Promise<{ success: boolean; confirmed: boolean; reclaimed?: boolean }> =>
+    ipcRenderer.invoke('force-quit'),
 };
 
 contextBridge.exposeInMainWorld('electronAPI', electronAPI);

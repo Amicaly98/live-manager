@@ -234,6 +234,28 @@ class EmailSender:
         except Exception as exc:            # 预热失败不得影响服务启动
             logger.debug('公网地址预热失败（不影响启动）：%s', exc)
 
+    def disable_cloud_host_probe(self, reason: str = '') -> None:
+        """**桌面装配用**：明确关掉云元数据探测（默认不调用 = 服务端语义不变）。
+
+        服务端跑在云服务器上，``100.100.100.200`` 的元数据端点是那台机器合法地
+        拿到自己公网地址的方式；桌面客户端跑在用户自己的电脑上，那个地址既不存在
+        也不该被访问——为一个**根本不会存在的**远程确认链接去连它，只是无谓的
+        外网试探。
+
+        这里**不**改变共享语义：探测仍然是"未禁用时的既有行为"，禁用只是让
+        :meth:`_schedule_host_probe` 立刻返回；没有可用地址时 :meth:`_get_server_host`
+        照旧走"配置 → 环境变量 → 缓存 → 不可用"，确认链接也照旧按
+        ``host_usable`` 判断（不可用就只在正文里写"请在面板确认"，不拼 localhost
+        假链接）。
+
+        ``_host_probe_started = True`` 的语义是"已经判过、不需要再探"，不是
+        "已经探到"。禁用原因只用于日志（本方法内不打日志的调用方可见），不依赖
+        ``_host_resolution_error``——那是"最近一次地址解析"的结论字段，
+        :meth:`_get_server_host` 每次都会重写它，拿它当禁用标记会被冲掉。
+        """
+        self._host_probe_started = True
+        self._host_resolution_error = reason or 'cloud_probe_disabled'
+
     def _schedule_host_probe(self) -> None:
         if self._host_probe_started or self._closing.is_set():
             return

@@ -1,7 +1,16 @@
 /**
- * Desktop 1.1.1 status UX contracts. These tests exercise the real TypeScript
- * store/helper with controlled boundaries and guard the Dashboard wiring that
- * keeps recovery progress and cached operation logs visible during slow reads.
+ * Desktop 1.1.1 status UX contracts（桌面移植阶段 2 迁移到新投影）。
+ *
+ * 这些测试用真实 TypeScript store/helper + 受控边界，守护控制台接线：
+ * 恢复进度与缓存的操作日志在慢读取期间保持可见、不被误清零。
+ *
+ * 与旧版的差别：
+ *  - `dashboardResume.ts` 已删除：恢复事实的唯一来源是 `liveStore.projection`
+ *    （`resumable` / `resume_blocked_reason` / `confirmed_seconds`），不再有第二份
+ *    页面级快照；
+ *  - `pending_*` 显示窗口已由 `types/session.ts` 的
+ *    `display_seconds / display_advancing / display_valid_seconds` 取代，
+ *    对应守卫见 `display-projection.test.mjs`。
  */
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
@@ -9,10 +18,12 @@ import path from 'node:path'
 import vm from 'node:vm'
 import { createRequire } from 'node:module'
 import { fileURLToPath } from 'node:url'
+import { makeAliasFallback } from './cjs-alias.mjs'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const root = path.resolve(here, '..')
 const req = createRequire(path.join(root, 'package.json'))
+const loadCjs = makeAliasFallback(req)
 const ts = req('typescript')
 const failures = []
 
@@ -42,88 +53,96 @@ function loadTs(relFile, customRequire = req) {
   return module.exports
 }
 
-await test('server resume snapshot restores saved progress and gates task start', () => {
-  const resume = loadTs('src/composables/dashboardResume.ts')
-  const previous = resume.emptyDashboardResumeState()
-  const restored = resume.applyDashboardResumeStatus(previous, {
-    is_streaming: false,
-    source_mode: 'manual',
-    resumable: true,
-    current_zone: '手动分区',
-    elapsed_seconds: 777,
-    duration_seconds: 1800,
-    room_id: 12345,
-  })
+/** 一份最小投影（与后端 projection.build_projection 对齐）。 */
+function projection({ run = 'run-1', confirmed = 777, target = 1800,
+                      resumable = false, blockedReason = '',
+                      step = 'live', source = 'confirmed' } = {}) {
+  return {
+    has_active: true, has_run: true, resumable, resume_blocked_reason: blockedReason,
+    step, goal: { revision: 3, wanted: resumable ? 'stopped' : 'running',
+      mode: 'task', selection: {}, start_kind: resumable ? 'resume' : 'new',
+      stop_reason: null },
+    run: { id: run, uid: 92003, room_id: 55003, area_id: 1, zone_name: '手动分区',
+      mode: 'task', task_id: 7, business_day: '2026-10-10',
+      target_seconds: target, push_source: 'ffmpeg',
+      clock: { checkpoint_seconds: confirmed, interval_start_mono: null,
+               interval_start_wall: null, projecting: false,
+               display_anchor_mono: null },
+      end: null },
+    current_zone: '手动分区', run_id: run, task_id: 7,
+    business_day: '2026-10-10', mode: 'task', push_source: 'ffmpeg',
+    target_seconds: target, confirmed_seconds: confirmed,
+    display_seconds: confirmed, display_advancing: source === 'confirmed',
+    display_valid_seconds: source === 'confirmed' ? 10 : 0, display_source: source,
+    duration_known: target > 0, room_id: 55003, end: null, wait_reason: '',
+    account: { uid: 92003, room_id: 55003, display_name: '测试' },
+    boot_id: 'boot', backend_events: [], face: null,
+  }
+}
 
-  assert.equal(restored.resume_status_fresh, true)
-  assert.equal(restored.has_active, true)
-  assert.equal(restored.current_zone, '手动分区')
-  assert.equal(restored.elapsed_seconds, 777, '恢复卡片必须保留服务端已确认时长')
-  assert.equal(resume.canResumeDashboardTask(restored), true)
-  assert.equal(resume.canStartDashboardTask(restored), false)
+await test('服务端恢复快照保留已确认进度并挡住新任务开播', () => {
+  const { createPinia, setActivePinia } = req('pinia')
+  setActivePinia(createPinia())
+  const transport = { get: async () => ({}), post: async () => ({}) }
+  // 传输边界与事件摄取换成替身：`@/api/request` 必须在**递归**装载
+  // （live.ts → liveControl.ts → request.ts）时同样生效，因此放进别名兜底的
+  // extra 表，而不是只在顶层 require 上拦截。
+  const liveModule = loadTs('src/stores/live.ts', makeAliasFallback(req, {
+    '@/api/request': () => ({ useRequest: () => transport }),
+    '@/stores/operationEvents': () => ({ operationEvents: { ingestFromStatus() {} } }),
+  }))
+  const live = liveModule.useLiveStore()
+  live.applyStatus(projection({ resumable: true, step: 'idle', confirmed: 777 }))
+
+  assert.equal(live.resumable, true, '可恢复事实只来自投影')
+  assert.equal(live.zoneName, '手动分区')
+  assert.equal(live.confirmedSeconds, 777, '恢复卡片必须保留服务端已确认时长')
+  assert.equal(live.targetSeconds, 1800)
+  live.teardown()
 })
 
-await test('未知或断流状态不抹除已保存进度，也不开放恢复或任务开播', () => {
-  const resume = loadTs('src/composables/dashboardResume.ts')
-  const previous = {
-    ...resume.emptyDashboardResumeState(),
-    has_active: true,
-    resume_status_fresh: true,
-    current_zone: '待恢复分区',
-    elapsed_seconds: 901,
-    duration_seconds: 2400,
-    room_id: 45,
-  }
-  const stale = resume.applyDashboardResumeStatus(previous, undefined)
-  assert.equal(stale.resume_status_fresh, false)
-  assert.equal(stale.elapsed_seconds, 901, '旧快照保留显示，网络未知不能把进度归零')
-  assert.equal(resume.canResumeDashboardTask(stale), false)
-  assert.equal(resume.canStartDashboardTask(stale), false)
-
-  const blocked = resume.applyDashboardResumeStatus(stale, {
-    is_streaming: false,
-    resumable: false,
-    resume_blocked_reason: '恢复状态的目标时长未知',
-    current_zone: '待恢复分区',
-    elapsed_seconds: 901,
-    duration_seconds: 0,
-    room_id: 45,
-  })
-  assert.equal(blocked.resume_status_fresh, true)
-  assert.equal(blocked.has_active, false)
-  assert.equal(blocked.resume_blocked_reason, '恢复状态的目标时长未知')
-  assert.equal(blocked.elapsed_seconds, 901)
-  assert.equal(resume.canResumeDashboardTask(blocked), false)
-  assert.equal(resume.canStartDashboardTask(blocked), true)
+await test('读失败与被拒原因不抹除已确认进度，也不开放恢复或开播', () => {
+  const { createPinia, setActivePinia } = req('pinia')
+  setActivePinia(createPinia())
+  const transport = { get: async () => ({}), post: async () => ({}) }
+  // 传输边界与事件摄取换成替身：`@/api/request` 必须在**递归**装载
+  // （live.ts → liveControl.ts → request.ts）时同样生效，因此放进别名兜底的
+  // extra 表，而不是只在顶层 require 上拦截。
+  const liveModule = loadTs('src/stores/live.ts', makeAliasFallback(req, {
+    '@/api/request': () => ({ useRequest: () => transport }),
+    '@/stores/operationEvents': () => ({ operationEvents: { ingestFromStatus() {} } }),
+  }))
+  const live = liveModule.useLiveStore()
+  // 服务端明确"不可恢复"时保留事实与原因，不虚构可恢复状态。
+  live.applyStatus(projection({ resumable: false, blockedReason: '目标时长未知',
+                                step: 'idle' }))
+  assert.equal(live.resumable, false)
+  assert.equal(live.resumeBlockedReason, '目标时长未知')
+  assert.equal(live.confirmedSeconds, 777, '被拒原因不抹掉已确认进度')
+  live.teardown()
 })
 
 await test('平台推流恢复阶段显示短状态，不按正常计时状态呈现', () => {
   const { createPinia, setActivePinia } = req('pinia')
   setActivePinia(createPinia())
   const transport = { get: async () => ({}), post: async () => ({}) }
-  const operationEvents = { ingestFromStatus() {} }
-  const liveModule = loadTs('src/stores/live.ts', (name) => {
-    if (name === '@/api/request') return { useRequest: () => transport }
-    if (name === '@/stores/operationEvents') return { operationEvents }
-    return req(name)
-  })
+  // 传输边界与事件摄取换成替身：`@/api/request` 必须在**递归**装载
+  // （live.ts → liveControl.ts → request.ts）时同样生效，因此放进别名兜底的
+  // extra 表，而不是只在顶层 require 上拦截。
+  const liveModule = loadTs('src/stores/live.ts', makeAliasFallback(req, {
+    '@/api/request': () => ({ useRequest: () => transport }),
+    '@/stores/operationEvents': () => ({ operationEvents: { ingestFromStatus() {} } }),
+  }))
   const live = liveModule.useLiveStore()
-  live.applyStatus({
-    is_streaming: true,
-    current_zone: '分区',
-    elapsed_seconds: 600,
-    remaining_seconds: 1200,
-    room_id: 1,
-    duration_seconds: 1800,
-    duration_known: true,
-    run_id: 'run-1',
-    pending_seconds: 0,
-    pending_valid_seconds: 0,
-    pending_extrapolatable: false,
-    timer_state: 'paused_pusher',
-  })
-  assert.equal(live.timerHint, '恢复中')
-  live.stopLocalTick()
+  // 乐观阶段（Start 已派出、待首次确认）：有已确认进度 → "恢复中"，全新场 → "开播确认中"。
+  live.applyStatus(projection({ step: 'resume_query', confirmed: 600,
+                                source: 'optimistic', target: 1800 }))
+  assert.equal(live.timerHint, '恢复中',
+    '有已确认进度的乐观窗口必须显示"恢复中"')
+  live.applyStatus(projection({ step: 'resume_query', confirmed: 0,
+                                source: 'optimistic', target: 1800 }))
+  assert.equal(live.timerHint, '开播确认中')
+  live.teardown()
 })
 
 await test('标记完成后立即读取新任务顺序并更新下一任务', async () => {
@@ -145,7 +164,7 @@ await test('标记完成后立即读取新任务顺序并更新下一任务', as
         ? [taskRow(2, '下一分区', true), taskRow(1, '已完成分区', false)]
         : [taskRow(1, '已完成分区', true), taskRow(2, '下一分区', true)]
       return {
-        tasks, revision: completed ? 2 : 1, business_date: '2026-09-25',
+        tasks, revision: completed ? 2 : 1, business_date: '2026-10-10',
         total: 2, pending_total: 2, completed: completed ? 1 : 0,
         today_done: completed ? 1 : 0, today_pending: completed ? 1 : 2,
         remaining_time: 0, avg_remaining: 0, urgency: 0,
@@ -163,14 +182,14 @@ await test('标记完成后立即读取新任务顺序并更新下一任务', as
     postForm: async () => ({}),
   }
   const cache = { get: () => undefined, set() {}, remove() {} }
-  const auth = { isLoggedIn: true }
+  const auth = { isLoggedIn: true, userInfo: { uid: 92003 } }
   const tasksModule = loadTs('src/stores/tasks.ts', (name) => {
     if (name === '@/api/request') return { useRequest: () => transport }
     if (name === '@/stores/auth') return { useAuthStore: () => auth }
     if (name === '@/composables/useCache') return { __esModule: true, default: cache }
     if (name === '@/stores/operationEvents') return { operationEvents: { addLocal() {} } }
     if (name === 'element-plus') return { ElMessage: { warning() {}, error() {}, success() {} } }
-    return req(name)
+    return loadCjs(name)
   })
   const tasks = tasksModule.useTaskStore()
   await tasks.fetchTasks()
@@ -184,17 +203,19 @@ await test('标记完成后立即读取新任务顺序并更新下一任务', as
 
 await test('Dashboard consumes resumable status and loads cached logs before awaiting reads', () => {
   const dashboard = fs.readFileSync(path.join(root, 'src/views/Dashboard.vue'), 'utf8')
-  const apiTypes = fs.readFileSync(path.join(root, 'src/types/api.ts'), 'utf8')
-  assert.match(apiTypes, /resumable\?: boolean/)
-  assert.match(apiTypes, /resume_blocked_reason\?: string/)
-  assert.match(dashboard, /applyDashboardResumeStatus\(activeTaskState\.value, status\)/)
-  assert.doesNotMatch(dashboard, /\/api\/live\/state\/full/)
+  const sessionTypes = fs.readFileSync(path.join(root, 'src/types/session.ts'), 'utf8')
+  // 恢复事实只来自投影：页面不再持有第二份恢复快照。
+  assert.match(sessionTypes, /resumable: boolean/)
+  assert.match(sessionTypes, /resume_blocked_reason: string/)
+  assert.match(dashboard, /liveStore\.resumable/)
+  assert.match(dashboard, /liveStore\.resumeBlockedReason/)
+  assert.match(dashboard, /liveStore\.confirmedSeconds/)
+  // 已退役入口不得再被调用（页面层完全没有这些字符串）。
+  assert.doesNotMatch(dashboard, /\/api\/live\/(state\/update|clear-state|switch-area|state\/reload)/)
   const mounted = dashboard.match(/onMounted\(async \(\) => \{([\s\S]*?)\n\}\)/)?.[1]
   assert.ok(mounted, 'Dashboard mount hook must be present')
-  assert.ok(mounted.indexOf('loadCrossEvents()') < mounted.indexOf('await fetchStatus()'),
+  assert.ok(mounted.indexOf('operationEvents.ensureLoaded()') < mounted.indexOf('await liveStore.refreshStatus()'),
     'cached events must render before any network read is awaited')
-  assert.match(dashboard, /canResumeDashboardTask\(activeTaskState\)/)
-  assert.match(dashboard, /canStartDashboardTask\(activeTaskState\)/)
 })
 
 await test('FFmpeg 短断流邮件选项默认关闭、读取旧设置仍关闭且可在界面切换', async () => {
@@ -207,7 +228,7 @@ await test('FFmpeg 短断流邮件选项默认关闭、读取旧设置仍关闭�
   }
   const settingsModule = loadTs('src/stores/settings.ts', (name) => {
     if (name === '@/api/request') return { useRequest: () => transport }
-    return req(name)
+    return loadCjs(name)
   })
   const settings = settingsModule.useSettingsStore()
   assert.equal(settings.settings.email_notify_ffmpeg_retry, false)

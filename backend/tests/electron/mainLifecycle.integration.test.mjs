@@ -295,7 +295,10 @@ test('E2/D2: failed owner reclaim keeps the app open and permits a bounded retry
   assert.equal(first.prevented, true);
   assert.equal(harness.calls.quit, 0, 'failed kill must not abandon the owned process');
   assert.equal(harness.lifecycle.owned, true);
-  assert.equal(harness.calls.dialogs.length, 1, 'failed cleanup gives a short retry prompt');
+  // 阶段 2 契约：失败 UI 由**页面横幅**承担（保留 + 重试），原生模态会阻塞
+  // confirm-quit 的 IPC 回包、让横幅永远渲染不出来，因此这里必须是 0。
+  assert.equal(harness.calls.dialogs.length, 0,
+    'failed cleanup leaves the failure UI to the page banner (no native modal)');
 
   const retry = { prevented: false, preventDefault() { this.prevented = true; } };
   harness.app.emit('before-quit', retry);

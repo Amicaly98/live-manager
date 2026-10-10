@@ -10,7 +10,9 @@ const defaultSettings: AppSettings = {
   scan_interval_seconds: 30,
   max_reconnect: 3,
   live_retry_cooldown_minutes: 60,
-  stream_mode: 'manual',
+  // 与后端 AppSettings 同一默认：首次/缺字段 = 本机 FFmpeg 推流（manual 才是
+  // 自行推流/OBS）。页面推流来源只由这一项决定，不再另设来源选择。
+  stream_mode: 'ffmpeg',
   auto_open_video: true,
   ffmpeg_path: 'ffmpeg',
   ffmpeg_reencode: true,
@@ -32,6 +34,9 @@ const defaultSettings: AppSettings = {
   email_face_verify_port: 19080,
   // Server酱
   serverchan_sendkey: '',
+  // 面板/邮件链接里的服务器公网地址（域名或IP），留空自动检测。
+  // 桌面没有公网部署：留空即"没有可用远程地址"，不把 127.0.0.1 链接当远程能力。
+  server_host: '',
   duration_distribution: 'beta',
   duration_multiplier_min: 1.05,
   duration_multiplier_max: 1.25,

@@ -85,6 +85,14 @@ def main():
     # 模块级常量（实例入口标识等展示口径读它），导入后再设就晚了。
     os.environ["API_PORT"] = str(args.port)
     os.environ["API_HOST"] = str(args.host)
+    # 桌面实例标识：通知署名在"账号显示名尚未取得"时的回落值。
+    #
+    # 共享实现的回落顺序是 INSTANCE_LABEL → `instance-<API_PORT>` → 数据目录名；
+    # 服务器版多实例共用一个收件箱，靠端口区分是它真实需要的能力。桌面同一系统
+    # 用户只运行一份客户端，用端口署名既没有区分度，还会把本机后端端口写进邮件
+    # 主题（桌面 1.1.1 的既有守卫：模板不暴露实例端口）。这里在装配期给它一个
+    # 稳定的中性标识，服务端语义一点未改。
+    os.environ.setdefault("INSTANCE_LABEL", "desktop")
 
     # 数据目录必须先于业务模块导入初始化。
     from app.core.config import (
@@ -133,6 +141,16 @@ def main():
     # 将 frontend_dir 存入环境变量，供 main.py 使用。
     if args.frontend_dir:
         os.environ["FRONTEND_DIR"] = os.path.abspath(args.frontend_dir)
+
+    # 隔离验收接缝（与 BILIBILI_SKIP_MIGRATION 同类的环境开关，默认缺省 = 真实
+    # B 站端点，行为逐字节不变）。验收用本地回环平台桩替代外部平台时在这里注入；
+    # `configure_boundaries` 的既有校验强制 endpoint_base 必须是 loopback ——
+    # 因此这个接缝**不可能**把桌面重定向到远程主机，只用于本机隔离验收。
+    # 必须在导入 app.main 之前调用：owner 构造会冻结边界。
+    endpoint_base = os.environ.get("BILIBILI_ENDPOINT_BASE", "")
+    if endpoint_base:
+        from app.core.session_runtime import production as _production
+        _production.configure_boundaries(endpoint_base=endpoint_base)
 
     import uvicorn
 

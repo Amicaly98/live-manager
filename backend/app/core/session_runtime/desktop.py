@@ -18,6 +18,12 @@
    :func:`prepare_account_target` 的说明。
 3. **设置页是视频目录/FFmpeg 路径的权威**。桌面用 Electron 目录选择器写的
    ``settings.json:video_path`` 必须真正进入选片与进程创建，而不是只让诊断接口读到。
+4. **通知器装配：不探测云元数据**（``desktop_notifier_policy``）。共享的
+   ``EmailSender`` 会为了拼"远程确认链接"在后台探测云厂商的元数据地址
+   （``100.100.100.200``）——那是**服务器**拿到自己公网地址的合法途径，桌面客户端
+   跑在用户电脑上，既没有那个服务、也不该为一条根本不存在的远程链接去连它。
+   桌面在装配时明确禁用这一次探测；没有用户配置的可用地址时，邮件正文照旧写
+   "请在面板确认"，不拼 localhost 假链接。服务端语义一点未改（默认不禁用）。
 
 这里**不新增**第二套业务规则：迁移、归属、锁、关闭预算、账本全部复用共享实现，
 本模块只做"调用哪一段既有能力"和"怎么解释桌面旧文件"。
@@ -324,13 +330,41 @@ def current_takeover_facts() -> Dict[str, Any]:
     return dict(LAST_TAKEOVER)
 
 
+# ==================== 通知器装配（第 4 处桌面适配点） ====================
+
+def desktop_notifier_policy(sender: Any) -> None:
+    """桌面通知器的**唯一**装配动作：关掉云元数据探测。
+
+    为什么必须在装配期（而不是发邮件时）做：探测由 ``warmup_host()`` 在启动时
+    触发一次，等第一封邮件再判断已经晚了——那一次连接早就在后台发出去了。
+
+    为什么不是改共享实现：服务端跑在云主机上，那条探测是它拿到公网地址的**既有
+    且合法**的途径。把判断放在装配侧，两边各按自己的部署事实说话，共享文件里只
+    多了一个"默认不调用"的开关（见
+    :meth:`~app.core.email_sender.EmailSender.disable_cloud_host_probe`）。
+
+    关掉探测**不等于**获得远程能力：桌面没有公网地址时，确认链接仍然不可用，
+    正文照旧写"请在面板确认"（``host_usable`` 判据在共享实现里，未改动）。
+    用户若确实配置了可用地址（``server_host``），共享实现会照常使用它——那才是
+    "按实际能力处理"。
+    """
+    disable = getattr(sender, 'disable_cloud_host_probe', None)
+    if callable(disable):
+        disable('desktop_product')
+        logger.info('桌面通知装配：已禁用云元数据探测（确认链接按配置/localhost 之外'
+                    '的既有判据处理）')
+    else:
+        logger.warning('桌面通知装配：通知器不支持禁用探测，沿用其默认行为')
+
+
 # ==================== 默认 owner（桌面策略） ====================
 
 def build_desktop_owner(*, data_dir: Path):
     """构造桌面默认 owner：共享组装 + 桌面策略，不另写一条运行链。"""
     from .production import build_application_owner
 
-    owner = build_application_owner(data_dir=data_dir)
+    owner = build_application_owner(data_dir=data_dir,
+                                    notifier_policy=desktop_notifier_policy)
     #: 桌面产品语义：重启只提示恢复，不自动开播（见模块头）。
     owner.manual_resume_only = True
     #: 首次领取账号目录前先做旧资料接管（见 prepare_account_target）。

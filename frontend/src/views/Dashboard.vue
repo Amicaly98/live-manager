@@ -15,85 +15,89 @@
               <template #header>
                 <div class="card-header">
                   <span>直播状态</span>
-                  <el-tag :type="liveStore.status.is_streaming ? 'success' : 'info'" size="small">
-                    {{ liveStore.status.is_starting ? '后台处理中' : liveStore.status.recovery_blocked ? '恢复已暂停' : liveStore.status.is_streaming ? '直播中' : '已停止' }}
-                  </el-tag>
+                  <el-tag :type="statusTagType" size="small">{{ statusLabel }}</el-tag>
                 </div>
               </template>
 
               <el-alert
-                v-if="liveStore.status.recovery_blocked"
-                :title="'自动恢复暂停：' + liveStore.status.recovery_blocked"
+                v-if="!liveStore.statusLoaded"
+                title="正在读取服务端状态…"
+                type="info" :closable="false" style="margin-bottom:12px"
+              />
+              <el-alert
+                v-else-if="liveStore.statusStale"
+                title="与服务端连接已中断：显示停留在最后一次可信状态"
+                type="warning" :closable="false" style="margin-bottom:12px"
+              />
+              <el-alert
+                v-else-if="blockedReason"
+                :title="blockedReason"
                 type="error" :closable="false" style="margin-bottom:12px"
               />
-              <div v-if="liveStore.status.is_starting" class="idle-info">
-                <el-alert
-                  :title="liveStore.status.is_cancelling ? '正在停止直播并清理' : '正在后台开播，网络中断时会持续重试'"
-                  description="可以关闭应用，后台会继续处理。"
-                  type="info" :closable="false" style="margin-bottom:12px"
-                />
-                <el-button type="danger" :loading="liveStore.isStopping"
-                  :disabled="liveStore.status.is_cancelling" @click="handleStopLive">
-                  取消开播
-                </el-button>
-              </div>
-              <!-- 直播中 -->
-              <div v-else-if="liveStore.status.is_streaming" class="streaming-info">
+
+              <!-- 运行中（含等待任务） -->
+              <div v-if="runningSection" class="streaming-info">
                 <div class="info-row">
-                  <span class="label">直播模式</span>
+                  <span class="label">运行方式</span>
                   <span class="value">
-                    <el-tag :type="liveStore.status.stream_mode === 'manual' ? 'warning' : 'success'" size="small">
-                      {{ liveStore.status.stream_mode === 'manual' ? '手动模式' : '任务模式' }}
+                    <el-tag :type="liveStore.sessionMode === 'single' ? 'warning' : 'success'" size="small">
+                      {{ liveStore.sessionMode === 'single' ? '手动模式' : '任务模式' }}
                     </el-tag>
-                  </span>
-                </div>
-                <!-- FFmpeg 推流状态 -->
-                <div v-if="liveStore.status.ffmpeg_active" class="info-row">
-                  <span class="label">推流状态</span>
-                  <span class="value">
-                    <el-tag type="success" size="small">FFmpeg 推流中</el-tag>
-                    <span style="margin-left:6px;font-size:13px;color:#909399">{{ liveStore.status.ffmpeg_current_video }}</span>
+                    <el-tag size="small" type="info" effect="plain" style="margin-left:6px">
+                      {{ liveStore.pushSource === 'obs' ? 'OBS 推流' : '本机推流' }}
+                    </el-tag>
                   </span>
                 </div>
                 <div class="info-row">
                   <span class="label">当前分区</span>
-                  <span class="value">{{ liveStore.status.current_zone }}</span>
+                  <span class="value">{{ liveStore.zoneName || '—' }}</span>
                 </div>
                 <div class="info-row">
                   <span class="label">房间号</span>
                   <span class="value">
                     <a
-                      :href="`https://live.bilibili.com/${liveStore.status.room_id}`"
+                      v-if="roomId"
+                      :href="`https://live.bilibili.com/${roomId}`"
                       target="_blank"
                       class="room-link"
                     >
-                      {{ liveStore.status.room_id }}
+                      {{ roomId }}
                       <el-icon :size="12"><TopRight /></el-icon>
                     </a>
+                    <template v-else>—</template>
                   </span>
                 </div>
+
+                <!-- 等待任务：用户要运行，但暂时没有可执行场次 -->
+                <el-alert
+                  v-if="liveStore.waitingTasks"
+                  title="等待任务"
+                  description="当前没有可执行的任务场次。添加任务或到日切后由后端自行唤醒，无需重复点击开始。"
+                  type="info" :closable="false" style="margin-bottom:8px"
+                />
+
                 <div class="progress-section">
                   <div class="progress-header">
-                    <span :class="(liveStore.status.is_anomaly || liveStore.timerHint) ? 'anomaly-text' : ''">
-                      {{ liveStore.timerHint || (liveStore.status.is_anomaly ? '⚠ 异常' : '直播进度') }}
+                    <span :class="liveStore.timerHint ? 'anomaly-text' : ''">
+                      {{ liveStore.timerHint || '直播进度' }}
                     </span>
                     <!-- 时长标签与进度条宽度解耦：0%/不限时/未知都能完整显示 -->
                     <span class="progress-time">
-                      {{ formatDuration(liveStore.localElapsed) }}
-                      <template v-if="liveStore.fixedTotal > 0"> / {{ formatDuration(liveStore.fixedTotal) }}</template>
-                      <template v-else-if="liveStore.durationKnown"> / 不限时</template>
-                      <template v-else> / 正在获取时长…</template>
-                      <span v-if="overtime" class="overtime-tag">收尾中</span>
+                      {{ formatDuration(liveStore.displaySeconds) }}
+                      <template v-if="progressRendered"> / {{ formatDuration(liveStore.targetSeconds) }}</template>
+                      <template v-else-if="liveStore.hasRun"> / 不限时</template>
+                      <template v-else> / 准备中</template>
+                      <span v-if="liveStore.overtime" class="overtime-tag">收尾中</span>
                     </span>
                   </div>
-                  <div v-if="liveStore.fixedTotal > 0" class="progress-bar-wrap">
+                  <div v-if="progressRendered" class="progress-bar-wrap">
                     <el-progress
-                      :percentage="progressPercent"
+                      :percentage="liveStore.progressPercent"
                       :stroke-width="18"
-                      :status="liveStore.status.is_anomaly ? 'exception' : (overtime ? 'warning' : '')"
+                      :status="liveStore.overtime ? 'warning' : ''"
                       :text-inside="true"
                     >
-                      {{ progressPercent }}%
+                      {{ liveStore.progressPercent }}%
                     </el-progress>
                   </div>
                   <div v-else class="progress-bar-wrap">
@@ -103,20 +107,15 @@
                       :text-inside="true"
                       color="#909399"
                     >
-                      {{ liveStore.durationKnown ? '不限时' : '准备中' }}
+                      {{ liveStore.hasRun ? '不限时' : '等待场次' }}
                     </el-progress>
                   </div>
+                  <p v-if="liveStore.displayFrozen" class="task-progress">
+                    状态暂未更新：显示已冻结在最后一次可信进度上。
+                  </p>
                 </div>
+
                 <div class="stream-actions">
-                  <el-button
-                    v-if="liveStore.status.stream_mode === 'manual'"
-                    type="warning"
-                    plain
-                    @click="showSwitchAreaDialog = true"
-                  >
-                    <el-icon><Switch /></el-icon>
-                    切换分区
-                  </el-button>
                   <el-button
                     type="danger"
                     :loading="liveStore.isStopping"
@@ -128,69 +127,53 @@
                 </div>
               </div>
 
-              <!-- 已停止：双模式 + 进行中任务恢复 -->
+              <!-- 停止 / 空闲：恢复 + 双模式 -->
               <div v-else class="idle-info">
+                <!-- 停止收尾中：目标已停止，房间还没核对完 -->
                 <el-alert
-                  v-if="canResumeDashboardTask(activeTaskState)"
-                  title="存在未完成的直播任务"
+                  v-if="liveStore.closing"
+                  title="正在停止并核对房间状态"
+                  type="info" :closable="false" style="margin-bottom:12px"
+                />
+
+                <!-- 有可恢复的原场：继续 / 放弃 -->
+                <el-alert
+                  v-if="liveStore.resumable && liveStore.statusLoaded"
+                  title="存在未完成的直播场次"
                   type="warning"
                   :closable="false"
                   style="margin-bottom:12px"
                 >
                   <template #default>
                     <p>
-                      分区：<strong>{{ activeTaskState.current_zone }}</strong>
-                      &nbsp;|&nbsp; 已播 {{ formatDuration(activeTaskState.elapsed_seconds) }}
-                      &nbsp;|&nbsp; 总时长 {{ formatDuration(activeTaskState.duration_seconds) }}
+                      分区：<strong>{{ liveStore.zoneName || '—' }}</strong>
+                      &nbsp;|&nbsp; 已确认 {{ formatDuration(liveStore.confirmedSeconds) }}
+                      <template v-if="liveStore.durationKnown">
+                        &nbsp;|&nbsp; 目标 {{ formatDuration(liveStore.targetSeconds) }}
+                      </template>
+                      <template v-else>&nbsp;|&nbsp; 不限时</template>
                     </p>
-                    <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
-                      <el-button size="small" type="primary" :disabled="!canResumeDashboardTask(activeTaskState)" @click="resumeTask">继续任务</el-button>
-                      <el-button size="small" @click="clearTaskState">清空状态</el-button>
-                      <el-popover trigger="click" :width="280" placement="bottom">
-                        <template #reference>
-                          <el-button size="small" text type="warning">修改参数</el-button>
-                        </template>
-                        <div style="display:flex;flex-direction:column;gap:8px">
-                          <div>
-                            <el-text size="small">分区名</el-text>
-                            <el-input v-model="editState.zone" size="small" placeholder="分区名" />
-                          </div>
-                          <div>
-                            <el-text size="small">总时长（秒）</el-text>
-                            <el-input-number v-model="editState.duration" :min="60" :step="300" size="small" style="width:100%" />
-                          </div>
-                          <div>
-                            <el-text size="small">已播时长（秒）</el-text>
-                            <el-input-number v-model="editState.elapsed" :min="0" :step="60" size="small" style="width:100%" />
-                          </div>
-                          <el-button size="small" type="primary" @click="updateTaskState">保存修改</el-button>
-                        </div>
-                      </el-popover>
+                    <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">
+                      <el-button size="small" type="primary"
+                        :loading="liveStore.isStarting" @click="resumeTask">继续场次</el-button>
+                      <el-button size="small"
+                        :loading="liveStore.isStarting" @click="abandonTask">放弃场次</el-button>
+                      <el-button size="small" type="warning" plain
+                        :loading="liveStore.isStarting" @click="restartAfterAbandonTask">
+                        放弃并重新开播
+                      </el-button>
                     </div>
                   </template>
                 </el-alert>
+
                 <el-alert
-                  v-else-if="!activeTaskState.resume_status_fresh"
-                  title="恢复状态待确认"
-                  type="info"
-                  :closable="false"
-                  style="margin-bottom:12px"
+                  v-else-if="liveStore.statusLoaded && liveStore.resumeBlockedReason"
+                  title="保存的场次当前不可继续"
+                  type="info" :closable="false" style="margin-bottom:12px"
                 >
-                  <template #default>
-                    <p>暂时无法读取最新服务端状态；连接恢复前不会提供继续或修改入口。</p>
-                  </template>
+                  <template #default><p>{{ liveStore.resumeBlockedReason }}</p></template>
                 </el-alert>
-                <el-alert
-                  v-else-if="activeTaskState.current_zone && activeTaskState.resume_blocked_reason"
-                  title="保存的直播状态当前不可继续"
-                  type="info"
-                  :closable="false"
-                  style="margin-bottom:12px"
-                >
-                  <template #default>
-                    <p>{{ activeTaskState.resume_blocked_reason }}</p>
-                  </template>
-                </el-alert>
+
                 <el-tabs v-model="liveMode" class="mode-tabs">
                   <el-tab-pane label="任务模式" name="task">
                     <div class="mode-content">
@@ -206,17 +189,23 @@
                           type="primary"
                           @click="startNextTask"
                           :loading="liveStore.isStarting"
-                          :disabled="!canStartDashboardTask(activeTaskState)"
+                          :disabled="!canStartNew"
                         >
                           开始下一任务
                         </el-button>
-                        <p v-if="activeTaskState.has_active && activeTaskState.resume_status_fresh" class="task-progress">
-                          请先继续未完成任务，完成或清理后再开始下一任务。
+                        <p class="task-progress">
+                          推流方式：{{ pushSourceLabel }}（在设置页修改）
+                        </p>
+                        <p v-if="liveStore.resumable" class="task-progress">
+                          请先继续或放弃未完成的场次，再开始新任务。
+                        </p>
+                        <p v-else-if="!liveStore.statusLoaded" class="task-progress">
+                          正在读取服务端状态，请稍候。
                         </p>
                       </template>
                       <div v-else class="empty-task">
                         <el-icon :size="36" color="#c0c4cc"><CircleCheck /></el-icon>
-                        <p>所有任务已完成 🎉</p>
+                        <p>所有任务已完成</p>
                       </div>
                     </div>
                   </el-tab-pane>
@@ -232,6 +221,9 @@
                         @start="onManualStart"
                         @stop="handleStopLive"
                       />
+                      <p class="task-progress">
+                        推流方式：{{ pushSourceLabel }}（在设置页修改）
+                      </p>
                     </div>
                   </el-tab-pane>
                 </el-tabs>
@@ -298,47 +290,28 @@
     <!-- 人脸验证弹窗 -->
     <FaceVerifyModal
       :visible="showVerifyModal"
-      :verify-url="verifyUrl"
+      :verify-url="faceVerifyUrl"
       :is-checking="isCheckingVerify"
-      @retry="retryStartLive"
-      @cancel="showVerifyModal = false"
+      :confirmable="faceConfirmable"
+      :block-reason="faceBlockReason"
+      @retry="confirmFaceVerify"
+      @cancel="cancelVerifyModal"
     />
-
-    <!-- 手动模式切换分区弹窗 -->
-    <el-dialog v-model="showSwitchAreaDialog" title="切换直播分区" width="420px">
-      <el-select
-        v-model="switchAreaZone"
-        filterable
-        remote
-        reserve-keyword
-        :remote-method="searchSwitchAreas"
-        :loading="searchingSwitchAreas"
-        placeholder="输入分区名搜索"
-        clearable
-        style="width:100%"
-      >
-        <el-option
-          v-for="item in switchAreaOptions"
-          :key="item.id"
-          :label="item.name"
-          :value="item.name"
-        >
-          <span>{{ item.name }}</span>
-          <span v-if="item.parent_name" style="color:#c0c4cc;font-size:12px;margin-left:4px">
-            — {{ item.parent_name }}
-          </span>
-        </el-option>
-      </el-select>
-      <template #footer>
-        <el-button @click="showSwitchAreaDialog = false">取消</el-button>
-        <el-button type="primary" @click="handleSwitchArea" :loading="isSwitchingArea">切换</el-button>
-      </template>
-    </el-dialog>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, watch, onMounted, onUnmounted, computed, nextTick } from 'vue'
+/**
+ * Dashboard（阶段 4C 接线）。
+ *
+ * 三条硬边界：
+ *  1. 运行事实全部来自 `liveStore.projection` —— 页面不再有自己的状态副本，
+ *     也不再用 `resumable` 反推"能不能开新任务"；
+ *  2. **手工恢复参数编辑已退役**：没有分区/时长/已播秒数的输入框，也没有
+ *     `/state/update`、`/clear-state`、`/switch-area` 调用；
+ *  3. 进度条只是绘制：`progressPercent` 到 100% 也不会触发任何控制请求。
+ */
+import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useAuthStore } from '@/stores/auth'
@@ -347,15 +320,7 @@ import { useLiveStore } from '@/stores/live'
 import { useSettingsStore } from '@/stores/settings'
 import { operationEvents } from '@/stores/operationEvents'
 import { usePolling } from '@/composables/usePolling'
-import { useNotification } from '@/composables/useNotification'
-import {
-  applyDashboardResumeStatus,
-  canResumeDashboardTask,
-  canStartDashboardTask,
-  emptyDashboardResumeState,
-  type DashboardResumeState,
-} from '@/composables/dashboardResume'
-import type { LiveStatus } from '@/types/api'
+import type { FaceConfirmRequest, PushSource } from '@/types/session'
 import Sidebar from '@/components/Sidebar.vue'
 import StreamConfigurator from '@/components/StreamConfigurator.vue'
 import FaceVerifyModal from '@/components/FaceVerifyModal.vue'
@@ -372,22 +337,45 @@ const pollInterval = computed(() => (settingsStore.settings.scan_interval_second
 
 // ==================== State ====================
 const liveMode = ref<'task' | 'manual'>('task')
+/**
+ * 推流方式只由**设置页**决定（manual→obs，其余→ffmpeg）：页面不再另选。
+ * 这里只作兼容字段随请求带上（服务端以目标实例自己的可信设置为准），
+ * 以及给只读提示用。
+ */
+const pushSource = computed<PushSource>(
+  () => (settingsStore.settings.stream_mode === 'manual' ? 'obs' : 'ffmpeg'))
+const pushSourceLabel = computed(
+  () => (pushSource.value === 'obs' ? 'OBS（自行推流）' : 'FFmpeg 本机推流'))
+const lastManualZone = ref(sessionStorage.getItem('lastManualZone') || '')
+const lastManualDuration = ref(Number(sessionStorage.getItem('lastManualDuration')) || 120)
 
-// 进行中的任务状态
-const activeTaskState = ref<DashboardResumeState>(emptyDashboardResumeState())
+const roomId = computed(() => Number(liveStore.projection?.room_id ?? 0) || 0)
+/** 有没有可画的目标进度：有场次且目标有限。 */
+const progressRendered = computed(
+  () => liveStore.hasRun && liveStore.targetSeconds > 0 && liveStore.durationKnown)
+/** 用户在运行（含等待任务），停止收尾不算。 */
+const runningSection = computed(
+  () => (liveStore.running && liveStore.hasRun) || liveStore.closing)
+const canStartNew = computed(
+  () => liveStore.statusLoaded && !liveStore.resumable && !liveStore.running)
 
-// 编辑待恢复任务参数
-const editState = reactive({ zone: '', duration: 0, elapsed: 0 })
-// 监听 activeTaskState 变化，同步编辑表单初始值
-watch(activeTaskState, (s) => {
-  if (s.current_zone) {
-    editState.zone = s.current_zone
-    editState.duration = s.duration_seconds
-    editState.elapsed = s.elapsed_seconds
-  }
-}, { immediate: true })
+const statusLabel = computed(() => {
+  if (!liveStore.statusLoaded) return '读取中'
+  if (liveStore.closing) return '停止收尾中'
+  if (liveStore.live) return '直播中'
+  if (liveStore.waitingTasks) return '等待任务'
+  if (liveStore.running) return '切换中'
+  return '已停止'
+})
+const statusTagType = computed(() => {
+  if (liveStore.live) return 'success'
+  if (liveStore.closing || liveStore.running) return 'warning'
+  return 'info'
+})
+/** 控制不可用时的原因（数据接管未通过等）：由 /api/health 的结论呈现。 */
+const blockedReason = ref('')
 
-
+// ==================== 操作日志 ====================
 interface LiveEvent {
   id: string
   tag: string
@@ -396,9 +384,8 @@ interface LiveEvent {
   time: string
   source: 'server' | 'local' | 'legacy'
 }
-// 近期操作日志统一走响应式事件 store（2026-09-21 工作包 A）：
-// 服务器事件由 live store 的受控状态应用路径直接摄取，本地操作意图走
-// addLocal（独立身份/来源），页面不再经过"定时器→localStorage→定时器"中转。
+// 近期操作日志统一走响应式事件 store：服务器事件由 live store 的受控状态应用
+// 路径直接摄取（唯一 ingestion 入口），本地操作意图走 addLocal（独立身份/来源）。
 const events = computed<LiveEvent[]>(() =>
   operationEvents.events.value.map((e) => ({
     id: e.id,
@@ -409,263 +396,198 @@ const events = computed<LiveEvent[]>(() =>
     source: e.source,
   })) as LiveEvent[])
 
-// 事件日志容器引用（滚底用）
 const eventListRef = ref<HTMLElement | null>(null)
 let _eventListResizeOb: ResizeObserver | null = null
 
 function scrollEventsToBottom() {
   const el = eventListRef.value
-  if (el) {
-    requestAnimationFrame(() => { el.scrollTop = el.scrollHeight })
-  }
+  if (el) requestAnimationFrame(() => { el.scrollTop = el.scrollHeight })
 }
-
 function setupEventListAutoScroll() {
   const el = eventListRef.value
   if (!el || _eventListResizeOb) return
-  _eventListResizeOb = new ResizeObserver(() => {
-    // 容器大小变化时保持在底部
-    scrollEventsToBottom()
-  })
+  _eventListResizeOb = new ResizeObserver(() => { scrollEventsToBottom() })
   _eventListResizeOb.observe(el)
 }
-
 function teardownEventListAutoScroll() {
-  if (_eventListResizeOb) {
-    _eventListResizeOb.disconnect()
-    _eventListResizeOb = null
+  if (_eventListResizeOb) { _eventListResizeOb.disconnect(); _eventListResizeOb = null }
+}
+
+// ==================== 人脸验证 ====================
+const showVerifyModal = ref(false)
+const isCheckingVerify = ref(false)
+/**
+ * 弹窗打开时**冻结**的确认上下文。提交时只用它——不再读当前投影补齐，
+ * 这样"打开弹窗后又 Stop / 换了目标"就不会被旧确认改写。
+ */
+let frozenFace: FaceConfirmRequest | null = null
+const faceVerifyUrl = ref('')
+const faceConfirmable = computed(() => {
+  const face = liveStore.face
+  return Boolean(face && face.active && face.confirmable)
+})
+const faceBlockReason = computed(() => String(liveStore.face?.block_reason || ''))
+let suppressFaceUntilGoalRevision = -1
+
+watch(() => liveStore.face, (face) => {
+  if (face && face.active) {
+    if (suppressFaceUntilGoalRevision >= 0
+        && face.goal_revision === suppressFaceUntilGoalRevision) return
+    suppressFaceUntilGoalRevision = -1
+    faceVerifyUrl.value = face.verify_url
+    if (!showVerifyModal.value) {
+      showVerifyModal.value = true
+      frozenFace = {
+        goal_revision: face.goal_revision,
+        uid: face.uid, room_id: face.room_id,
+      }
+      addEvent('验证', 'warning',
+               face.verify_url_available
+                 ? '需要人脸验证：请完成验证后在弹窗确认'
+                 : '需要人脸验证：验证链接未取得，请在 B 站完成验证后回到面板确认')
+    }
+    return
+  }
+  suppressFaceUntilGoalRevision = -1
+  if (showVerifyModal.value && !liveStore.running) cancelVerifyModal(false)
+}, { deep: true })
+
+function cancelVerifyModal(suppressCurrent = true) {
+  if (suppressCurrent) {
+    suppressFaceUntilGoalRevision = Number(liveStore.face?.goal_revision ?? -1)
+  }
+  showVerifyModal.value = false
+  isCheckingVerify.value = false
+  frozenFace = null
+  faceVerifyUrl.value = ''
+}
+
+/**
+ * 面板确认：提交**冻结**的三元组；确认后只等事实，**不**另发 Start。
+ */
+async function confirmFaceVerify() {
+  if (!showVerifyModal.value) return
+  const frozen = frozenFace
+  if (!frozen || !faceConfirmable.value) {
+    ElMessage.warning(faceBlockReason.value
+      || '本次验证无法从面板确认：请在 B 站完成验证后重试')
+    return
+  }
+  isCheckingVerify.value = true
+  try {
+    const result = await liveStore.confirmFace(frozen)
+    if (result.superseded) return
+    if (result.outcome.kind === 'receipt'
+        && result.outcome.receipt.status === 'ignored') {
+      // 目标已经变了：这份确认不再授权任何东西。
+      cancelVerifyModal()
+      ElMessage.warning('这次确认已被更新的操作取代，请按当前状态重新操作')
+      return
+    }
+    if (result.notice) {
+      const level = result.notice.level
+      if (level === 'error') ElMessage.error(result.notice.message)
+      else if (level === 'warning') ElMessage.warning(result.notice.message)
+      else ElMessage.success(result.notice.message)
+    }
+    if (!result.notice || result.notice.level !== 'error') {
+      cancelVerifyModal(false)
+      addEvent('验证', 'info', '已提交人工确认，等待后台按原目标重试')
+    }
+  } finally {
+    isCheckingVerify.value = false
   }
 }
-
-// 人脸验证
-const showVerifyModal = ref(false)
-const verifyUrl = ref('')
-const isCheckingVerify = ref(false)
-let pendingStartZone: string | undefined = undefined
-let pendingStartDuration: number | undefined = undefined
-let pendingRetryResume = false  // true=重试恢复，false=重试开播
-const lastManualZone = ref(sessionStorage.getItem('lastManualZone') || '')
-const lastManualDuration = ref(Number(sessionStorage.getItem('lastManualDuration')) || 120)
-
-// 手动模式切换分区
-const showSwitchAreaDialog = ref(false)
-const switchAreaZone = ref('')
-const isSwitchingArea = ref(false)
-const searchingSwitchAreas = ref(false)
-const switchAreaOptions = ref<{ id: number; name: string; parent_name?: string }[]>([])
-
-async function searchSwitchAreas(keyword: string) {
-  if (!keyword || !keyword.trim()) { switchAreaOptions.value = []; return }
-  searchingSwitchAreas.value = true
-  try {
-    const { useRequest } = await import('@/api/request')
-    const req = useRequest()
-    const res = await req.get<{ results: { id: number; name: string; parent_name?: string }[] }>(
-      `/api/live/areas/search?keyword=${encodeURIComponent(keyword)}`
-    )
-    switchAreaOptions.value = res.results || []
-  } catch { switchAreaOptions.value = [] }
-  finally { searchingSwitchAreas.value = false }
-}
-
-// ==================== 实时进度 ====================
-// 百分比永远落在 0..100（NaN/负数/未知都不传给进度组件），
-// 耗时超过目标时显示实际数值并标注"收尾中"，不让条宽超出容器。
-//
-// 计时语义（2026-09-20）：localElapsed = 服务端已确认有效时长 + 有界外推的
-// 待确认区间。待确认部分即使推到目标也**不显示已完成**（停在 99%），完成状态
-// 以服务端实际结算为准；只有服务端已确认值达到目标时才显示 100%。
-const confirmedElapsed = computed(() => {
-  const value = Number(liveStore.status.elapsed_seconds)
-  return Number.isFinite(value) && value > 0 ? value : 0
-})
-
-const progressPercent = computed(() => {
-  const total = Number(liveStore.fixedTotal)
-  if (!Number.isFinite(total) || total <= 0) return 0
-  if (confirmedElapsed.value >= total) return 100
-  const elapsed = Number(liveStore.localElapsed)
-  if (!Number.isFinite(elapsed) || elapsed <= 0) return 0
-  return Math.max(0, Math.min(99, Math.round((elapsed / total) * 100)))
-})
-
-const overtime = computed(() => {
-  const total = Number(liveStore.fixedTotal)
-  return Number.isFinite(total) && total > 0 && confirmedElapsed.value > total
-})
 
 // ==================== Polling ====================
-let _wasStreaming = false
-// 轮询不重复触发 success：retryStartLive 成功时置 true，轮询消费后复位
-let _faceVerifySuccessHandled = false
-function applyDashboardStatus(status: LiveStatus | undefined) {
-  activeTaskState.value = applyDashboardResumeStatus(activeTaskState.value, status)
-  // A failed status read is unknown. Keep the last stream state and bounded timer
-  // intact; only a fresh backend snapshot may confirm that streaming stopped.
-  if (!status) return
-
-  liveStore.syncFromServer()
-  // 事件展示由响应式 store 驱动（服务器事件在状态应用路径上已直接摄取）。
-  // 人脸验证弹窗感知
-  if (status.pending_face_verify && !showVerifyModal.value) {
-    showVerifyModal.value = true
-    verifyUrl.value = status.face_verify_url || ''
-    pendingRetryResume = false
-  }
-  // 邮箱远程确认后开播成功，自动关闭人脸验证弹窗
-  if (showVerifyModal.value && status.is_streaming) {
-    showVerifyModal.value = false
-    pendingRetryResume = false
-    if (!_faceVerifySuccessHandled) {
-      ElMessage.success('人脸验证已确认，直播已开始')
-    }
-    _faceVerifySuccessHandled = false
-  }
-  if (status.is_streaming) {
-    if (!liveStore.tickActive) liveStore.startLocalTick()
-    _wasStreaming = true
-  } else {
-    if (_wasStreaming) {
-      _wasStreaming = false
-      // 手动模式停播：保持手动页面 + 剩余时长预填
-      if (status.stream_mode === 'manual') {
-        liveMode.value = 'manual'
-        const elapsedMins = Math.round(liveStore.localElapsed / 60)
-        if (lastManualDuration.value > 0 && elapsedMins > 0) {
-          lastManualDuration.value = Math.max(1, lastManualDuration.value - elapsedMins)
-          sessionStorage.setItem('lastManualDuration', String(lastManualDuration.value))
-        }
-      }
-    }
-    liveStore.stopLocalTick()
-  }
-}
-
-async function refreshDashboardStatus() {
-  const statusPromise = liveStore.pollStatus().then((status) => {
-    applyDashboardStatus(status)
-    return status
-  })
-  // Task data refresh is independent; a slow task list cannot hold the status card,
-  // restore decision, or operation log behind it.
-  void taskStore.fetchTasks().catch(() => { /* task list refresh is independent */ })
+const { start: startPoll } = usePolling(async () => {
+  // 状态走 store 的单飞入口：慢请求不会叠加，任务查询再慢也不拖住状态应用。
+  const statusPromise = liveStore.refreshStatus()
+  void taskStore.fetchTasks().catch(() => { /* 任务列表刷新与状态无关 */ })
   await statusPromise
-}
-
-const { start: startPoll } = usePolling(refreshDashboardStatus, pollInterval.value)
-
-const { notify } = useNotification()
+}, pollInterval.value)
 
 onMounted(async () => {
-  loadCrossEvents()
-  await fetchStatus()
+  // 缓存的操作日志先于任何网络读取装载：慢读取期间日志栏也有内容可看，
+  // 不等第一份状态回来才出现（桌面既有行为，保留）。
+  operationEvents.ensureLoaded()
+  scrollEventsToBottom()
+  // 只读提示与兼容字段都要反映**当前**设置（推流方式由设置页唯一决定）。
+  void settingsStore.fetchSettings()
+  await liveStore.refreshStatus()
+  await readHealth()
   startPoll()
-  // 确保 DOM 渲染完成后滚到底部
   await nextTick()
-  setTimeout(() => {
-    scrollEventsToBottom()
-    setupEventListAutoScroll()
-  }, 100)
+  setTimeout(() => { scrollEventsToBottom(); setupEventListAutoScroll() }, 100)
 })
 
 onUnmounted(() => {
   teardownEventListAutoScroll()
-  // 页面离开：取消在途状态读与启动观察，避免离开后仍有请求落地。
-  liveStore.stopStartWatch()
+  // 页面离开：取消在途状态读与收敛观察，避免离开后仍有请求落地。
+  liveStore.stopSettleWatch()
   liveStore.stopStatusReads()
 })
 
+/** 控制不可用的原因来自 /api/health 的 data_takeover（只读）。 */
+async function readHealth() {
+  try {
+    const { useRequest } = await import('@/api/request')
+    const res = await useRequest().get<{
+      control_service?: boolean
+      data_takeover?: { status?: string; detail?: string; reason?: string }
+    }>('/api/health')
+    const takeover = res?.data_takeover || {}
+    blockedReason.value = (res?.control_service && takeover.status
+      && !['trusted', 'first_start', 'migrated'].includes(String(takeover.status)))
+      ? `控制当前不可用：${takeover.detail || takeover.reason || takeover.status}`
+      : ''
+  } catch { blockedReason.value = '' }
+}
+
 function addEvent(tag: string, type: LiveEvent['type'], message: string) {
-  // 本地操作意图：独立身份与来源（与后台事实分阶段，不按文案猜同一事件）。
   operationEvents.addLocal(tag, type, message)
   scrollEventsToBottom()
 }
 
-// 加载跨页面/跨启动事件：由事件 store 的缓存装载完成（含旧格式迁移），
-// 页面挂载只需确保 store 已装载并滚动到底部。
-function loadCrossEvents() {
-  operationEvents.ensureLoaded()
-  scrollEventsToBottom()
+/**
+ * 桌面系统级通知（只走 Electron 通道，不再弹第二条应用内提示）。
+ *
+ * `composables/useNotification` 的 `notify` 会**同时**弹一条 ElMessage；控制结果
+ * 已经在页面上有明确提示，再弹一次只会把同一件事说两遍。这里只保留"窗口可能在
+ * 托盘里"这一条真实需求：失败/需人工处理的结论额外发一条系统通知。
+ */
+function notifyDesktop(title: string, body: string): void {
+  try {
+    window.electronAPI?.showNotification(title, body)
+  } catch {
+    /* 通知通道不可用不影响控制结果 */
+  }
+}
+
+/** 控制结果的统一呈现：受理 ≠ 成功，页面只转述。 */
+function showNotice(notice: { level: string; message: string } | null) {
+  if (!notice) return
+  const { level, message } = notice
+  if (level === 'error') ElMessage.error(message)
+  else if (level === 'warning') ElMessage.warning(message)
+  else if (level === 'success') ElMessage.success(message)
+  else ElMessage.info(message)
+  if (level === 'error' || level === 'warning') {
+    addEvent(level === 'error' ? '错误' : '提示', level === 'error' ? 'danger' : 'warning',
+             message)
+    notifyDesktop(level === 'error' ? '操作未被受理' : '需要注意', message)
+  } else {
+    addEvent('操作', 'info', message)
+  }
 }
 
 // ==================== Actions ====================
-async function fetchStatus() {
-  await refreshDashboardStatus()
-}
-
-async function updateTaskState() {
-  if (!canResumeDashboardTask(activeTaskState.value)) {
-    ElMessage.warning('恢复状态尚未确认，请连接恢复后重试')
-    return
-  }
-  try {
-    const { useRequest } = await import('@/api/request')
-    const req = useRequest()
-    await req.post('/api/live/state/update', {
-      current_zone: editState.zone,
-      duration_seconds: editState.duration,
-      elapsed_seconds: editState.elapsed,
-    })
-    activeTaskState.value = {
-      ...activeTaskState.value,
-      current_zone: editState.zone,
-      duration_seconds: editState.duration,
-      elapsed_seconds: editState.elapsed,
-      resume_status_fresh: false,
-    }
-    await fetchStatus()
-    ElMessage.success('任务参数已更新')
-    addEvent('状态', 'info', `修改恢复参数：${editState.zone}，时长 ${formatDuration(editState.duration)}`)
-  } catch {
-    ElMessage.error('更新失败')
-  }
-}
-
-async function resumeTask() {
-  if (!canResumeDashboardTask(activeTaskState.value)) {
-    ElMessage.warning('恢复状态尚未确认，请连接恢复后重试')
-    return
-  }
-  try {
-    // 走 store 的 resumeLive：与 start 共用同一套在途意图管理，
-    // 取票等待期间点停止能真正取消这次恢复（旧实现直接 req.post 不受控）。
-    const res = await liveStore.resumeLive()
-    if (res.success) {
-      // 后端只是“已接收”：开播在后台持续重试，只有状态轮询确认后才算真正在播。
-      ElMessage.success(res.message || '恢复请求已接收，后台正在开播')
-      addEvent('恢复', 'info', `恢复请求已接收：${activeTaskState.value.current_zone}`)
-    } else if (res.needFaceVerify) {
-      showVerifyModal.value = true
-      verifyUrl.value = res.qrData || ''
-      pendingStartZone = activeTaskState.value.current_zone
-      pendingStartDuration = undefined
-      pendingRetryResume = true
-      addEvent('验证', 'warning', '需要人脸验证，请扫描二维码完成验证后重试')
-    } else {
-      ElMessage.error(res.message)
-    }
-    await fetchStatus()
-  } catch {
-    ElMessage.error('恢复失败')
-  }
-}
-
-async function clearTaskState() {
-  try {
-    const { useRequest } = await import('@/api/request')
-    const req = useRequest()
-    await req.post('/api/live/clear-state')
-    activeTaskState.value = { ...emptyDashboardResumeState(), resume_status_fresh: true }
-    ElMessage.success('任务状态已清空')
-  } catch {
-    ElMessage.error('清空失败')
-  }
-}
-
 async function startNextTask() {
-  if (!canStartDashboardTask(activeTaskState.value)) return
-  const result = await liveStore.startLive()
-  handleStartResult(result)
+  // 本地只记录**意图**；"已开播"只能来自后台确认事实。
+  addEvent('开播', 'info',
+           `请求自动选择并开始下一场（${pushSource.value === 'obs' ? 'OBS' : '本机'}推流）`)
+  const result = await liveStore.startNextTask(pushSource.value)
+  showNotice(result.notice)
 }
 
 function onManualStart(payload: { zoneName: string; durationSeconds: number }) {
@@ -673,139 +595,124 @@ function onManualStart(payload: { zoneName: string; durationSeconds: number }) {
   lastManualDuration.value = Math.round(payload.durationSeconds / 60)
   sessionStorage.setItem('lastManualZone', payload.zoneName)
   sessionStorage.setItem('lastManualDuration', String(lastManualDuration.value))
-  const durLabel = payload.durationSeconds === 0 ? '不限时' : `${Math.round(payload.durationSeconds / 60)} 分钟`
+  const durLabel = payload.durationSeconds === 0 ? '不限时'
+    : `${Math.round(payload.durationSeconds / 60)} 分钟`
+  // 确认框**之前**冻结整份操作：确认期间的任何后台变化都拼不进这份载荷。
+  const operation = liveStore.buildSingleOp(
+    { zoneName: payload.zoneName, durationSeconds: payload.durationSeconds },
+    pushSource.value)
   ElMessageBox.confirm(
-    `将在分区「${payload.zoneName}」开播，时长 ${durLabel}`,
+    `将在分区「${payload.zoneName}」开一场单次直播，时长 ${durLabel}。`,
     '确认开播',
     { confirmButtonText: '开始', cancelButtonText: '取消', type: 'info' },
   ).then(async () => {
-    const result = await liveStore.startLive(payload.zoneName, payload.durationSeconds)
-    handleStartResult(result, payload.zoneName, payload.durationSeconds)
+    addEvent('开播', 'info', `请求单次开播：${payload.zoneName}（${durLabel}）`)
+    const result = await liveStore.dispatch(operation)
+    showNotice(result.notice)
   }).catch(() => { /* 用户取消 */ })
 }
 
-function handleStartResult(
-  result: { success: boolean; message: string; needFaceVerify?: boolean; qrData?: string },
-  zoneName?: string,
-  durationSeconds?: number,
-) {
-  console.log('[handleStartResult]', { success: result.success, needFaceVerify: result.needFaceVerify, qrData: result.qrData, message: result.message })
-  if (result.success) {
-    ElMessage.success(result.message)
-    notify('开播请求已接收', result.message, 'success')
-    fetchStatus()
-  } else if (result.needFaceVerify) {
-    console.log('[handleStartResult] 显示人脸验证弹窗, qrData:', result.qrData)
-    showVerifyModal.value = true
-    verifyUrl.value = result.qrData || ''
-    pendingStartZone = zoneName
-    pendingStartDuration = durationSeconds
-    pendingRetryResume = false
-    addEvent('验证', 'warning', '需要人脸验证，请扫描二维码完成验证后重试')
-  } else {
-    ElMessage.error(result.message)
-    addEvent('错误', 'danger', `开播失败 — ${result.message}`)
-    notify('开播失败', result.message, 'error')
+async function resumeTask() {
+  if (!liveStore.projection?.run || !liveStore.projection?.goal) {
+    ElMessage.error('当前没有可恢复的场次'); return
   }
+  // 恢复同样在**任何 await 之前**冻结 run_id/goal_revision。
+  const operation = liveStore.buildResumeOp({
+    runId: liveStore.runId, goalRevision: liveStore.goalRevision,
+  })
+  addEvent('恢复', 'info', `请求继续场次：${liveStore.zoneName}`)
+  const result = await liveStore.dispatch(operation)
+  showNotice(result.notice)
 }
 
-async function retryStartLive() {
-  isCheckingVerify.value = true
+async function abandonTask() {
+  // 弹框**之前**冻结原场三件套：确认之后不再读当前投影（复核 R2）。
+  const ref = liveStore.freezeAbandonRef(liveStore.projection)
+  if (!ref) { ElMessage.error('当前没有可放弃的场次'); return }
+  const operation = liveStore.buildAbandonOp(ref)
   try {
-    // 先确认人脸验证完成
-    const { useRequest } = await import('@/api/request')
-    const req = useRequest()
-    await req.post('/api/live/confirm-face-verify')
+    await ElMessageBox.confirm(
+      `将放弃「${ref.zoneName || '—'}」这一场未结算的已播进度。\n\n`
+      + `此前已完成的天数不受影响；放弃之后这场无法再继续。`,
+      '放弃这场未结算的进度',
+      { confirmButtonText: '放弃', cancelButtonText: '取消', type: 'warning',
+        distinguishCancelAndClose: true, confirmButtonClass: 'el-button--danger' },
+    )
+  } catch { return /* 用户取消：零控制提交 */ }
+  addEvent('放弃', 'warning', `请求放弃场次：${ref.zoneName}`)
+  const result = await liveStore.dispatch(operation)
+  showNotice(result.notice)
+}
 
-    // 根据原始操作选择重试方式
-    let result: { success: boolean; message: string; needFaceVerify?: boolean; qrData?: string }
-    if (pendingRetryResume) {
-      // 验证后恢复同样走 store：受停止取消约束，且复用统一的响应形状
-      result = await liveStore.resumeLive()
-    } else {
-      result = await liveStore.startLive(pendingStartZone, pendingStartDuration)
+/**
+ * 放弃旧场并**一步**开新场。
+ *
+ * 新选择与原场上下文都必须在确认框**之前**冻结：确认期间后台换场不会改写
+ * 用户已经确认的这一份（`buildRestartAfterAbandonOp` 只接受冻结值）。
+ */
+async function restartAfterAbandonTask() {
+  const ref = liveStore.freezeAbandonRef(liveStore.projection)
+  if (!ref) { ElMessage.error('当前没有需要放弃的原场'); return }
+  let startBody: Record<string, unknown> | null = null
+  if (liveMode.value === 'manual') {
+    const zoneName = String(lastManualZone.value || '').trim()
+    if (!zoneName) { ElMessage.warning('请先在手动模式下填写直播分区'); return }
+    startBody = { mode: 'single', zone_name: zoneName,
+                  target_seconds: Math.max(0, Math.round(lastManualDuration.value * 60)),
+                  push_source: pushSource.value }
+  } else {
+    const next = taskStore.nextTask as (typeof taskStore.nextTask & { id?: number }) | null
+    if (!next || typeof next.id !== 'number') {
+      ElMessage.warning('当前没有可指定的任务：请刷新任务列表后重试'); return
     }
-
-    if (result.success) {
-      showVerifyModal.value = false
-      pendingRetryResume = false
-      _faceVerifySuccessHandled = true
-      handleStartResult(result)
-    } else if (result.needFaceVerify) {
-      // 仍需验证，更新二维码
-      verifyUrl.value = result.qrData || ''
-    } else {
-      showVerifyModal.value = false
-      pendingRetryResume = false
-      handleStartResult(result)
-    }
-  } finally {
-    isCheckingVerify.value = false
+    startBody = { mode: 'task', task_id: next.id,
+                  expected_revision: taskStore.tasksRevision,
+                  business_date: taskStore.businessDate,
+                  push_source: pushSource.value }
   }
+  const operation = liveStore.buildRestartAfterAbandonOp(startBody, ref)
+  try {
+    await ElMessageBox.confirm(
+      `将放弃「${ref.zoneName || '—'}」这一场未结算的已播进度，并立即开始新的一场。\n\n`
+      + `两项动作在同一项请求里完成，中途不会先清空状态。`,
+      '放弃并重新开播',
+      { confirmButtonText: '放弃并开播', cancelButtonText: '取消', type: 'warning',
+        distinguishCancelAndClose: true, confirmButtonClass: 'el-button--danger' },
+    )
+  } catch { return }
+  addEvent('放弃并开播', 'warning',
+           `请求放弃「${ref.zoneName}」并开始新场`)
+  const result = await liveStore.dispatch(operation)
+  showNotice(result.notice)
 }
 
 async function handleStopLive() {
   try {
     await ElMessageBox.confirm('确定要停止当前直播吗？', '停止直播', {
-      confirmButtonText: '确定停止',
-      cancelButtonText: '取消',
-      type: 'warning',
+      confirmButtonText: '确定停止', cancelButtonText: '取消', type: 'warning',
     })
-  } catch {
-    return
-  }
+  } catch { return }
+  // 用户已确认停播：撤销页面中的旧验证意图，避免旧弹窗在停止请求期间继续重试。
+  cancelVerifyModal()
+  addEvent('停播', 'warning', '请求停止直播')
   const result = await liveStore.stopLive()
-  if (result.success) {
-    ElMessage.success(result.message)
-    addEvent('停播', 'warning', result.message)
-    notify('停止直播', result.message, 'warning')
-    await fetchStatus()
-  } else {
-    ElMessage.error(result.message)
-    addEvent('错误', 'danger', result.message)
-  }
-  await fetchStatus()
-}
-
-async function handleSwitchArea() {
-  const zone = switchAreaZone.value.trim()
-  if (!zone) { ElMessage.warning('请输入分区名'); return }
-  isSwitchingArea.value = true
-  try {
-    const { useRequest } = await import('@/api/request')
-    const req = useRequest()
-    const res = await req.post<{ success: boolean; message: string }>(
-      `/api/live/switch-area?zone_name=${encodeURIComponent(zone)}`
-    )
-    if (res.success) {
-      ElMessage.success(res.message)
-      addEvent('切换', 'warning', `切换分区：${zone}`)
-      showSwitchAreaDialog.value = false
-      switchAreaZone.value = ''
-      await fetchStatus()
-    } else {
-      ElMessage.error(res.message)
-    }
-  } catch (e: any) {
-    ElMessage.error(e?.response?.data?.detail || '切换分区失败')
-  } finally {
-    isSwitchingArea.value = false
-  }
+  showNotice(result.notice)
 }
 
 async function onLogout() {
+  // 退出由 auth store 统一处理：**服务确认之后**才撤本地身份。
   const result = await authStore.logout()
-  // 业务拒绝（例如直播进行中）或已被新的登录意图取代时，留在当前页面。
-  // 网络失败仍保留本地退出语义，沿用原来的登录页落点。
   if (!result.blocked && !result.superseded) {
+    liveStore.teardown()
     router.push({ name: 'Login' })
   }
 }
 
 function formatDuration(seconds: number): string {
-  const h = Math.floor(seconds / 3600)
-  const m = Math.floor((seconds % 3600) / 60)
-  const s = seconds % 60
+  const total = Math.max(0, Math.floor(Number(seconds) || 0))
+  const h = Math.floor(total / 3600)
+  const m = Math.floor((total % 3600) / 60)
+  const s = total % 60
   if (h > 0) return `${h}时${m}分${s}秒`
   if (m > 0) return `${m}分${s}秒`
   return `${s}秒`
@@ -853,6 +760,7 @@ function formatDuration(seconds: number): string {
 .progress-header { display: flex; justify-content: space-between; margin-bottom: 4px; }
 .progress-time { font-size: 13px; color: #606266; }
 .anomaly-text { color: #f56c6c; font-weight: bold; }
+.overtime-tag { margin-left: 6px; color: #e6a23c; }
 
 /* ---- 统计 ---- */
 .stats-card { container-type: inline-size; }
