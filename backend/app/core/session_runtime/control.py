@@ -25,6 +25,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import logging
 import threading
 import time
 from collections import OrderedDict
@@ -51,6 +52,9 @@ from ..session.model import (
     WANT_STOPPED,
     Selection,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 class ControlServiceError(ValueError):
@@ -365,11 +369,34 @@ class ControlService:
                account_context: Optional[dict]) -> ControlReceipt:
         instance = self._require_instance(token)
         self._check_account_context(instance, account_context)
+        selection = self._with_current_push_source(frozen['selection'])
+        refusal = self._preflight_start(instance, frozen['mode'], selection)
+        if refusal:
+            # 同步拦截：不提交 Goal、不发平台请求；页面直接显示“未被受理：<原因>”。
+            return self._receipt(token, 'rejected', False, refusal,
+                                 self._read_instance(instance))
         return self._submit_goal(UserGoal(
             wanted=WANT_RUNNING, mode=frozen['mode'],
-            selection=self._with_current_push_source(frozen['selection']),
+            selection=selection,
             start_kind=START_NEW),
             token, instance)
+
+    def _preflight_start(self, instance: Any, mode: str, selection: Any) -> str:
+        """提交 Goal 前的只读分区预检；返回非空字符串表示拒绝原因。
+
+        端口未提供预检能力（旧夹具/隔离构造）时放行；预检自身异常也放行——
+        选场/开播端口仍会在本地拒绝空分区，绝不让预检 bug 挡住正常开播。
+        """
+        port = getattr(instance, 'task_port', None)
+        checker = getattr(port, 'preflight_start', None)
+        if not callable(checker):
+            return ''
+        try:
+            reason = checker(mode, selection)
+        except Exception:                                 # noqa: BLE001
+            logger.warning('开播前分区预检失败（按放行处理）', exc_info=True)
+            return ''
+        return reason if isinstance(reason, str) else ''
 
     def _stop(self, token: str,
               account_context: Optional[dict]) -> ControlReceipt:
@@ -459,9 +486,13 @@ class ControlService:
         if not run:
             return self._receipt(token, 'rejected', False,
                                  '没有需要放弃的原场', snapshot)
+        next_selection = self._with_current_push_source(frozen['selection'])
+        refusal = self._preflight_start(instance, frozen['mode'], next_selection)
+        if refusal:
+            return self._receipt(token, 'rejected', False, refusal, snapshot)
         return self._submit_goal(UserGoal(
             wanted=WANT_RUNNING, mode=frozen['mode'],
-            selection=self._with_current_push_source(frozen['selection']),
+            selection=next_selection,
             start_kind=START_NEW,
             abandon_run_id=str(run_id),
             abandon_goal_revision=int(goal_revision),

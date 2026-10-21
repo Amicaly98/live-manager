@@ -180,6 +180,7 @@ HISTORY_SOURCE_USER = 'user'
 HISTORY_SOURCE_IMPORT = 'import'
 HISTORY_SOURCE_AUTO = 'auto'
 HISTORY_SOURCE_NEGATIVE = 'negative_priority'
+HISTORY_SOURCE_AREA = 'area_unavailable'
 HISTORY_SOURCE_MIGRATION = 'migration'
 
 

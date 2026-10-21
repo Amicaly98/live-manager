@@ -44,3 +44,10 @@ html, body, #app {
 ::-webkit-scrollbar-thumb:hover {
   background: #909399;
 }
+
+/* 对话框会传送到 body，统一限制小屏宽度，覆盖创建、历史和人脸等固定宽度弹窗。 */
+@media (max-width: 768px) {
+  .el-dialog {
+    max-width: calc(100vw - 24px);
+  }
+}

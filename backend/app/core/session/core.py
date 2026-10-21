@@ -23,20 +23,24 @@ import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from urllib.parse import urlsplit
 
 from . import effects as fx
 from .events import (
+    OP_MARK_AREA,
     OP_QUERY,
     OP_SELECT,
     OP_SETTLE,
     OP_START,
     OP_STOP,
+    OUTCOME_AREA_UNAVAILABLE,
     OUTCOME_FACE_VERIFY,
     OUTCOME_OK,
     OUTCOME_REJECTED,
     OUTCOME_UNKNOWN,
     STATUS_CLOSED,
     STATUS_LIVE,
+    STATUS_ROUND,
     STATUS_UNKNOWN,
     WAKE_MIDNIGHT,
     WAKE_TARGET,
@@ -54,6 +58,7 @@ from .events import (
     Result,
     SelectionResult,
     StartReservationResult,
+    TaskAreaMarkResult,
     TasksChanged,
     Timeout,
     UserConfirmation,
@@ -85,6 +90,7 @@ from .model import (
     STEP_RESUME_QUERY,
     STEP_WAIT_TASKS,
     STOP_ACCOUNT_EXIT,
+    STOP_AREA_UNAVAILABLE,
     STOP_FACE_VERIFY,
     STOP_PLATFORM_REJECTED,
     STOP_SELECTION_REJECTED,
@@ -138,6 +144,32 @@ _CLOSE_BACKOFF_AFTER = 2
 #: ``_emit_fact(task_id=...)`` 的"未指定"哨兵：与显式的 ``None``（确实没有
 #: 任务身份，例如单次模式）区分开。
 _UNSET = object()
+
+#: 平台拒绝开播/恢复时的人脸验证页（旧版 ``live_controller`` 同款口径）：
+#: 平台回包没有给出可用地址时，用它把 ``fact.reason`` 变成邮件/面板可点击的
+#: 链接，而不是把平台文案当"验证地址"传给用户。
+_FACE_VERIFY_URL_TEMPLATE = (
+    'https://www.bilibili.com/blackboard/live/face-auth-middle.html'
+    '?source_event=400&mid={uid}')
+
+
+def face_verify_reason(detail: Any, uid: Any) -> str:
+    """人脸事实的 reason：回包带合法 http(s) 地址就用它；否则构造 B 站验证页地址。
+
+    地址判定与 ``session_runtime.projection._is_http_url`` 同口径（scheme +
+    hostname，且不带 userinfo）；``urlsplit`` 解析失败按"不是地址"处理。
+    ``mid`` 用当前账号 uid。
+    """
+    text = str(detail or '').strip()
+    try:
+        parsed = urlsplit(text)
+    except ValueError:
+        parsed = None
+    if (parsed is not None and parsed.scheme in ('http', 'https')
+            and parsed.hostname and not parsed.username
+            and not parsed.password):
+        return text
+    return _FACE_VERIFY_URL_TEMPLATE.format(uid=uid or '')
 
 
 class RequiredSaveFailed(RuntimeError):
@@ -393,6 +425,8 @@ class Core:
             return self._on_selection_result(event)
         if isinstance(event, StartReservationResult):
             return self._on_start_reservation_result(event)
+        if isinstance(event, TaskAreaMarkResult):
+            return self._on_task_area_mark_result(event)
         if isinstance(event, LedgerResult):
             return self._on_ledger_result(event)
         if isinstance(event, PusherInventory):
@@ -706,6 +740,9 @@ class Core:
         if op.kind == OP_SETTLE:
             return self._on_ledger_result(LedgerResult(
                 operation_id=op.id, ok=False, detail='timeout'))
+        if op.kind == OP_MARK_AREA:
+            return self._on_task_area_mark_result(TaskAreaMarkResult(
+                operation_id=op.id, ok=False, reason='timeout'))
         return self._on_platform_result(PlatformResult(
             operation_id=op.id, kind=op.kind, run_id=op.run_id, room_id=op.room_id,
             outcome=OUTCOME_UNKNOWN, status=STATUS_UNKNOWN, detail='timeout'))
@@ -755,6 +792,11 @@ class Core:
         if self._operation is not None:
             # 当前一轮没有结束：不发第二项房间请求。
             return
+
+        # 平台已判定分区下架：先把任务按“不可完成”移出（幂等、重启可重发），
+        # 再走关房核对与下一轮选场。它占用同一个在途操作槽。
+        if self._area_mark_pending(self._snapshot):
+            return self._issue(OP_MARK_AREA, effects)
 
         if self._snapshot.step != STEP_WAIT_TASKS:
             # 等任务之外的任何位置都不再需要这次"重走关房核对"的唤醒。
@@ -853,6 +895,13 @@ class Core:
 
     # ---------------------------------------------------------------- 发出
 
+    @staticmethod
+    def _area_mark_pending(s: Snapshot) -> bool:
+        run = s.run
+        return (run is not None and run.area_unavailable
+                and not run.area_unavailable_marked
+                and run.task_id is not None)
+
     def _issue(self, kind: str, effects: List[Any]) -> None:
         """发出下一项动作。平台/选任务/结算动作都只从这里出去。
 
@@ -948,10 +997,17 @@ class Core:
                                  target_seconds=float(request.get('target_seconds') or 0.0),
                                  completed_at=request.get('completed_at'),
                                  settlement_guard=request.get('settlement_guard'))
+        if operation.kind == OP_MARK_AREA:
+            return fx.MarkTaskAreaUnavailable(
+                op_id=operation.id, run_id=operation.run_id or '',
+                task_id=request.get('task_id'),
+                zone_name=request.get('zone_name') or '',
+                business_day=request.get('business_day') or '',
+                reason=request.get('reason') or 'area_unavailable')
         raise RuntimeError(f'未知操作类型：{operation.kind}')
 
     def _request_room(self, kind: str, s: Snapshot) -> Optional[int]:
-        if kind in (OP_SELECT, OP_SETTLE):
+        if kind in (OP_SELECT, OP_SETTLE, OP_MARK_AREA):
             return s.run.room_id if s.run is not None else None
         if s.run is not None:
             return s.run.room_id
@@ -979,6 +1035,21 @@ class Core:
                                      if ticket is not None else None),
                 'ticket_business_date': (ticket.business_date
                                          if ticket is not None else None),
+                # 拒绝/不可用后的处置方式取决于**原意图**（自动排序 / 指定 /
+                # 恢复），不能读取可能已经被更新的 Goal。
+                'mode': s.goal.mode,
+                'selection_kind': selection.kind,
+                'start_kind': s.goal.start_kind,
+            })
+        elif kind == OP_MARK_AREA:
+            run = s.run
+            request.update({
+                'run_id': run.id if run is not None else None,
+                'room_id': run.room_id if run is not None else room_id,
+                'task_id': run.task_id if run is not None else None,
+                'zone_name': run.zone_name if run is not None else '',
+                'business_day': run.business_day if run is not None else '',
+                'reason': 'area_unavailable',
             })
         elif kind in (OP_QUERY, OP_STOP):
             request.update({
@@ -1088,10 +1159,13 @@ class Core:
             if not confirmed:
                 self._arm_retry(Scheduler.key(step, OP_QUERY, self._run_id()))
                 return
-            if result.status == STATUS_CLOSED:
+            # 轮播不是本程序的直播，stopLive 也不会结束它；与 closed 同样
+            # 视为"可以进入开播"，否则会在轮播房间上反复下播。
+            if result.status in (STATUS_CLOSED, STATUS_ROUND):
                 self._move_to(STEP_CLOSE_DONE)
                 return
-            # 房间仍在播 → 必须先下播，绝不带着开着的房间进开播。
+            # 房间仍在播（本程序或其他客户端）→ 必须先下播，绝不带着开着的
+            # 房间进开播。
             self._move_to(STEP_CLOSE_STOP)
             return
 
@@ -1121,6 +1195,9 @@ class Core:
                         if self._snapshot.goal.start_kind == START_RESUME
                         else 'new'))
             return
+        if result.outcome == OUTCOME_AREA_UNAVAILABLE:
+            self._record_area_unavailable(op, result)
+            return
         if result.outcome in (OUTCOME_REJECTED, OUTCOME_FACE_VERIFY):
             # 人脸 / 明确非网络拒绝：落到 stopped＋原因，随后走同一条关房收尾；
             # 不假装成功、不留自动开播。网络 unknown **不**走这里（见下）。
@@ -1136,10 +1213,59 @@ class Core:
                     result=(fx.FACT_RESULT_FACE_VERIFY
                             if result.outcome == OUTCOME_FACE_VERIFY
                             else fx.FACT_RESULT_REJECTED),
-                    reason=str(result.detail or ''))
+                    reason=(face_verify_reason(result.detail,
+                                               self._account.uid)
+                            if result.outcome == OUTCOME_FACE_VERIFY
+                            else str(result.detail or '')))
             return
         # 网络不明/超时：不假称成功，随后用查询纠正（乐观值不结算）。
         self._retry_start_by_query()
+
+    def _record_area_unavailable(self, op: Operation,
+                                 result: PlatformResult) -> None:
+        """平台判定分区已不存在/下架。
+
+        - 自动场：标记 Run 待移出（``area_unavailable``），不停止 Goal、不发
+          拒绝事实，随后由 ``_advance`` 先执行不可完成移出，再关房轮转；
+        - 单次/指定/恢复：落 ``stopped + area_unavailable`` 并留一条拒绝事实，
+          不移出任务（用户明确指定的场次由用户处置）。
+        """
+        s = self._snapshot
+        run = s.run
+        request = op.request or {}
+        still_current = s.goal.revision == op.goal_revision
+        auto_skip = (still_current and run is not None
+                     and request.get('mode') == MODE_TASK
+                     and request.get('selection_kind') == SELECT_AUTO
+                     and request.get('start_kind') != START_RESUME
+                     and run.task_id is not None)
+        if auto_skip:
+            run.area_unavailable = True
+            run.area_unavailable_marked = False
+            self._touch()
+            # 不停止 Goal、不发 session_open 事实（避免〔异常〕刷屏）。
+            self._move_to(STEP_CLOSE_QUERY)
+            return
+        self._refuse_start(STOP_AREA_UNAVAILABLE, op.goal_revision)
+        if still_current:
+            self._emit_fact(
+                fx.FACT_SESSION_OPEN, result=fx.FACT_RESULT_REJECTED,
+                reason='该分区已不存在（或已下架）')
+
+    def _on_task_area_mark_result(self, event: TaskAreaMarkResult) -> Result:
+        op = self._operation
+        if op is None or op.kind != OP_MARK_AREA or event.operation_id != op.id:
+            return Ignored('old_mark_area_result')
+        self._release_operation(op)
+        run = self._snapshot.run
+        if run is not None and run.id == op.run_id and run.area_unavailable:
+            # 成功与否都视为已受理：失败只记录并继续轮转，不阻塞直播。
+            run.area_unavailable_marked = True
+            if not event.ok:
+                logger.warning('分区不可用任务移出未生效（%s）：继续轮转',
+                               event.reason or 'unknown')
+            self._touch()
+        return Recorded()
 
     def _refuse_start(self, reason: str, op_revision: int) -> None:
         """开播被拒/需人脸：只在仍属于当前意图时落停止目标，且绝不跳过关房核对。"""
@@ -1169,7 +1295,7 @@ class Core:
 
         - 未确认（unknown/超时）→ 显示回最后可信检查点、暂停外推；区间锚点**保留**，
           同一场后来确认仍在播时按它补接（未知本身不证明区间已结束）；
-        - 明确 closed → 截掉未确认尾段；
+        - 明确 closed / 平台轮播（``live_status=2``）→ 截掉未确认尾段；
         - ``live`` 缺/非法 ``area_id`` → 按普通 unknown，不新造"分区缺失状态"；
         - ``live`` 错分区 → 截尾：绝不借外部房间或错误分区给原 Run 补时；
         - ``live`` 且分区正确 → 用**同一份** :class:`PlatformClock` 校准（未知之后
@@ -1182,7 +1308,7 @@ class Core:
         if not confirmed:
             run.clock.suspend_projection()
             return
-        if result.status == STATUS_CLOSED:
+        if result.status in (STATUS_CLOSED, STATUS_ROUND):
             run.clock.discard_unconfirmed_tail()
             return
         if result.status == STATUS_LIVE:
@@ -1221,6 +1347,9 @@ class Core:
         if result.status == STATUS_CLOSED:
             self._on_closed_observation(run, step)
             return
+        if result.status == STATUS_ROUND:
+            self._on_round_observation(run)
+            return
         if result.status == STATUS_LIVE:
             if result.area_id is None or int(result.area_id) <= 0:
                 # 缺/非法分区按普通 unknown（时钟已在上面暂停）。
@@ -1251,6 +1380,20 @@ class Core:
         self._scheduler.cancel_target(run.id)
         self._note_platform_close()
         # 停止目标由 advance 收尾；运行目标下从这里回到既有的 open 步骤。
+        self._move_to(STEP_OPEN)
+
+    def _on_round_observation(self, run: Run) -> None:
+        """平台轮播不是本程序的直播：按 closed 处理，直接按原目标重开。
+
+        ``live_status=2`` 是平台明确返回的合法状态，不能当成 ordinary unknown
+        空转重查。它也不是**本程序**的直播，不能进入在播计费；但平台的轮播状态
+        不会因为 stopLive 而结束（实测会一直停在 2），而 startLive 可以直接接管
+        轮播房间（旧控制器的既有行为）。因此这里与 closed 同路：截尾、撤预约、
+        按原 Run/目标重新开播，绝不把它当成"房间还开着"去反复下播。
+        """
+        run.clock.discard_unconfirmed_tail()
+        self._scheduler.cancel_target(run.id)
+        self._note_platform_close()
         self._move_to(STEP_OPEN)
 
     def _on_wrong_area_observation(self, run: Run) -> None:

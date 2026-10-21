@@ -207,6 +207,7 @@ const SOURCE_LABELS: Record<string, string> = {
   import: '导入',
   auto: '自动结算',
   negative_priority: '规则移出',
+  area_unavailable: '分区不可用移出',
   migration: '现状收录',
   legacy_observed: '历史迁移',
   mark_done: '人工标记',

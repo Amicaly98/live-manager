@@ -243,7 +243,7 @@ function getBackendCommand(): { cmd: string; args: string[] } {
  * 旧版 spawn 未设 cwd → 数据落在进程工作目录（安装根）；另含 resources
  * 目录作为兜底候选。只传"存在且含已知旧数据文件"的目录。
  *
- * 阶段 3 A 包：安装器（build/installer.nsh 的 customInit）在**覆盖安装清空安装根
+ * 阶段 3 A 包：安装器（build/installer.nsh 的 customCheckAppRunning）在**覆盖安装清空安装根
  * 目录之前**，把旧数据复制到 `<appData>/<应用名>/legacy-rescue`。这里把它也作为
  * 候选交给后端，走的就是同一条既有迁移/接管链，没有第二套入口。
  *
@@ -641,7 +641,7 @@ function setupIPC(): void {
     try {
       const result = await autoUpdater.checkForUpdatesAndNotify()
       return {
-        updateAvailable: !!result?.updateInfo,
+        updateAvailable: result?.isUpdateAvailable === true,
         currentVersion: app.getVersion(),
         latestVersion: result?.updateInfo?.version || app.getVersion(),
       }
@@ -706,10 +706,10 @@ async function initializeAfterReady(): Promise<void> {
     autoUpdater.on('update-available', (info) => console.log('[Update] 发现新版本:', info.version))
     autoUpdater.on('update-not-available', () => console.log('[Update] 已是最新版本'))
     autoUpdater.on('download-progress', (p) => console.log(`[Update] 下载进度: ${Math.round(p.percent)}%`))
-    autoUpdater.on('update-downloaded', () => {
+    autoUpdater.on('update-downloaded', (info) => {
       console.log('[Update] 更新已下载，将在退出时安装')
       if (mainWindow) {
-        mainWindow.webContents.send('update-downloaded', { version: autoUpdater.currentVersion })
+        mainWindow.webContents.send('update-downloaded', { version: info.version })
       }
     })
     autoUpdater.on('error', (err) => console.error('[Update] 更新错误:', err.message))

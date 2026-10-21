@@ -217,7 +217,7 @@ B 包的实测（`smoke-r6` 内）：2.13c 本次是**真中断**
 | `probe_reopen_during_rescue.py`（R3 那组） | **写者被保护挡住**：它的第二阶段写者在"主库已复制、保护未释放"的闸门处开库失败，探针以异常报告这一点（复核方写明"修后如写者被保护挡住…应按该安全出口验证"，不要求保持旧形状） |
 
 `smoke-r8`（`--only=legacy,upgrade`）**62/62、`errors: []`**；`smoke-r9`
-（`--only=install,single`）**37/37**。关键判据（`smoke-r8/aggregate.json`）：
+（`--only=install,single`）**37/37**。补记：r9 的 `errors` 还含一条跨场景监视器产生的 `BACKEND DIED`；日志显示它发生在下一场后端启动前，该后端随后正常就绪并退出。不能把 r9 描述成 `errors: []`。这属于采证监视器问题，后续冒烟应按场景重建监视器。关键判据（`smoke-r8/aggregate.json`）：
 `4.02c` 旧库被另一进程持有时安装器 **exit=3**、五份旧资料一份未动；`4.02d` 此刻
 **没有** `legacy-rescue` 也没有 `legacy-rescue-new`/`-old`；`4.03/4.05/4.06` 释放后正常
 升级、保全副本逐字节等于安装前原件、安装根目录里的原件确实已被清掉；`4.14b` 升级后再装
@@ -318,9 +318,11 @@ B 包的实测（`smoke-r6` 内）：2.13c 本次是**真中断**
 构建环境：Node `v22.20.0`（`tools/node-v22.20.0-win-x64`）、Python `3.12.2` +
 PyInstaller `6.19.0`（`F:/python/python.exe`）。三者都记在 `build-manifest.json` 里。
 
-构建时的源码 = 本阶段提交 `26354aa` + 两轮返修的工作树：产物是在**带着这批改动的工作树**
-上构建的（`build-manifest.json` 里 `working_tree_dirty=true`、`commit` 是当时 HEAD
-`efb9f4b`，反映的就是这一点）；提交内容与构建时的源文件逐字相同，此后未再改动产品源码。
+上表最终第三轮 A 包产物是在 `72b26b1` 上带着第三轮安装器修复构建的：对应
+`build-manifest.json` 记录 `working_tree_dirty=true`、`commit=72b26b1`。
+此前写出的 `efb9f4b` 只对应更早的构建，不能作为上表最终产物的提交标识；
+第三轮修复后来收入 `e42c086`，收尾说明截至 `b4e29ca`。本段记录的是当时 1.1.1 候选，
+不代表后续版本的构建来源。
 
 **包内后端 = 本次源码构建**：构建脚本与冒烟各核对一次（`1.03`），哈希与上表一致。
 PyInstaller 的分析图（`backend/build/run/xref-run.html`）里能看到

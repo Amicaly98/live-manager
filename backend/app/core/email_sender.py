@@ -13,8 +13,8 @@ email_sender.py - 推送通知模块
 - **有界资源**：固定 worker + 有界队列，失败只影响通知；同一故障的持续恢复
   事件按事件身份合并，不每轮新建线程。
 - **真实结果**：测试通知返回 disabled/queued/sent/failed，不把排队当投递成功。
-- **确认链接**：token 绑定会话身份（run/room/epoch）、用途与有效期；GET 只预览，
-  显式 POST 才消费；停止或会话更替后旧链接失效。
+- **确认链接**：token 绑定会话身份（run/room/epoch）与用途，默认不限期并持久化
+  到实例数据目录；GET 只预览，显式 POST 才消费；停止或会话更替后旧链接失效。
 """
 
 import html as _html
@@ -161,6 +161,7 @@ class EmailSender:
         self._rate_lock = threading.Lock()
         self._face_verify_tokens: Dict[str, dict] = {}
         self._token_lock = threading.Lock()
+        self._tokens_loaded = False
         self._queue: 'queue.Queue[_NotificationJob]' = queue.Queue(maxsize=self.MAX_QUEUE)
         self._enqueue_lock = threading.Lock()
         self._ordering_lock = threading.Lock()
@@ -1243,10 +1244,92 @@ class EmailSender:
 
     # ---------- 人脸验证远程确认 ----------
 
+    #: 令牌持久化文件名（实例数据目录）。记录里没有 cookie/密钥。
+    _TOKEN_STORE_FILENAME = 'face_verify_tokens.json'
+
+    def _token_store_path(self):
+        """令牌持久化文件；数据目录尚未显式初始化时返回 ``None``（仅内存）。"""
+        try:
+            from app.core import config as _config
+            if not _config.data_dir_initialized():
+                return None
+            return _config.get_data_path(self._TOKEN_STORE_FILENAME)
+        except Exception:                                 # noqa: BLE001
+            return None
+
+    def _ensure_tokens_loaded_locked(self) -> None:
+        """首次访问时把磁盘上的令牌合并进内存（调用方必须持有 ``_token_lock``）。
+
+        文件缺失视为空表；损坏时记一次 ERROR 并从空表开始（不阻塞确认流程）。
+        只丢弃**明确带过期时间**且已过期的记录——无限期令牌原样保留。
+        """
+        if self._tokens_loaded:
+            return
+        path = self._token_store_path()
+        if path is None:
+            return                    # 数据目录尚不可用：本次仅内存工作
+        self._tokens_loaded = True
+        try:
+            raw = json.loads(Path(path).read_text(encoding='utf-8'))
+        except FileNotFoundError:
+            return
+        except Exception as exc:                          # noqa: BLE001
+            logger.error('人脸确认令牌文件不可用，按空表继续：%s（%s）', exc, path)
+            return
+        tokens = raw.get('tokens') if isinstance(raw, dict) else None
+        if not isinstance(tokens, dict):
+            logger.error('人脸确认令牌文件结构非法，按空表继续：%s', path)
+            return
+        now = time.time()
+        for key, record in tokens.items():
+            if not isinstance(key, str) or not isinstance(record, dict):
+                continue
+            expires_at = record.get('expires_at')
+            if expires_at is not None and expires_at <= now:
+                continue
+            self._face_verify_tokens[key] = dict(record)
+
+    def _persist_tokens_locked(self) -> bool:
+        """原子落盘（调用方必须持有 ``_token_lock``）；失败记日志并返回 False。"""
+        path = self._token_store_path()
+        if path is None:
+            return False
+        import tempfile
+        payload = {'version': 1, 'tokens': self._face_verify_tokens}
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp_name = tempfile.mkstemp(
+                prefix=path.name + '.', suffix='.tmp', dir=str(path.parent))
+            try:
+                with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+                    json.dump(payload, fh, ensure_ascii=False)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.replace(tmp_name, path)
+            finally:
+                if os.path.exists(tmp_name):
+                    try:
+                        os.unlink(tmp_name)
+                    except OSError:
+                        pass
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
+            return True
+        except Exception as exc:                          # noqa: BLE001
+            logger.error('人脸确认令牌持久化失败：%s', exc)
+            return False
+
     def issue_face_verify_token(self, run_id: str = '', room_id=None,
                                 epoch: int = None, purpose: str = 'face_verify',
-                                ttl_seconds: int = 3600, **extra) -> str:
-        """签发带身份与有效期的确认 token。
+                                ttl_seconds: Optional[int] = None,
+                                **extra) -> str:
+        """签发带身份与（可选）有效期的确认 token。
+
+        默认**不限期**（``ttl_seconds=None``）：链接在手动确认或被新会话取代前
+        一直有效；显式传入 ``ttl_seconds`` 仍按秒过期（测试与特殊用途）。
+        令牌会持久化到实例数据目录，实例重启后仍可用；一次性消费语义不变。
 
         旧实现只保存 True：没有失效时间、也没绑定会话，于是"发一封新邮件就能
         让上一封失效"，而旧邮件链接又能清掉**新会话**的验证/恢复阻塞状态。
@@ -1254,9 +1337,12 @@ class EmailSender:
         token = uuid.uuid4().hex[:16]
         now = time.time()
         with self._token_lock:
-            # 清理过期 token（不无条件清空：一次发送失败不应废掉上一封有效邮件）
+            self._ensure_tokens_loaded_locked()
+            # 只清理**明确过期**的 token（无限期记录不参与；发送失败不应废掉
+            # 上一封有效邮件）。
             expired = [k for k, v in self._face_verify_tokens.items()
-                       if v.get('expires_at', 0) <= now]
+                       if v.get('expires_at') is not None
+                       and v['expires_at'] <= now]
             for k in expired:
                 self._face_verify_tokens.pop(k, None)
             record = {
@@ -1265,20 +1351,28 @@ class EmailSender:
                 'epoch': epoch,
                 'purpose': purpose,
                 'created_at': now,
-                'expires_at': now + ttl_seconds,
             }
+            if ttl_seconds is not None:
+                record['expires_at'] = now + ttl_seconds
             # 冻结的启动意图（模式/来源/继承进度/分区/task_id/执行日）：确认后
             # 重试必须沿用**当时**的事实，不能由晚到的 worker 重新拼当前状态。
             for key, value in extra.items():
                 if value is not None:
                     record[key] = value
             self._face_verify_tokens[token] = record
+            # 未初始化数据目录的显式旧装配仍允许仅内存令牌。已有数据目录时，
+            # 若落盘失败就不把无法跨重启兑现的令牌暴露到邮件确认链接。
+            if (self._token_store_path() is not None
+                    and not self._persist_tokens_locked()):
+                self._face_verify_tokens.pop(token, None)
+                return ''
         return token
 
     def _token_mismatch(self, info: dict, run_id: str, room_id,
                         epoch) -> str:
         """返回不匹配的原因（'' 表示匹配）。有效期也在这里统一判定。"""
-        if info.get('expires_at', 0) <= time.time():
+        expires_at = info.get('expires_at')
+        if expires_at is not None and expires_at <= time.time():
             return '确认链接已过期'
         if run_id and info.get('run_id') and info['run_id'] != run_id:
             return '该确认链接属于另一个会话，已失效'
@@ -1299,6 +1393,7 @@ class EmailSender:
         都会渲染出可点的按钮，点下去才失败。
         """
         with self._token_lock:
+            self._ensure_tokens_loaded_locked()
             info = self._face_verify_tokens.get(token)
             if not info:
                 return None
@@ -1312,6 +1407,7 @@ class EmailSender:
                                      ) -> Tuple[bool, str, Optional[dict]]:
         """消费并**连同冻结意图一起返回**（确认后的重试要用它）。"""
         with self._token_lock:
+            self._ensure_tokens_loaded_locked()
             info = self._face_verify_tokens.get(token)
             if info is None:
                 return False, 'token 不存在或已被使用', None
@@ -1319,9 +1415,17 @@ class EmailSender:
             reason = self._token_mismatch(frozen, run_id, room_id, epoch)
             if reason:
                 self._face_verify_tokens.pop(token, None)
+                self._persist_tokens_locked()
                 return False, reason, None
-            # 消费：只在这里删除，保证并发双击也至多生效一次
+            # 消费：只在这里删除，保证并发双击也至多生效一次。
+            # 先落盘再返回成功：进程此刻崩溃也不会让同一链接被重放。
             self._face_verify_tokens.pop(token, None)
+            if (self._token_store_path() is not None
+                    and not self._persist_tokens_locked()):
+                # 持久化失败时磁盘仍保留原令牌；在同一锁内恢复内存事实，
+                # 保证本次失败后可重试，且不让 API 误执行控制确认。
+                self._face_verify_tokens[token] = frozen
+                return False, '确认消费未能持久化，请重试', None
             return True, 'ok', frozen
 
     def consume_face_verify_token(self, token: str,
@@ -1329,31 +1433,12 @@ class EmailSender:
                                   epoch: int = None) -> Tuple[bool, str]:
         """POST 才消费：原子取出，且身份/有效期不匹配一律拒绝。
 
-        返回 (ok, reason)。旧链接不得清掉新会话的状态——run_id/room/epoch
-        任一不匹配即视为失效。
+        返回 (ok, reason)。与 ``consume_face_verify_token_ex`` 共用同一份
+        校验与消费实现（含持久化），避免两处规则漂移。
         """
-        now = time.time()
-        with self._token_lock:
-            info = self._face_verify_tokens.get(token)
-            if info is None:
-                return False, 'token 不存在或已被使用'
-            if info.get('expires_at', 0) <= now:
-                self._face_verify_tokens.pop(token, None)
-                return False, '确认链接已过期'
-            if run_id and info.get('run_id') and info['run_id'] != run_id:
-                self._face_verify_tokens.pop(token, None)
-                return False, '该确认链接属于另一个会话，已失效'
-            if room_id is not None and info.get('room_id') is not None \
-                    and info['room_id'] != room_id:
-                self._face_verify_tokens.pop(token, None)
-                return False, '该确认链接属于另一个直播间，已失效'
-            if epoch is not None and info.get('epoch') is not None \
-                    and int(info['epoch']) != int(epoch):
-                self._face_verify_tokens.pop(token, None)
-                return False, '该确认链接的控制代际已过期，已失效'
-            # 消费：只在这里删除，保证并发双击也至多生效一次
-            self._face_verify_tokens.pop(token, None)
-            return True, 'ok'
+        ok, reason, _info = self.consume_face_verify_token_ex(
+            token, run_id=run_id, room_id=room_id, epoch=epoch)
+        return ok, reason
 
     #: 验证阶段 → 用户可读的阶段标题。一个验证事实一封、阶段措辞与真实处置
     #: 一致（2026-09-21 N2：旧正文固定写"开播需要人脸验证"，查询提示与恢复
@@ -1401,8 +1486,10 @@ class EmailSender:
         lines = [self._event_time_line(when),
                  f'{zone}：{stage_label}。' if zone else f'{stage_label}。',
                  '', '请先打开 B 站验证页面：', verify_url]
-        if host_usable:
+        confirm_url = ''
+        if host_usable and token:
             confirm_url = self._confirm_url(token, server_host=server_host)
+        if confirm_url:
             lines += ['', '验证后打开以下链接，点击“验证完成”：',
                       confirm_url]
         else:
@@ -1416,7 +1503,7 @@ class EmailSender:
         if defer_notification:
             return {
                 'verify_url': verify_url,
-                'confirm_url': confirm_url if host_usable else '',
+                'confirm_url': confirm_url,
             }
         return self.notify_event(
             EVENT_ACTION_REQUIRED,

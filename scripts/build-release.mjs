@@ -153,7 +153,16 @@ function main() {
   log(`[env] python = ${pyExe} (${pyVer}, PyInstaller ${piVer})`);
 
   // ---------- 源码提交 ----------
-  const git = (args) => String(spawnSync('git', args, { cwd: ROOT, encoding: 'utf8' }).stdout || '').trim();
+  const git = (args) => {
+    const result = spawnSync('git', ['-c', `safe.directory=${ROOT}`, ...args], {
+      cwd: ROOT, encoding: 'utf8', windowsHide: true,
+    });
+    if (result.error || result.status !== 0) {
+      fail(`无法读取构建源码信息（git ${args.join(' ')}）：` +
+        String(result.error?.message || result.stderr || `exit=${result.status}`).trim());
+    }
+    return String(result.stdout || '').trim();
+  };
   const commit = git(['rev-parse', 'HEAD']);
   const branch = git(['rev-parse', '--abbrev-ref', 'HEAD']);
   const dirty = git(['status', '--porcelain']).length > 0;
@@ -174,6 +183,7 @@ function main() {
   }
 
   const manifest = {
+    version: APP_VERSION,
     built_at: new Date().toISOString(),
     branch,
     commit,

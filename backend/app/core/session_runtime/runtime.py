@@ -44,6 +44,7 @@ from ..session.events import (
     Rejected,
     SelectionResult,
     StartReservationResult,
+    TaskAreaMarkResult,
     TasksChanged,
     UserConfirmation,
     UserGoal,
@@ -69,7 +70,7 @@ _MAX_IDLE_SPINS = 20_000
 UNSUPPORTED_NAMED_TICKET = '指定任务确认票据无效或已过期'
 
 _PLATFORM_EFFECTS = (fx.StartPlatform, fx.StopPlatform, fx.QueryPlatform)
-_DATA_EFFECTS = (fx.SelectTask, fx.SettleTask)
+_DATA_EFFECTS = (fx.SelectTask, fx.SettleTask, fx.MarkTaskAreaUnavailable)
 _MEDIA_EFFECTS = (fx.SyncPusher, fx.ReclaimPusher)
 
 logger = logging.getLogger(__name__)
@@ -644,6 +645,12 @@ class Runtime:
             return self._task_port.select(job)
         if isinstance(effect, fx.SettleTask):
             return self._task_port.settle(job)
+        if isinstance(effect, fx.MarkTaskAreaUnavailable):
+            marker = getattr(self._task_port, 'mark_area_unavailable', None)
+            if marker is None:
+                return TaskAreaMarkResult(operation_id=effect.op_id, ok=False,
+                                          reason='task_port_unavailable')
+            return marker(effect)
         raise UnexpectedEffect(f'工作者不认识的效果：{effect!r}')
 
     def _take_media(self, timeout: float) -> Optional[Any]:
@@ -856,6 +863,9 @@ def _failure_event(effect: Any, exc: BaseException) -> Optional[Any]:
                                reason=reason, business_day=effect.business_day)
     if isinstance(effect, fx.SettleTask):
         return LedgerResult(operation_id=effect.op_id, ok=False, detail=reason)
+    if isinstance(effect, fx.MarkTaskAreaUnavailable):
+        return TaskAreaMarkResult(operation_id=effect.op_id, ok=False,
+                                  reason=reason)
     return None
 
 

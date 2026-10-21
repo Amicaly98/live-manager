@@ -19,11 +19,13 @@ from typing import Any, Optional
 OUTCOME_OK = 'ok'                         # 平台业务成功
 OUTCOME_REJECTED = 'rejected'             # 明确的非网络拒绝（1B 接入）
 OUTCOME_FACE_VERIFY = 'face_verify'       # 平台要求人脸验证（1B 接入）
+OUTCOME_AREA_UNAVAILABLE = 'area_unavailable'  # 平台判定分区不存在/已下架
 OUTCOME_UNKNOWN = 'unknown'               # 超时/网络不明；不等于平台没做
 
 # ---- 房间状态观察 ----
 STATUS_LIVE = 'live'
 STATUS_CLOSED = 'closed'
+STATUS_ROUND = 'round'
 STATUS_UNKNOWN = 'unknown'
 
 # ---- 预约种类 ----
@@ -37,6 +39,7 @@ OP_STOP = 'stop'
 OP_START = 'start'
 OP_SELECT = 'select'
 OP_SETTLE = 'settle'
+OP_MARK_AREA = 'mark_area'
 
 
 class Event:
@@ -166,6 +169,15 @@ class StartReservationResult(Event):
     run_id: str
     reason: str
     named_ticket: bool = False
+
+
+@dataclass(frozen=True)
+class TaskAreaMarkResult(Event):
+    """把“分区已不存在/下架”的任务移出不可完成区的执行回执。"""
+
+    operation_id: str
+    ok: bool = False
+    reason: str = ''
 
 
 @dataclass(frozen=True)

@@ -518,11 +518,28 @@ def _resolve_video_base(boundaries: BoundaryOverrides) -> Path:
     return Path(base)
 
 
-def _area_lookup_for(data_dir: Path) -> Callable[[str], Optional[int]]:
-    """分区名 → area_id 的**纯能力**查询（复用运行时分区缓存，不构造旧控制器）。"""
+def _area_index_for(data_dir: Path) -> Callable[[], Dict[str, int]]:
+    """热更新的"名称 → area_id"全量索引（文件变化后自动重读）。"""
     from .area_reader import load_area_index
-    index = load_area_index(data_dir)
-    return lambda zone: index.get(str(zone or '').strip())
+    return lambda: load_area_index(data_dir)
+
+
+def _area_lookup_for(data_dir: Path) -> Callable[[str], Optional[int]]:
+    """分区名 → area_id 的**纯能力**查询（复用运行时分区缓存，不构造旧控制器）。
+
+    每次调用都经 ``load_area_index``（内部按文件签名缓存）——任一实例刷新
+    共享分区列表后，下一次选场即可看到新内容。
+    """
+    index = _area_index_for(data_dir)
+    return lambda zone: index().get(str(zone or '').strip())
+
+
+def _refresh_shared_areas(budget, sender, endpoint_base) -> bool:
+    """在开播被拒后的**同一操作预算**内限频刷新共享分区列表。"""
+    from .area_capability import get_area_loader, new_bilibili_api
+    return get_area_loader().fetch_and_save_areas(
+        new_bilibili_api(), budget=budget,
+        endpoint_base=endpoint_base, sender=sender)
 
 
 def _bind_original_area(*, store, area_lookup) -> str:
@@ -582,6 +599,7 @@ def build_account_instance(*, data_dir: Path, account: AccountContext,
     try:
         store = (account_binding.store if account_binding is not None
                  else SessionStore(data_dir / STATE_FILE))
+        area_index = _area_index_for(data_dir)
         area_lookup = _area_lookup_for(data_dir)
         _bind_original_area(store=store, area_lookup=area_lookup)
         tuning = Tuning(op_budget_seconds=float(boundaries.op_budget_seconds),
@@ -590,11 +608,15 @@ def build_account_instance(*, data_dir: Path, account: AccountContext,
                         close_check_delay_seconds=0.0)
         core = Core(store, clock, account, tuning,
                     push_source_provider=current_push_source)
-        task_port = TaskDataPort(task_manager, store, clock, account,
-                                 area_lookup=area_lookup)
+        task_port = TaskDataPort(
+            task_manager, store, clock, account,
+            area_lookup=area_lookup,
+            area_index=area_index)
         api = BilibiliApi(cookie_file=str(data_dir / 'bili_cookies.json'))
-        platform_port = PlatformHttpPort(api, clock,
-                                         endpoint_base=boundaries.endpoint_base)
+        platform_port = PlatformHttpPort(
+            api, clock, endpoint_base=boundaries.endpoint_base,
+            area_index=area_index,
+            area_refresh=_refresh_shared_areas)
 
         media_instance = MediaInstance(_media_instance_id(data_dir), data_dir)
         owned['media_instance'] = media_instance

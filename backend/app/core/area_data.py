@@ -9,7 +9,9 @@ area_data.py - 分区数据（运行时数据）的落位与读写（服务器�
 本模块确立的规则：
 
 1. 运行时缓存 = ``--data-dir`` 数据目录下的 ``bili_areas_full.json``，
-   每个实例各一份，互不干扰（对应 DATA/实例隔离要求）。
+   每个实例各一份，互不干扰（对应 DATA/实例隔离要求）。部署可以设置
+   ``AREA_CACHE_PATH`` 指向同一个绝对路径，让多个新架构实例**共用一份**
+   分区列表（任一实例刷新即对全体生效）；未设置时保持每实例一份。
 2. 旧位置（仓库根、backend 目录）的同名文件**只作为一次性兼容导入来源**：
    - 仅在目标缓存缺失且旧文件通过结构校验时复制；
    - 复制走"临时文件 + 原子替换"，中断不会留下吃不掉的半截 JSON；
@@ -38,15 +40,41 @@ logger = logging.getLogger(__name__)
 
 AREA_CACHE_FILENAME = "bili_areas_full.json"
 
+#: 部署级覆盖：多个新架构实例共用一份分区列表时，指向同一绝对路径。
+#: 未设置（或为空）时保持"每个实例数据目录各一份"的历史语义。
+AREA_CACHE_PATH_ENV = "AREA_CACHE_PATH"
+
 # 只保护本地缓存读写；网络请求不持锁。
 _IO_LOCK = threading.RLock()
 
 
-def area_cache_path(data_dir=None) -> Path:
-    """运行时分区缓存路径（每实例数据目录内）。
+def _env_area_cache_path() -> Optional[Path]:
+    """``AREA_CACHE_PATH`` 覆盖路径；未设置或为空时返回 ``None``。"""
+    raw = (os.getenv(AREA_CACHE_PATH_ENV) or "").strip()
+    if not raw:
+        return None
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        logger.warning("AREA_CACHE_PATH 不是绝对路径，按当前工作目录解释：%s", path)
+    try:
+        return path.resolve()
+    except (OSError, RuntimeError):
+        return path
 
-    延迟导入 config，避免"config.init 之前就固化路径"。
+
+def area_cache_path(data_dir=None) -> Path:
+    """运行时分区缓存路径。
+
+    优先级：``AREA_CACHE_PATH`` 环境变量（多实例共享一份）＞ 显式
+    ``data_dir``（每实例一份）＞ 本进程配置的数据目录。延迟导入 config，
+    避免"config.init 之前就固化路径"。
+
+    注意：进程环境中设置了覆盖时，显式传入的 ``data_dir`` 也会被忽略——
+    这是部署级选择，不是每实例选项。
     """
+    override = _env_area_cache_path()
+    if override is not None:
+        return override
     from app.core.config import get_data_path
     if data_dir is not None:
         return Path(data_dir) / AREA_CACHE_FILENAME
@@ -252,7 +280,6 @@ def import_legacy_cache(target: Optional[Path] = None,
             actions.append((str(src), f"failed_{err}"))
             logger.warning("导入旧分区表失败：%s（%s）", src, err)
     return actions
-
 
 # ==================== 桌面适配点：打包种子分区表 ====================
 # Desktop build input compatibility: seed data lives in the packaged bundle and

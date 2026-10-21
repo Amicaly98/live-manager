@@ -24,6 +24,8 @@ function loadMain({
   holdCleanup = false,
   initialOwner = false,
   stopResults = [],
+  development = true,
+  updateCheckResult = null,
 }) {
   const calls = {
     whenReady: 0,
@@ -34,6 +36,7 @@ function loadMain({
     fetch: [],
     spawn: 0,
     dialogs: [],
+    rendererEvents: [],
   };
   const listeners = new Map();
   const ipcHandlers = new Map();
@@ -113,7 +116,7 @@ function loadMain({
       this.webContents = {
         openDevTools() {},
         setWindowOpenHandler() {},
-        send() {},
+        send(...args) { calls.rendererEvents.push(args); },
       };
     }
     loadURL() {}
@@ -158,12 +161,13 @@ function loadMain({
     Notification: class { show() {} },
   };
 
+  const updateListeners = new Map();
   const autoUpdater = {
     autoDownload: false,
     autoInstallOnAppQuit: false,
     currentVersion: '1.1.0-test',
-    on() {},
-    async checkForUpdatesAndNotify() { return null; },
+    on(name, callback) { updateListeners.set(name, callback); },
+    async checkForUpdatesAndNotify() { return updateCheckResult; },
   };
 
   const fakeFs = {
@@ -223,7 +227,7 @@ function loadMain({
     process: {
       platform: 'win32',
       argv: [],
-      env: { NODE_ENV: 'development' },
+      env: { NODE_ENV: development ? 'development' : 'production' },
       resourcesPath: 'C:\\synthetic\\desktop\\resources',
     },
     console: { log() {}, error() {}, warn() {} },
@@ -239,6 +243,12 @@ function loadMain({
     app,
     calls,
     lifecycle: lifecycleInstance,
+    autoUpdater,
+    emitUpdate(name, ...args) {
+      const handler = updateListeners.get(name);
+      assert.ok(handler, `missing update event: ${name}`);
+      handler(...args);
+    },
     async invoke(name, ...args) {
       const handler = ipcHandlers.get(name);
       assert.ok(handler, `missing IPC handler: ${name}`);
@@ -328,4 +338,35 @@ test('E1/E2: unknown port blocks startup without HTTP shutdown or child spawn', 
   assert.equal(harness.calls.fetch.length, 0, 'foreign port must not receive /api/shutdown');
   assert.equal(harness.calls.quit, 1);
   assert.equal(harness.calls.dialogs.length, 1);
+});
+
+test('update check distinguishes the available flag from latest-version metadata', async () => {
+  for (const available of [false, true]) {
+    const harness = loadMain({
+      lock: true, development: false,
+      updateCheckResult: { isUpdateAvailable: available, updateInfo: { version: '1.2.0' } },
+    });
+    await flushMicrotasks();
+    const result = await harness.invoke('check-for-updates');
+    assert.equal(result.updateAvailable, available);
+    assert.equal(result.latestVersion, '1.2.0');
+  }
+});
+
+test('downloaded update reports its version and waits for managed app exit', async () => {
+  const harness = loadMain({ lock: true, development: false });
+  await flushMicrotasks();
+  harness.emitUpdate('update-downloaded', { version: '1.2.0' });
+  assert.equal(harness.calls.rendererEvents.length, 1);
+  assert.equal(harness.calls.rendererEvents[0][0], 'update-downloaded');
+  assert.equal(harness.calls.rendererEvents[0][1].version, '1.2.0');
+  assert.equal(harness.autoUpdater.autoInstallOnAppQuit, true);
+  assert.equal(harness.calls.quit, 0, 'download alone must not bypass backend cleanup');
+  const exit = { prevented: false, preventDefault() { this.prevented = true; } };
+  harness.app.emit('before-quit', exit);
+  await flushMicrotasks();
+  assert.equal(exit.prevented, true);
+  assert.equal(harness.calls.stop.length, 1);
+  assert.equal(harness.calls.stop[0].stopPlatform, false);
+  assert.equal(harness.calls.quit, 1);
 });

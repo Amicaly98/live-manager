@@ -56,26 +56,8 @@
               <div class="form-tip">每隔多少秒检查一次直播状态</div>
             </el-form-item>
 
-            <el-form-item label="直播间异常重试">
-              <el-input-number
-                :model-value="settingsStore.settings.max_reconnect"
-                @update:model-value="(v: number | undefined) => settingsStore.updateField('max_reconnect', v ?? 3)"
-                :min="1"
-                :max="10"
-              />
-              <span class="unit">次/小时</span>
-              <div class="form-tip">直播间状态异常时 1 小时内最多重试次数</div>
-            </el-form-item>
-            <el-form-item label="重试冷却时间">
-              <el-input-number
-                :model-value="settingsStore.settings.live_retry_cooldown_minutes"
-                @update:model-value="(v: number | undefined) => settingsStore.updateField('live_retry_cooldown_minutes', v ?? 60)"
-                :min="10"
-                :max="360"
-                :step="10"
-              />
-              <span class="unit">分钟</span>
-              <div class="form-tip">重试次数耗尽后冷却时间</div>
+            <el-form-item label="断线自动恢复">
+              <div class="form-tip">网络中断时后台持续重试，不限制次数；平台明确拒绝或要求验证时暂停并通知。可随时手动停止。</div>
             </el-form-item>
           </el-form>
         </el-card>
@@ -283,25 +265,28 @@
 
               <el-form-item label="通知事件">
                 <el-checkbox :model-value="settingsStore.settings.email_notify_start"
-                  @update:model-value="(v: any) => settingsStore.updateField('email_notify_start', v)">开播</el-checkbox>
+                  @update:model-value="(v: any) => settingsStore.updateField('email_notify_start', v)">开播与继续</el-checkbox>
                 <el-checkbox :model-value="settingsStore.settings.email_notify_stop"
-                  @update:model-value="(v: any) => settingsStore.updateField('email_notify_stop', v)">停播</el-checkbox>
+                  @update:model-value="(v: any) => settingsStore.updateField('email_notify_stop', v)">停止结果</el-checkbox>
                 <el-checkbox :model-value="settingsStore.settings.email_notify_complete"
-                  @update:model-value="(v: any) => settingsStore.updateField('email_notify_complete', v)">任务完成</el-checkbox>
+                  @update:model-value="(v: any) => settingsStore.updateField('email_notify_complete', v)">任务结算与轮转</el-checkbox>
                 <el-checkbox :model-value="settingsStore.settings.email_notify_error"
-                  @update:model-value="(v: any) => settingsStore.updateField('email_notify_error', v)">异常告警</el-checkbox>
+                  @update:model-value="(v: any) => settingsStore.updateField('email_notify_error', v)">故障恢复与需处理</el-checkbox>
                 <el-checkbox :model-value="settingsStore.settings.email_daily_summary"
                   @update:model-value="(v: any) => settingsStore.updateField('email_daily_summary', v)">每日简报</el-checkbox>
                 <el-checkbox
-                  v-if="settingsStore.settings.notification_channel === 'email' || settingsStore.settings.notification_channel === 'both'"
                   :model-value="settingsStore.settings.email_notify_ffmpeg_retry === true"
                   @update:model-value="(v: any) => settingsStore.updateField('email_notify_ffmpeg_retry', Boolean(v))"
-                >本地 FFmpeg 短断流</el-checkbox>
+                >本地 FFmpeg 短断流重试</el-checkbox>
               </el-form-item>
-              <div
-                v-if="settingsStore.settings.notification_channel === 'email' || settingsStore.settings.notification_channel === 'both'"
-                class="form-tip"
-              >默认关闭；开启后接收本地 FFmpeg 短断流邮件通知。</div>
+              <div class="form-tip notification-event-tip">
+                邮件主题按结果分为 [开播]、[轮转]、[停止]、[恢复]、[异常]、[简报]、[人脸]、[测试]。
+                人脸验证与需处理异常共用“故障恢复与需处理”开关，任务结算和下一任务的轮转结果合并通知；持续重试过程不逐次推送。
+              </div>
+              <div class="form-tip notification-event-tip">
+                FFmpeg 短断流重试默认关闭，并受“故障恢复与需处理”开关约束；开启后每轮故障最多通知一次。
+                连续 5 次快速退出仍按需处理异常通知。事件开关对所选推送渠道共同生效。
+              </div>
               <el-form-item label="人脸确认">
                 <div class="form-tip">请在运行本程序的电脑上确认，也可在面板确认。</div>
               </el-form-item>
@@ -312,7 +297,7 @@
               </el-form-item>
             </el-form>
           </template>
-          <div v-else style="color:#909399;padding:12px 0">开启后可接收开播/停播/异常通知和每日简报</div>
+          <div v-else style="color:#909399;padding:12px 0">开启后可接收直播结果、任务轮转、恢复与异常通知和每日简报</div>
         </el-card>
 
         <!-- 版本更新 -->
@@ -321,7 +306,7 @@
             <div class="form-header"><span>版本更新</span></div>
           </template>
           <div class="update-info">
-            <p>当前版本：{{ appVersion }}</p>
+            <p>当前版本：{{ appVersion || '读取中' }}</p>
             <el-button @click="checkUpdate" :loading="checkingUpdate">
               检查更新
             </el-button>
@@ -332,7 +317,7 @@
         <el-card shadow="never" style="margin-top: 16px;">
           <template #header><span>关于</span></template>
           <div class="about-info">
-            <p>直播控制系统 v1.0.0</p>
+            <p>直播控制系统{{ appVersion ? ` v${appVersion}` : '' }}</p>
             <p>前端：Vue 3 + Element Plus</p>
             <p>后端：Python FastAPI</p>
             <p>桌面壳：Electron</p>
@@ -377,7 +362,9 @@ async function checkVideos() {
     const req = useRequest()
     const res = await req.get<{ has_videos: boolean }>('/api/settings/check-videos')
     hasVideos.value = res.has_videos
-  } catch { hasVideos.value = false }
+  } catch {
+    // 诊断读取失败不等于目录没有视频，保留上次或默认结论。
+  }
 }
 onMounted(() => { checkVideos(); fetchRtmpCode() })
 
@@ -477,7 +464,7 @@ async function selectDirectory() {
 
 // ==================== 版本更新 ====================
 const isElectron = computed(() => !!window.electronAPI)
-const appVersion = ref('1.0.0')
+const appVersion = ref('')
 const checkingUpdate = ref(false)
 const updateMsg = ref('')
 
@@ -580,4 +567,15 @@ onUnmounted(() => {
 }
 .update-info p { color: #606266; }
 .update-msg { color: #00a1d6; font-size: 13px; }
+@media (max-width: 768px) {
+  .main-content { padding: 72px 12px 24px; }
+  .settings-form { width: 100%; min-width: 0; }
+  .settings-form :deep(.el-form-item__label) {
+    display: block;
+    text-align: left;
+    padding-bottom: 4px;
+  }
+  .settings-form :deep(.el-form-item) { display: flex; flex-direction: column; }
+  .settings-form :deep(.el-form-item__content) { margin-left: 0 !important; }
+}
 </style>

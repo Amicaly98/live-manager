@@ -48,6 +48,7 @@ STOP_USER = 'user'
 STOP_TARGET_REACHED = 'target_reached'
 STOP_FACE_VERIFY = 'face_verify'
 STOP_PLATFORM_REJECTED = 'platform_rejected'
+STOP_AREA_UNAVAILABLE = 'area_unavailable'
 STOP_ACCOUNT_EXIT = 'account_exit'
 STOP_SELECTION_REJECTED = 'selection_rejected'
 
@@ -412,6 +413,10 @@ class Run:
     settlement_guard: Optional[int] = None
     # 取数时的版本来源，仅供首次指定任务 Start 复核；不是恢复时的授权票据。
     task_source_revision: Optional[int] = None
+    #: 平台判定本场分区已不存在/下架：先完成“不可完成移出”，再关房轮转。
+    #: ``*_marked`` 记录这条任务事实已被执行层受理（幂等；重启可重发）。
+    area_unavailable: bool = False
+    area_unavailable_marked: bool = False
     clock: PlatformClock = field(default_factory=PlatformClock)
     end: Optional[EndDecision] = None
 
@@ -442,6 +447,8 @@ class Run:
                                  else int(self.settlement_guard)),
             'task_source_revision': (None if self.task_source_revision is None
                                      else int(self.task_source_revision)),
+            'area_unavailable': bool(self.area_unavailable),
+            'area_unavailable_marked': bool(self.area_unavailable_marked),
             'clock': self.clock.to_dict(),
             'end': self.end.to_dict() if self.end else None,
         }
@@ -466,6 +473,9 @@ class Run:
             settlement_guard=(None if guard is None else _i(guard, 0)),
             task_source_revision=(None if source_revision is None
                                   else _i(source_revision, -1)),
+            area_unavailable=bool(data.get('area_unavailable', False)),
+            area_unavailable_marked=bool(
+                data.get('area_unavailable_marked', False)),
             clock=PlatformClock.from_dict(data.get('clock') or {}),
             end=EndDecision.from_dict(end) if isinstance(end, dict) else None,
         )

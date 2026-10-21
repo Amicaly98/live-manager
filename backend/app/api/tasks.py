@@ -14,7 +14,7 @@ import time
 import uuid
 from typing import Optional, List
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, date
 from concurrent.futures import ThreadPoolExecutor
 from fastapi import APIRouter, HTTPException, Query, UploadFile, File, Request, Header
 from fastapi.responses import FileResponse
@@ -29,6 +29,7 @@ from app.models.schemas import (
     ImportResult, ExportResult,
 )
 from app.core.task_manager import TaskMutationRejected
+from app.core.session_runtime.area_reader import load_area_index
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -237,22 +238,25 @@ def _reject_mutation(exc: TaskMutationRejected) -> HTTPException:
 @router.get('', summary='获取任务列表')
 async def get_tasks():
     tm = _require_current_task_manager()
+    business_date = _business_day()
     revision, _rows = tm.get_snapshot()
     tasks = tm.get_tasks_as_list()
-    stats = tm.get_stats()
+    stats = tm.get_stats(as_of=date.fromisoformat(business_date))
     # business_date：客户端把它连同 task_id 一起回传，"标记今日完成"才带上
     # 渲染时的业务日——否则响应丢失后的重放会在次日把新的一天记成完成。
     return {'tasks': tasks, 'revision': revision,
-            'business_date': _business_day(), **stats}
+            'business_date': business_date, **stats}
 
 
 @router.get('/detail', summary='获取任务详情列表')
 async def get_tasks_detail():
     tm = _require_current_task_manager()
+    business_date = _business_day()
     revision, _rows = tm.get_snapshot()
     tasks = tm.get_tasks_detail()
-    stats = tm.get_stats()
-    return {'tasks': tasks, 'revision': revision, **stats}
+    stats = tm.get_stats(as_of=date.fromisoformat(business_date))
+    return {'tasks': tasks, 'revision': revision,
+            'business_date': business_date, **stats}
 
 
 @router.get('/next', summary='获取下一个待执行任务')
@@ -276,9 +280,10 @@ async def get_task_stats():
     不必把整个任务列表按秒轮询（也不把慢查询压在 live 状态上）。
     """
     tm = _require_current_task_manager()
+    business_date = _business_day()
     revision, _rows = tm.get_snapshot()
-    return {**tm.get_stats(), 'revision': revision,
-            'business_date': _business_day()}
+    return {**tm.get_stats(as_of=date.fromisoformat(business_date)),
+            'revision': revision, 'business_date': business_date}
 
 
 # ==================== CRUD ====================
@@ -514,6 +519,17 @@ async def update_task(zone_name: str, task: TaskUpdate, request: Request):
     return await _run_write(frozen, _update_task_sync, zone_name, task)
 
 
+def _area_state_for_task_edit(zone_name: str):
+    """“改为待完成”时的分区校验：True=存在，False=不存在，None=列表不可用。"""
+    try:
+        index = load_area_index()
+    except Exception:                                     # noqa: BLE001
+        return None
+    if not index:
+        return None
+    return str(zone_name or '').strip() in index
+
+
 def _update_task_sync(zone_name: str, task: TaskUpdate, frozen=None):
     frozen = _frozen_or_current(frozen)
     """更新任务。
@@ -535,7 +551,8 @@ def _update_task_sync(zone_name: str, task: TaskUpdate, frozen=None):
     try:
         ok = tm.update_task_fields(
             zone_name, payload, task_id=task_id,
-            rename_to=new_zone if task_id is not None else None)
+            rename_to=new_zone if task_id is not None else None,
+            area_state=_area_state_for_task_edit)
     except TaskMutationRejected as exc:
         raise _reject_mutation(exc)
     if not ok:

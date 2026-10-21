@@ -61,6 +61,8 @@ export const useTaskStore = defineStore('tasks', () => {
   const tasksRevision = ref(-1)
   /** 列表渲染时的业务日：写请求带上它，重放才不会作用到次日。 */
   const businessDate = ref('')
+  /** 最近一次编辑失败的服务端原因（如“分区已不存在，不能改为待完成”）。 */
+  const lastUpdateError = ref('')
 
   const request = useRequest()
   // 任务列表是受保护读取的**唯一数据所有者**：认证意图不允许时（未登录 /
@@ -285,6 +287,7 @@ export const useTaskStore = defineStore('tasks', () => {
           remaining_time: res.remaining_time,
           avg_remaining: res.avg_remaining,
           urgency: res.urgency,
+          schedule_margin: res.schedule_margin,
         }
       } catch (error) {
         // 已作废/已被取代/已换账号（含被取消）：不写回、**不恢复缓存**
@@ -381,6 +384,7 @@ export const useTaskStore = defineStore('tasks', () => {
         remaining_time: res.remaining_time,
         avg_remaining: res.avg_remaining,
         urgency: res.urgency,
+        schedule_margin: res.schedule_margin,
       }
     } catch (error) {
       if (generation === _readGeneration) console.error('获取任务详情失败:', error)
@@ -521,6 +525,7 @@ export const useTaskStore = defineStore('tasks', () => {
   async function updateTask(zoneName: string, data: TaskUpdate, taskId?: number,
                             scope?: FrozenWriteScope) {
     const frozen = scope ?? freezeWriteScope()
+    lastUpdateError.value = ''
     try {
       const body = taskId === undefined ? data : { ...data, id: taskId }
       await request.put(`/api/tasks/${encodeURIComponent(zoneName)}`, body,
@@ -530,6 +535,8 @@ export const useTaskStore = defineStore('tasks', () => {
       if (writeScopeIsCurrent(frozen)) await fetchTasks({ fresh: true })
       return true
     } catch (error) {
+      const e = error as { response?: { data?: { detail?: string } }; message?: string }
+      lastUpdateError.value = e?.response?.data?.detail || e?.message || ''
       console.error('更新任务失败:', error)
       return false
     }
@@ -711,6 +718,7 @@ export const useTaskStore = defineStore('tasks', () => {
     isLoading,
     tasksRevision,
     businessDate,
+    lastUpdateError,
     nextTask,
     fetchTasks,
     refreshTasksIfStale,

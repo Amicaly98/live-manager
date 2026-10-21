@@ -1115,17 +1115,32 @@ class AreaLoader:
         self.area_file = Path(area_file) if area_file else area_file_path()
         self.areas: List[dict] = []
         self._search_cache: dict = {}
+        self._reload_lock = threading.RLock()
+        self._loaded_signature = None
         # 分区可用性状态：loaded / cache_missing / cache_corrupt / cache_invalid /
         # empty_response / invalid_payload / persist_failed / request_failed
         self.status: str = "unloaded"
         self.last_error: str = ""
         self._load_areas()
 
+    @staticmethod
+    def _file_signature(path: Path):
+        try:
+            st = path.stat()
+            return (st.st_mtime_ns, st.st_size, st.st_ino)
+        except OSError:
+            return None
+
     def _load_areas(self):
         from app.core.area_data import read_cache
+        before = self._file_signature(self.area_file)
         areas, reason = read_cache(self.area_file)
         self.areas = areas if isinstance(areas, list) else []
         self.status = reason
+        after = self._file_signature(self.area_file)
+        # 替换若发生在读取期间，不能把读到的快照标记为新文件签名；
+        # 保留读取前签名，让下一次 reload_if_changed 再读一次。
+        self._loaded_signature = before if before != after else after
         if self.areas:
             self.last_error = ""
             logger.info(f" 加载分区数据：{len(self.areas)} 项（{self.area_file}）")
@@ -1134,12 +1149,24 @@ class AreaLoader:
             # 缺/坏都不是致命错误：面板照常启动，在线刷新或人工刷新可补齐
             logger.info(f" 分区数据暂不可用（{reason}）：{self.area_file}")
 
+    def reload_if_changed(self) -> bool:
+        """共享分区文件被其他实例刷新后，本进程无需重启即可看到新内容。"""
+        signature = self._file_signature(self.area_file)
+        with self._reload_lock:
+            if signature == self._loaded_signature:
+                return False
+            self._search_cache.clear()
+            self._load_areas()
+            return True
+
     @property
     def available(self) -> bool:
         return bool(self.areas)
 
     def fuzzy_search(self, keyword: str) -> List[dict]:
         """模糊搜索分区 — 子分区优先，支持拼音首字母检索"""
+        # 共享分区文件可能已被其他实例刷新：先按签名检查，空缓存也能补上。
+        self.reload_if_changed()
         if not keyword or not self.areas:
             return []
         keyword = keyword.lower().strip()
@@ -1192,17 +1219,25 @@ class AreaLoader:
         logger.error(f" 未找到分区：{zone_name}")
         return None
 
-    def fetch_and_save_areas(self, api: BilibiliApi) -> bool:
-        """从 B 站 API 获取最新分区并写入本实例缓存。
+    def fetch_and_save_areas(self, api: BilibiliApi, *, budget=None,
+                             endpoint_base=None, sender=None) -> bool:
+        """从 B 站 API 获取最新分区并写入缓存。
 
         顺序：网络请求（不持 IO 锁）→ 结构校验 → 原子落盘 → 落盘成功后才
         切换内存数据并清搜索缓存。任何一步失败都保留当前可用数据并返回
         False（不返回假成功）。
+
+        ``budget`` 给定时，平台请求走**同一份**有限预算的单轮调用（不重试），
+        供开播被拒后的“限频自动刷新”在既有操作预算内复用。
         """
         from app.core.area_data import (
             validate_api_payload, validate_areas, write_cache)
 
-        success, resp = api.get_areas()
+        if budget is None:
+            success, resp = api.get_areas()
+        else:
+            with api.bounded_attempt(budget, endpoint_base, sender):
+                success, resp = api.get_areas()
         if not success or resp.get('code') != 0:
             self.status = "request_failed"
             self.last_error = str(resp.get('msg', '')) if isinstance(resp, dict) else ""
@@ -1262,6 +1297,7 @@ class AreaLoader:
 
         self.areas = flat
         self._search_cache.clear()  # 清空旧缓存
+        self._loaded_signature = self._file_signature(self.area_file)
         self.status = "loaded"
         self.last_error = ""
         logger.info(f" 成功获取并保存 {len(self.areas)} 个分区 → {self.area_file}")

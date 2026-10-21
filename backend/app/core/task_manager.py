@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 from app.models.schemas import LiveInstruction, Task
 from app.core.db import (
+    HISTORY_SOURCE_AREA,
     HISTORY_SOURCE_IMPORT,
     HISTORY_SOURCE_MIGRATION,
     HISTORY_SOURCE_NEGATIVE,
@@ -32,6 +33,7 @@ from app.core.db import (
     TaskDB,
 )
 from app.core.config import get_data_path
+from app.core.task_margin import calculate_schedule_margin
 
 # 常量
 REQUIRED_COLUMNS = [
@@ -1862,7 +1864,167 @@ class TaskManager:
             "remaining_time": remaining_time,
             "avg_remaining": avg_remaining,
             "urgency": urgency,
+            "schedule_margin": self._schedule_margin_from_rows(rows, today),
         }
+
+    def _schedule_margin_from_rows(self, rows: List[dict], today: date) -> dict:
+        """只读重建当前计划的日初进度；历史与发布行必须属于同一份数据。
+
+        管理器内写者由变更锁隔开，其他连接的写者由 SQLite 读事务隔开。
+        发布行已落后于库时只把新指标标成未知，不拼接两份状态、不补写历史。
+        """
+        unavailable = {
+            'business_date': today.isoformat(), 'hours': None,
+            'bottleneck_date': None, 'bottleneck_days': None,
+            'sufficient': False, 'reason': 'baseline_unavailable',
+        }
+        try:
+            with self._mutation_lock:
+                with self.db.coherent_read() as conn:
+                    current = TaskDB.rows_from_conn(conn)
+                    if TaskDB.fingerprint_rows(current) != TaskDB.fingerprint_rows(rows):
+                        return unavailable
+                    events = [dict(r) for r in conn.execute(
+                        'SELECT h.* FROM task_history h JOIN tasks t '
+                        'ON t.id=h.task_id ORDER BY h.id')]
+                    ledger = [dict(r) for r in conn.execute(
+                        'SELECT l.* FROM task_completion_ledger l JOIN tasks t '
+                        'ON t.id=l.task_id ORDER BY l.id')]
+            history_by_task = {}
+            ledger_by_task = {}
+            for event in events:
+                history_by_task.setdefault(event['task_id'], []).append(event)
+            for entry in ledger:
+                ledger_by_task.setdefault(entry['task_id'], []).append(entry)
+            plan = []
+            for row in rows:
+                projected = self._margin_plan_without_today(
+                    row, history_by_task.get(row['id'], []),
+                    ledger_by_task.get(row['id'], []), today)
+                if projected['category'] <= 0:
+                    continue
+                remaining = projected['total_days'] - projected['days_done']
+                if remaining == 0:
+                    continue
+                try:
+                    deadline = self._parse_deadline(projected['deadline'])
+                except (ValueError, OverflowError):
+                    deadline = None
+                plan.append({'remaining_days': remaining,
+                             'daily_hours': projected['category'],
+                             'deadline': deadline})
+            return calculate_schedule_margin(plan, today)
+        except Exception as exc:
+            logger.warning('日初容错指标不可用（其余统计保留）：%s', exc)
+            return unavailable
+
+    @staticmethod
+    def _margin_plan_without_today(row: dict, events: List[dict],
+                                   ledger: List[dict], today: date) -> dict:
+        """重放实际字段变化，同时省略今天的完成效果；不回退计划参数。
+
+        completed 的业务日只来自账本，不能用入账时刻或历史写入时刻猜。
+        all_done 没有执行日，是当时发生的人工操作，按历史操作日归属。
+        显式改 days_done 是新进度事实，覆盖此前省略的完成；0→0 的参数
+        编辑不覆盖被恢复的每日要求。已移出、删除、替换的计划不复活。
+        """
+        fields = ('category', 'total_days', 'days_done', 'deadline')
+
+        def snapshot(event, side):
+            result = {key: event.get(f'{key}_{side}') for key in fields}
+            if any(value is None for value in result.values()):
+                raise ValueError('完成恢复所需的历史参数不完整')
+            return result
+
+        current = {key: row.get('deadline_raw' if key == 'deadline' else key)
+                   for key in fields}
+        day = today.isoformat()
+        today_ledger = [entry for entry in ledger if entry['business_day'] == day]
+        today_all_done = [event for event in events
+                          if event['event'] == 'all_done'
+                          and str(event.get('at') or '')[:10] == day]
+        # 旧资料只有完成标记而没有账本/前后参数时，不能猜“加回一天”。
+        dated_all_done = any(event['event'] == 'all_done'
+                             and str(event.get('at') or '')[:10] < day
+                             and len(str(event.get('at') or '')) >= 10
+                             for event in events)
+        marked_today = (str(row.get('last_done_date') or '') == day
+                        or (row.get('today_done') == 1
+                            and not row.get('last_done_date')
+                            and not (current['category'] == 0 and dated_all_done)))
+        if not today_ledger and not today_all_done:
+            if marked_today:
+                raise ValueError('今日完成缺少可恢复的账本或历史')
+            return current
+
+        completed = [event for event in events if event['event'] == 'completed']
+        # 两种事实在同一事务追加，按追加顺序从新到旧对齐。迁移资料可能只有
+        # 旧账本和现状 baseline；那些旧账本不要求补齐历史。今天的账本必须找到
+        # 可靠完成事件，而恢复只从今天首个完成的 before 开始，不依赖整份旧史。
+        completion_days = {}
+        cursor = len(completed)
+        for entry in reversed(ledger):
+            matched = None
+            for index in range(cursor - 1, -1, -1):
+                event = completed[index]
+                detail = str(event.get('detail') or '')
+                source = (LEDGER_SOURCE_MANUAL
+                          if event.get('source') == HISTORY_SOURCE_USER
+                          else event.get('source'))
+                if (event.get('days_done_after') == entry['days_done_after']
+                        and event.get('total_days_after') == entry['total_days_after']
+                        and source == entry['source']
+                        and (not detail.startswith('业务日 ')
+                             or detail[4:].strip() == entry['business_day'])):
+                    matched = index
+                    break
+            if matched is None:
+                if entry['business_day'] == day:
+                    raise ValueError('今日完成缺少匹配的前后历史')
+                continue
+            completion_days[completed[matched]['id']] = entry['business_day']
+            cursor = matched
+
+        starts = [index for index, event in enumerate(events)
+                  if completion_days.get(event['id']) == day
+                  or event in today_all_done]
+        if not starts:
+            raise ValueError('今日完成没有前后历史')
+        suffix = events[min(starts):]
+        observed = snapshot(suffix[0], 'before')
+        projected = dict(observed)
+        for event in suffix:
+            before, after = snapshot(event, 'before'), snapshot(event, 'after')
+            if before != observed:
+                raise ValueError('任务历史存在未记录的参数或进度变化')
+            kind = event['event']
+            if kind == 'completed':
+                if event['id'] not in completion_days:
+                    raise ValueError('恢复区间的完成事件缺少可靠执行日')
+                delta = after['days_done'] - before['days_done']
+                if delta != 1 or before['category'] <= 0:
+                    raise ValueError('完成历史缺少可靠的原要求或进度')
+                if completion_days[event['id']] != day:
+                    projected['days_done'] += delta
+                    if (after['category'] == 0
+                            and projected['days_done'] >= projected['total_days']):
+                        projected['category'] = 0
+            elif kind == 'all_done' and str(event.get('at') or '')[:10] == day:
+                pass
+            else:
+                for key in fields:
+                    if before[key] != after[key]:
+                        projected[key] = after[key]
+            # 原公式会把 category=0 的进度补齐。只修正仍真正处于完成态的
+            # 投影，今天完成被省略的任务保持原进度，尤其是完成后改总天数。
+            if projected['category'] == 0:
+                projected['days_done'] = projected['total_days']
+            observed = dict(after)
+            if observed['category'] == 0:
+                observed['days_done'] = observed['total_days']
+        if observed != current:
+            raise ValueError('当前计划与历史末态不一致')
+        return projected
 
     def _capture_daily_snapshot(self, as_of: Optional[date] = None) -> dict:
         """冻结一份简报快照：统计与优先度前 10 项来自同一份行、同一版本。
@@ -2042,6 +2204,50 @@ class TaskManager:
                        f'{before.get("total_days")} 天')
         logger.info(f" 已完成 {len(negative)} 个负优先度任务")
         return len(negative)
+
+    def move_out_area_unavailable(self, task_id: int, business_day: str = '',
+                                  zone_name: str = '',
+                                  reason: str = 'area_unavailable') -> bool:
+        """把“分区不存在/已下架”的任务按负优先度同款规则不可完成移出。
+
+        ``category`` 置 0、``days_done`` 填到 ``total_days``、推进人工进度代数，
+        并留一条 ``moved_out`` 历史（``source=area_unavailable``）。任务记录保留、
+        不删除；选场因此不再命中它。仅在行仍存在、分区名未变、``category > 0``
+        时生效，否则视为 no-op。
+        """
+        if task_id is None:
+            return False
+
+        def mutate(conn):
+            row = conn.execute("SELECT * FROM tasks WHERE id = ?",
+                               (int(task_id),)).fetchone()
+            if row is None:
+                return False
+            before = dict(row)
+            if int(before.get('category') or 0) <= 0:
+                return False
+            current_zone = str(before.get('zone_name') or '')
+            if zone_name and current_zone != str(zone_name):
+                # 选取之后被改名/删除了身份：不猜，留给下一次选场重新判断。
+                return False
+            total = int(before.get('total_days') or 0)
+            now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            conn.execute(
+                "UPDATE tasks SET category = 0, days_done = ?, updated_at = ? "
+                "WHERE id = ?", (total, now, int(task_id)))
+            self.db.bump_progress_guard(conn, int(task_id))
+            after = dict(before)
+            after.update({'category': 0, 'days_done': total})
+            self._record_history(
+                conn, int(task_id), 'moved_out', before=before, after=after,
+                source=HISTORY_SOURCE_AREA,
+                detail=(f'分区「{zone_name or current_zone}」不存在或已下架'
+                        f'（{reason}；业务日 {business_day or "-"}）：不可完成移出；'
+                        f'移出前实际进度 {before.get("days_done")}/'
+                        f'{before.get("total_days")} 天'))
+            return True
+
+        return self._commit_change(mutate)
 
     # ==================== 调度器 ====================
 
@@ -2228,10 +2434,11 @@ class TaskManager:
             remaining_days=row.get('remaining_days', 1),
         )
 
-    def get_stats(self) -> dict:
+    def get_stats(self, as_of: Optional[date] = None) -> dict:
         """获取统计信息（从当前已发布快照计算，与列表/详情/导出同源）。"""
-        return self._compute_stats_from_rows(self.get_snapshot()[1],
-                                             date.today())
+        with self._mutation_lock:
+            return self._compute_stats_from_rows(self.get_snapshot()[1],
+                                                 as_of or date.today())
 
     # ==================== 新建预检 / 一次替换事务 / 创建回执（M1） ====================
     #
@@ -2915,10 +3122,25 @@ class TaskManager:
             return False
         return outcome.get('task_id') is not None
 
+    def task_zone_name(self, task_id: int) -> str:
+        """只读：按 id 取任务当前分区名（供开播预检；读不到返回空串）。"""
+        if not isinstance(task_id, int) or isinstance(task_id, bool) \
+                or task_id <= 0:
+            return ''
+        try:
+            with self.db.coherent_read() as conn:
+                row = conn.execute(
+                    "SELECT zone_name FROM tasks WHERE id = ?",
+                    (int(task_id),)).fetchone()
+                return str(row['zone_name'] or '') if row else ''
+        except Exception:                                 # noqa: BLE001
+            return ''
+
     def update_task_fields(self, zone_name: str, data: dict,
                            task_id: Optional[int] = None,
                            expect: Optional[dict] = None,
-                           rename_to: Optional[str] = None) -> bool:
+                           rename_to: Optional[str] = None,
+                           area_state=None) -> bool:
         """更新任务字段（按 id 定位；未提供 id 时按分区名定位）。
 
         ``rename_to`` 与其它字段在**同一个事务**里提交：旧实现先调用
@@ -2927,6 +3149,12 @@ class TaskManager:
 
         在播保护是显式的：命中当前在播任务的一律拒绝（见 _guard_active_row），
         不允许"改原字段"绕开删除/覆盖的同等保护。
+
+        ``area_state(zone) -> bool | None`` 可选：把任务**改回待完成**
+        （``category`` 0→>0 或 ``today_done`` 1→0）时校验分区是否仍存在。
+        返回 ``None`` 表示分区列表不可用，``False`` 表示分区已不存在/下架；
+        两种都抛 :class:`TaskMutationRejected`（事务内，零写入）。
+        普通编辑不触发该回调。
         """
         updates = dict(data)
         if 'deadline_formula' in updates:
@@ -2939,6 +3167,16 @@ class TaskManager:
         if not filtered:
             return False
 
+        def _reactivating(row) -> bool:
+            old_category = int(row.get('category') or 0)
+            new_category = int(filtered.get('category') or 0) \
+                if 'category' in filtered else old_category
+            old_today = int(row.get('today_done') or 0)
+            new_today = int(filtered.get('today_done') or 0) \
+                if 'today_done' in filtered else old_today
+            return ((old_category == 0 and new_category > 0)
+                    or (old_today == 1 and new_today == 0))
+
         def mutate(conn):
             row = self._resolve_task_row(conn, zone_name, task_id)
             if not row:
@@ -2950,6 +3188,20 @@ class TaskManager:
                 for key, val in expect.items():
                     if row.get(key) != val:
                         return False
+            if area_state is not None and _reactivating(row):
+                resulting_zone = str(filtered.get('zone_name')
+                                     or row.get('zone_name') or '').strip()
+                state = area_state(resulting_zone)
+                if state is None:
+                    raise TaskMutationRejected(
+                        f'分区列表不可用，无法校验「{resulting_zone}」；'
+                        '请先刷新分区后重试',
+                        code='area_index_unavailable')
+                if not state:
+                    raise TaskMutationRejected(
+                        f'该分区「{resulting_zone}」已不存在或已下架，'
+                        '不能改为待完成；请先刷新分区或修正分区名',
+                        code='area_unavailable')
             set_clause = ', '.join(f"{k} = ?" for k in filtered)
             values = list(filtered.values()) + [
                 datetime.now().strftime('%Y-%m-%d %H:%M:%S'), row['id']]

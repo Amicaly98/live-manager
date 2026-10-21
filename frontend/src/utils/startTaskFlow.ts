@@ -99,6 +99,11 @@ export async function runSpecifiedTaskStart(
   if (result.superseded) return plan.operation  // 结果属于别的账号代次：不提示
   const notice = result.notice
   if (result.status === 'rejected') {
+    // 分区预检已经给出可操作的明确原因，不再追加“确认过期”的泛化提示。
+    if (notice?.message.includes('分区')) {
+      notify(notice.level, notice.message)
+      return plan.operation
+    }
     // 版本过期一类：提示用户**重新查看并确认**，绝不用最新 revision 偷偷重发。
     // 已有具体原因时**带上它**（不覆盖、不另发一条互相矛盾的"已过期"）；
     // 回执没给原因时才用通用的过期文案。

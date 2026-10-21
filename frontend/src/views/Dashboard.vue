@@ -257,9 +257,15 @@
                   <span class="stat-value success-value">{{ taskStore.stats.today_done }}</span>
                   <span class="stat-label">今日已执行</span>
                 </div>
-                <div class="stat-item">
-                  <span class="stat-value info-value">{{ taskStore.stats.today_pending }}</span>
-                  <span class="stat-label">今日待执行</span>
+                <div class="stat-item" :title="scheduleMarginPresentation.tooltip">
+                  <span class="stat-value" :class="scheduleMarginPresentation.sufficient ? 'success-value' : ''">
+                    {{ scheduleMarginPresentation.value }}
+                  </span>
+                  <span class="stat-label">容错时长</span>
+                  <small
+                    v-if="scheduleMarginPresentation.bottleneck"
+                    style="color:#909399;line-height:1.2;white-space:nowrap"
+                  >{{ scheduleMarginPresentation.bottleneck }}</small>
                 </div>
               </div>
             </el-card>
@@ -320,6 +326,7 @@ import { useLiveStore } from '@/stores/live'
 import { useSettingsStore } from '@/stores/settings'
 import { operationEvents } from '@/stores/operationEvents'
 import { usePolling } from '@/composables/usePolling'
+import { getScheduleMarginPresentation } from '@/utils/taskMargin'
 import type { FaceConfirmRequest, PushSource } from '@/types/session'
 import Sidebar from '@/components/Sidebar.vue'
 import StreamConfigurator from '@/components/StreamConfigurator.vue'
@@ -350,6 +357,8 @@ const lastManualZone = ref(sessionStorage.getItem('lastManualZone') || '')
 const lastManualDuration = ref(Number(sessionStorage.getItem('lastManualDuration')) || 120)
 
 const roomId = computed(() => Number(liveStore.projection?.room_id ?? 0) || 0)
+const scheduleMarginPresentation = computed(
+  () => getScheduleMarginPresentation(taskStore.stats))
 /** 有没有可画的目标进度：有场次且目标有限。 */
 const progressRendered = computed(
   () => liveStore.hasRun && liveStore.targetSeconds > 0 && liveStore.durationKnown)
@@ -831,19 +840,55 @@ function formatDuration(seconds: number): string {
 }
 .empty-event { text-align: center; padding: 24px; }
 .event-item { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid #f5f5f5; }
-.event-msg { flex: 1; font-size: 13px; color: #606266; }
+.event-msg { flex: 1; min-width: 0; overflow-wrap: anywhere; font-size: 13px; color: #606266; }
 .event-time { font-size: 12px; color: #c0c4cc; }
 /* ===== 手机端适配 ===== */
 @media (max-width: 768px) {
-  .dashboard { flex-direction: column; }
+  /* 小屏按内容向下滚动，日志不再争用首屏剩余的几十像素。 */
+  .dashboard {
+    display: block;
+    height: auto;
+    min-height: 100vh;
+    overflow: visible;
+  }
+  .dashboard > .el-container {
+    display: block;
+    width: 100%;
+  }
   .main-content {
     padding: 56px 12px 12px;
-    min-height: auto;
-    overflow: auto;
+    display: block;
+    width: 100%;
+    min-height: 0;
+    overflow: visible;
   }
-  .top-cards { margin-bottom: 12px; }
+  .top-cards { margin-bottom: 16px; row-gap: 12px; }
   .top-cards :deep(.el-card__body) { padding: 12px 14px !important; }
   .top-cards :deep(.el-card__header) { padding-left: 14px; padding-right: 14px; }
+  .info-row { gap: 12px; }
+  .info-row .label { flex-shrink: 0; }
+  .info-row .value { min-width: 0; overflow-wrap: anywhere; text-align: right; }
+  .progress-header { gap: 6px 12px; flex-wrap: wrap; }
+
+  .event-card {
+    height: 65vh;
+    height: 65svh;
+    min-height: 360px;
+    max-height: 640px;
+  }
+  .event-card :deep(.el-card__body) { min-height: 0; }
+  .event-list { min-height: 0; }
+  .event-item {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 6px 8px;
+    padding: 12px 0;
+  }
+  .event-item > .el-tag { justify-self: start; }
+  .event-msg { grid-column: 1 / -1; grid-row: 2; line-height: 1.6; }
+  .event-src { grid-column: 2; grid-row: 1; }
+  .event-time { grid-column: 3; grid-row: 1; white-space: nowrap; color: #909399; }
 
   /* 统计栏：3列2行紧凑排列 */
   .stats-grid {
@@ -852,6 +897,7 @@ function formatDuration(seconds: number): string {
     grid-template-rows: repeat(2, 1fr) !important;
     gap: 6px !important;
     width: 100% !important;
+    min-width: 0;
   }
   .stat-item {
     width: auto !important;

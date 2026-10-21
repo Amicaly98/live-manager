@@ -100,6 +100,17 @@ export interface TaskStats {
   remaining_time: number
   avg_remaining: number
   urgency: number
+  /** 服务端计划时容错余量；旧版服务端可能不返回。 */
+  schedule_margin?: ScheduleMargin | null
+}
+
+export interface ScheduleMargin {
+  business_date: string
+  hours: number | null
+  bottleneck_date: string | null
+  bottleneck_days: number | null
+  sufficient: boolean
+  reason: string | null
 }
 
 export interface TaskListResponse {
@@ -112,6 +123,8 @@ export interface TaskListResponse {
   remaining_time: number
   avg_remaining: number
   urgency: number
+  /** 与统计接口相同，旧版服务端可能不返回。 */
+  schedule_margin?: ScheduleMargin | null
 }
 
 export interface NextTaskResponse {
@@ -325,6 +338,8 @@ export interface TaskDetailResponse {
   remaining_time: number
   avg_remaining: number
   urgency: number
+  /** 与统计接口相同，旧版服务端可能不返回。 */
+  schedule_margin?: ScheduleMargin | null
 }
 
 export interface ImportResult {

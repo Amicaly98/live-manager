@@ -87,6 +87,22 @@ class SettleTask(Effect):
     settlement_guard: Optional[int] = None
 
 
+@dataclass(frozen=True)
+class MarkTaskAreaUnavailable(Effect):
+    """把平台判定“分区已下架”的任务按负优先度规则不可完成移出。
+
+    数据端口执行（保留任务记录）；它占用同一个在途操作槽，因此不会与关房/
+    开播请求并发。
+    """
+
+    op_id: str
+    run_id: str
+    task_id: Optional[int]
+    zone_name: str = ''
+    business_day: str = ''
+    reason: str = 'area_unavailable'
+
+
 # ---------------- 媒体端口（不占用操作槽） ----------------
 
 @dataclass(frozen=True)

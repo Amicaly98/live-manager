@@ -14,13 +14,21 @@ _loader: Optional[Any] = None
 
 
 def get_area_loader() -> Any:
-    """本实例的分区加载器（懒构造；缓存路径来自 ``config`` 的数据目录）。"""
+    """本实例的分区加载器（懒构造；路径来自 ``area_data.area_cache_path``）。
+
+    返回前按文件签名检查一次：共享分区列表被其他实例刷新后，本实例的
+    面板搜索、导入校验与刷新入口无需重启即可看到新内容。
+    """
     global _loader
     with _lock:
         if _loader is None:
             from ..live_controller import AreaLoader
             _loader = AreaLoader()
-        return _loader
+        loader = _loader
+    reload_if_changed = getattr(loader, 'reload_if_changed', None)
+    if callable(reload_if_changed):
+        reload_if_changed()
+    return loader
 
 
 def reset_area_loader() -> None:

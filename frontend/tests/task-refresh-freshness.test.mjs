@@ -370,6 +370,21 @@ test('版本提示路径（refreshTasksIfStale）：旧读晚回同样不倒退'
   assert.equal(w.tasks.tasksRevision, 11, '迟到的旧读不得倒退')
 })
 
+test('更新失败：lastUpdateError 透传服务端 detail（分区不可用）', async () => {
+  const w = buildWorld()
+  w.auth.isLoggedIn = true
+  const update = w.tasks.updateTask('SYNTHETIC', { category: 2 }, 1)
+  await waitParked(w.transport, '/api/tasks/SYNTHETIC')
+  const error = Object.assign(new Error('Request failed'), {
+    response: { data: { detail: '该分区「SYNTHETIC」已不存在或已下架，不能改为待完成' } },
+  })
+  w.transport.releaseError('/api/tasks/SYNTHETIC', error)
+  const ok = await update
+  assert.equal(ok, false, '被拒绝的编辑必须如实返回失败')
+  assert.ok(w.tasks.lastUpdateError.includes('已不存在'),
+            '页面必须能展示服务端的明确原因')
+})
+
 async function run() {
   let failures = 0
   for (const [name, fn] of tests) {

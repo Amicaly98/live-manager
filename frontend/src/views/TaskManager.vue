@@ -20,11 +20,11 @@
           <el-icon><Plus /></el-icon>
           新建任务
         </el-button>
-        <el-button @click="reloadTasks" :loading="taskStore.isLoading">
+        <el-button class="task-desktop-tool" @click="reloadTasks" :loading="taskStore.isLoading">
           <el-icon><Refresh /></el-icon>
           重新加载
         </el-button>
-        <el-button @click="refreshAreas" :loading="refreshingAreas">
+        <el-button class="task-desktop-tool" @click="refreshAreas" :loading="refreshingAreas">
           <el-icon><RefreshRight /></el-icon>
           刷新分区
         </el-button>
@@ -35,14 +35,35 @@
           style="display:none"
           @change="onFileSelected"
         />
-        <el-button @click="fileInputRef?.click()">
+        <el-button class="task-desktop-tool" @click="fileInputRef?.click()">
           <el-icon><Upload /></el-icon>
           导入 Excel
         </el-button>
-        <el-button @click="handleExport" :loading="exporting">
+        <el-button class="task-desktop-tool" @click="handleExport" :loading="exporting">
           <el-icon><Download /></el-icon>
           导出 Excel
         </el-button>
+        <el-dropdown class="task-mobile-tools" trigger="click">
+          <el-button aria-label="更多任务工具">
+            更多工具 <el-icon class="el-icon--right" aria-hidden="true"><ArrowDown /></el-icon>
+          </el-button>
+          <template #dropdown>
+            <el-dropdown-menu>
+              <el-dropdown-item :disabled="taskStore.isLoading" @click="reloadTasks">
+                重新加载
+              </el-dropdown-item>
+              <el-dropdown-item :disabled="refreshingAreas" @click="refreshAreas">
+                刷新分区
+              </el-dropdown-item>
+              <el-dropdown-item @click="fileInputRef?.click()">
+                导入 Excel
+              </el-dropdown-item>
+              <el-dropdown-item :disabled="exporting" @click="handleExport">
+                导出 Excel
+              </el-dropdown-item>
+            </el-dropdown-menu>
+          </template>
+        </el-dropdown>
         <span class="stats-info">
           共 {{ taskStore.stats.total }} 个任务，{{ taskStore.stats.today_pending }} 个今日待执行
         </span>
@@ -97,6 +118,7 @@
       <!-- 任务列表 -->
       <el-table
         :data="taskStore.tasks"
+        class="task-desktop-table"
         stripe
         style="width: 100%"
         max-height="calc(100vh - 139px)"
@@ -191,6 +213,109 @@
           </template>
         </el-table-column>
       </el-table>
+
+      <!-- 手机端紧凑任务行：保留主要字段，次要操作收进“更多”。 -->
+      <div class="task-mobile-list" v-loading="taskStore.isLoading">
+        <el-empty
+          v-if="taskStore.tasks.length === 0 && !taskStore.isLoading"
+          description="暂无任务数据"
+        />
+        <article
+          v-for="(row, index) in taskStore.tasks"
+          :key="row.id ?? row.zone_name"
+          class="task-mobile-row"
+        >
+          <div class="task-mobile-row-head">
+            <div class="task-mobile-zone-priority">
+              <span class="task-mobile-index" :aria-label="`序号 ${index + 1}`">{{ index + 1 }}</span>
+              <span class="task-mobile-zone" :title="row.zone_name">{{ row.zone_name }}</span>
+              <span class="task-mobile-priority">优先度 {{ row.priority }}</span>
+            </div>
+            <el-tag v-if="row.is_completed" type="success" size="small">
+              全部完成
+            </el-tag>
+            <el-tag v-else-if="executingLabel(row)" :type="executingTagType(row)" size="small">
+              {{ executingLabel(row) }}
+            </el-tag>
+            <el-tag v-else-if="row.today_done === 1" type="success" size="small">
+              今日完成
+            </el-tag>
+            <el-tag v-else type="info" size="small">待执行</el-tag>
+          </div>
+
+          <div class="task-mobile-row-foot">
+            <div class="task-mobile-progress" :aria-label="`进度 ${row.days_done}/${row.actual_days} 天`">
+              <span class="task-mobile-progress-count">{{ row.days_done }}/{{ row.actual_days }} 天</span>
+              <el-progress
+                class="task-mobile-progress-bar"
+                :percentage="Math.round((row.days_done / row.actual_days) * 100)"
+                :stroke-width="12"
+                :show-text="false"
+                :status="row.is_completed ? 'success' : ''"
+              />
+            </div>
+            <el-button
+              v-if="row.needs_execution"
+              class="task-mobile-start"
+              type="primary"
+              size="small"
+              :disabled="!canStartNew"
+              :title="canStartNew ? '立即开播' : startBlockedLabel"
+              :aria-label="'开播任务：' + row.zone_name
+                + (canStartNew ? '' : '；' + startBlockedLabel)"
+              @click="confirmStartLive(row)"
+            >
+              <span>{{ canStartNew ? '立即开播' : startBlockedLabel }}</span>
+            </el-button>
+            <el-dropdown
+              class="task-mobile-more"
+              trigger="click"
+              popper-class="task-mobile-actions-popper"
+            >
+              <el-button
+                class="task-mobile-more-trigger"
+                size="small"
+                :aria-label="'更多任务操作：' + row.zone_name"
+              >
+                更多 <el-icon class="el-icon--right" aria-hidden="true"><ArrowDown /></el-icon>
+              </el-button>
+              <template #dropdown>
+                <el-dropdown-menu>
+                  <el-dropdown-item
+                    v-if="row.needs_execution"
+                    :disabled="isExecuting(row)"
+                    @click.stop="confirmMarkDone(row.zone_name)"
+                  >
+                    标记完成
+                  </el-dropdown-item>
+                  <el-dropdown-item
+                    v-if="row.needs_execution"
+                    :disabled="isExecuting(row)"
+                    @click.stop="confirmMarkAllDone(row.zone_name)"
+                  >
+                    全部完成
+                  </el-dropdown-item>
+                  <el-dropdown-item @click.stop="openHistory(row.zone_name)">
+                    历史
+                  </el-dropdown-item>
+                  <el-dropdown-item
+                    :disabled="isExecuting(row)"
+                    @click.stop="openEditDialog(row as TaskItem)"
+                  >
+                    编辑
+                  </el-dropdown-item>
+                  <el-dropdown-item
+                    :disabled="isExecuting(row)"
+                    @click.stop="confirmDelete(row.zone_name)"
+                  >
+                    删除
+                  </el-dropdown-item>
+                </el-dropdown-menu>
+              </template>
+            </el-dropdown>
+          </div>
+        </article>
+      </div>
 
       <!-- 新建/编辑任务对话框 -->
       <el-dialog
@@ -764,7 +889,7 @@ async function submitTask() {
         ElMessage.success('任务已更新')
         showCreateDialog.value = false
       } else {
-        ElMessage.error('更新失败')
+        ElMessage.error(taskStore.lastUpdateError || '更新失败')
       }
       return
     }
@@ -1483,21 +1608,120 @@ async function refreshAreas() {
 /* 优先度列紧凑 */
 :deep(.el-table__body-wrapper) { overflow-x: auto; }
 
+.task-mobile-list,
+.task-mobile-tools {
+  display: none;
+}
+
 /* ===== 手机端适配 ===== */
 @media (max-width: 768px) {
   .main-content {
-    padding: 56px 12px 12px;
+    padding: 72px 12px 12px;
     height: auto;
     min-height: 100vh;
+    min-width: 0;
   }
   .toolbar {
     flex-wrap: wrap;
     gap: 6px;
   }
+  .task-desktop-tool {
+    display: none;
+  }
+  .task-mobile-tools {
+    display: inline-flex;
+  }
   .stats-info {
     width: 100%;
     margin-left: 0;
     margin-top: 4px;
+  }
+  .task-desktop-table {
+    display: none;
+  }
+  .task-mobile-list {
+    display: block;
+    width: 100%;
+    min-width: 0;
+  }
+  .task-mobile-row {
+    padding: 6px 0;
+    border-bottom: 1px solid #e4e7ed;
+  }
+  .task-mobile-row-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    min-height: 24px;
+    white-space: nowrap;
+  }
+  .task-mobile-zone-priority {
+    display: flex;
+    flex: 1 1 auto;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+  }
+  .task-mobile-index {
+    flex: 0 0 auto;
+    min-width: 12px;
+    color: #909399;
+    font-size: 11px;
+    text-align: right;
+  }
+  .task-mobile-zone {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    color: #303133;
+    font-size: 14px;
+    font-weight: 600;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .task-mobile-priority {
+    flex: 0 0 auto;
+    color: #606266;
+    font-size: 12px;
+  }
+  .task-mobile-row-head :deep(.el-tag) {
+    flex: 0 0 auto;
+    white-space: nowrap;
+  }
+  .task-mobile-row-foot {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-top: 4px;
+  }
+  .task-mobile-progress {
+    display: flex;
+    flex: 1 1 auto;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+  }
+  .task-mobile-progress-count {
+    flex: 0 0 auto;
+    color: #606266;
+    font-size: 12px;
+    white-space: nowrap;
+  }
+  .task-mobile-progress-bar {
+    flex: 1 1 auto;
+    min-width: 24px;
+  }
+  .task-mobile-start {
+    flex: 0 0 auto;
+    max-width: 96px;
+    min-width: 0;
+  }
+  .task-mobile-start span {
+    display: block;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 }
 </style>

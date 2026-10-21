@@ -193,6 +193,18 @@ await test('未受理但有明确原因：按回执语义如实转述并给出�
     [['warning', '未被受理：目标已变化。请刷新任务列表后重新确认']])
 })
 
+await test('分区不可用被拒：保留明确原因，不追加确认过期', async () => {
+  const plan = makePlan()
+  const message = '未被受理：该分区已不存在或已下架'
+  const { deps, calls } = makeDeps({
+    plan,
+    results: [{ superseded: false, notice: { level: 'error', message }, status: 'rejected' }],
+  })
+  await runSpecifiedTaskStart(deps)
+  assert.equal(calls.start.length, 1, '不自动重发被拒的操作')
+  assert.deepEqual(calls.notify, [['error', message]], '一条明确原因足以说明分区不可用')
+})
+
 const failed = results.filter(r => r.status === 'FAIL').length
 console.log(`\n${results.length - failed}/${results.length} passed`)
 process.exit(failed ? 1 : 0)

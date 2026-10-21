@@ -240,7 +240,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="直播控制系统 API",
     description="面向主播的一站式自动化直播管理工具后端（桌面版）",
-    version="1.1.1",
+    version="1.2.0",
     lifespan=lifespan
 )
 

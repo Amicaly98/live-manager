@@ -18,15 +18,19 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import replace
 from datetime import date
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Dict, Optional
 
 from ..session import ledger as session_ledger
 from ..session import effects as fx
-from ..session.events import LedgerResult, SelectionResult
-from ..session.model import MODE_SINGLE, SELECT_SINGLE, SELECT_TASK
+from ..session.events import LedgerResult, SelectionResult, TaskAreaMarkResult
+from ..session.model import (
+    MODE_SINGLE, SELECT_AUTO, SELECT_SINGLE, SELECT_TASK)
 from ..task_manager import TaskMutationRejected
+
+logger = logging.getLogger(__name__)
 
 
 class UnsupportedNamedTicket(RuntimeError):
@@ -45,14 +49,21 @@ def parse_business_day(value: Any) -> Optional[date]:
 class TaskDataPort:
     """一个实例一份：真实 TaskManager（真实 SQLite）＋真实账本适配器。"""
 
+    #: 一次选场最多连续移出多少个“分区不可用”的任务（防异常列表造成长时间占用）。
+    _MAX_AREA_MOVE_OUTS = 32
+
     def __init__(self, task_manager, store, clock, account,
-                 area_lookup: Optional[Callable[[str], Optional[int]]] = None
+                 area_lookup: Optional[Callable[[str], Optional[int]]] = None,
+                 area_index: Optional[Callable[[], Dict[str, int]]] = None,
+                 area_index_ready: Optional[Callable[[], bool]] = None
                  ) -> None:
         self._task_manager = task_manager
         self._store = store
         self._clock = clock
         self._account = account
         self._area_lookup = area_lookup
+        self._area_index = area_index
+        self._area_index_ready = area_index_ready
         #: 证据用计数：本端口实际调用了几次真实选取入口。
         self.select_calls = 0
         self.reset_calls = 0
@@ -105,11 +116,17 @@ class TaskDataPort:
             if instruction is None:
                 return self._not_found(effect, 'named_ticket_task_missing',
                                        terminal=True)
+            area = self._area_for(instruction.zone_name)
+            if (self._area_lookup is not None or self._area_index is not None) \
+                    and not self._valid_area(area):
+                # 手动入口已有同步预检；这里是并发竞态下的兜底：绝不带空分区开播。
+                return self._not_found(effect, 'named_area_unresolved',
+                                       terminal=True)
             return SelectionResult(
                 operation_id=effect.op_id, found=True,
                 task_id=instruction.task_id,
                 zone_name=instruction.zone_name,
-                area_id=self._area_for(instruction.zone_name),
+                area_id=area,
                 target_seconds=float(instruction.duration_seconds),
                 business_day=ticket_day,
                 settlement_guard=guard,
@@ -143,32 +160,211 @@ class TaskDataPort:
         if not self._task_manager.reset_daily_flags(target_date=day):
             return self._not_found(effect, 'daily_reset_failed')
 
-        self.select_calls += 1
-        try:
-            instruction, guard = self._task_manager.select_for_run(
-                business_date=day.isoformat())
-        except Exception as exc:
-            return self._not_found(effect, f'select_failed:{type(exc).__name__}')
-        if instruction is None:
-            return self._not_found(effect, 'no_tasks')
+        has_area_provider = (self._area_lookup is not None
+                             or self._area_index is not None)
+        tried = set()
+        for _ in range(self._MAX_AREA_MOVE_OUTS):
+            self.select_calls += 1
+            try:
+                instruction, guard = self._task_manager.select_for_run(
+                    business_date=day.isoformat())
+            except Exception as exc:
+                return self._not_found(
+                    effect, f'select_failed:{type(exc).__name__}')
+            if instruction is None:
+                return self._not_found(effect, 'no_tasks')
 
-        return SelectionResult(
-            operation_id=effect.op_id, found=True,
-            task_id=instruction.task_id,
-            zone_name=instruction.zone_name,
-            area_id=self._area_for(instruction.zone_name),
-            target_seconds=float(instruction.duration_seconds),
-            business_day=effect.business_day,
-            # 与任务行同一份读快照里冻结的人工进度代数，原样带走。
-            settlement_guard=guard)
+            if self._area_index is not None:
+                # 全量索引本身同时给出“目录可用”与“分区是否存在”；解析和授权
+                # 移出必须使用同一次读取，不能让后续恢复的列表替先前的空读背书。
+                area_index = self._selection_area_snapshot()
+                if area_index is None:
+                    return self._not_found(effect, 'area_index_unavailable')
+                area = area_index.get(str(instruction.zone_name or '').strip())
+            else:
+                area = self._area_for(instruction.zone_name)
+            if self._valid_area(area):
+                return SelectionResult(
+                    operation_id=effect.op_id, found=True,
+                    task_id=instruction.task_id,
+                    zone_name=instruction.zone_name,
+                    area_id=area,
+                    target_seconds=float(instruction.duration_seconds),
+                    business_day=effect.business_day,
+                    # 与任务行同一份读快照里冻结的人工进度代数，原样带走。
+                    settlement_guard=guard)
+
+            if not has_area_provider:
+                # 没有任何分区能力（旧夹具/特殊部署）：保持历史上的 found+None。
+                return SelectionResult(
+                    operation_id=effect.op_id, found=True,
+                    task_id=instruction.task_id,
+                    zone_name=instruction.zone_name,
+                    area_id=None,
+                    target_seconds=float(instruction.duration_seconds),
+                    business_day=effect.business_day,
+                    settlement_guard=guard)
+
+            if (self._area_index is None
+                    and not self._area_index_available()):
+                # 列表缺失/损坏：不迁移任务；核心按既有节奏重试，等待刷新恢复。
+                return self._not_found(effect, 'area_index_unavailable')
+
+            task_id = instruction.task_id
+            if task_id in tried:
+                return self._not_found(effect, 'area_unresolved')
+            tried.add(task_id)
+            moved = self._task_manager.move_out_area_unavailable(
+                task_id=task_id, business_day=day.isoformat(),
+                zone_name=instruction.zone_name)
+            if not moved:
+                return self._not_found(effect, 'area_unresolved')
+            logger.warning(
+                '分区「%s」不存在或已下架：任务 %s 按不可完成移出（业务日 %s）',
+                instruction.zone_name, task_id, day.isoformat())
+        return self._not_found(effect, 'area_move_out_limit')
+
+    @staticmethod
+    def _valid_area(area) -> bool:
+        return isinstance(area, int) and not isinstance(area, bool) and area > 0
 
     def _area_for(self, zone_name: str) -> Optional[int]:
+        zone = str(zone_name or '').strip()
+        if self._area_index is not None:
+            try:
+                return self._area_index().get(zone)
+            except Exception:
+                return None
         if self._area_lookup is None:
             return None
         try:
             return self._area_lookup(zone_name)
         except Exception:
             return None
+
+    def _selection_area_snapshot(self) -> Optional[Dict[str, int]]:
+        """自动选场的一份完整可用索引；空/坏/异常都表示未知，不能移出任务。
+
+        ``area_index_ready`` 只能否决已读到的完整索引，不能为未知索引背书；
+        因此先验证并冻结索引快照，再应用显式 readiness 的额外否决。
+        """
+        if self._area_index is None:
+            return None
+        try:
+            index = self._area_index()
+            if not isinstance(index, dict) or not index:
+                return None
+            snapshot = dict(index)
+        except Exception:
+            return None
+        if self._area_index_ready is not None:
+            try:
+                if not self._area_index_ready():
+                    return None
+            except Exception:
+                return None
+        return snapshot
+
+    def _area_index_available(self) -> bool:
+        """分区列表是否可用于“移出”判断（缺失/损坏时不得动任务）。
+
+        只有 ``area_lookup`` 的旧夹具/特殊装配把注入的解析器视为唯一权威
+        （测试替身与旧组装依赖这一语义）。全量索引装配由
+        ``_selection_area_snapshot`` 单次验证；生产只注入热索引，不另注入就绪回调。
+        """
+        if self._area_index_ready is not None:
+            try:
+                return bool(self._area_index_ready())
+            except Exception:
+                return False
+        if self._area_index is not None:
+            try:
+                return bool(self._area_index())
+            except Exception:
+                return False
+        return self._area_lookup is not None
+
+    @staticmethod
+    def _field(selection, name):
+        if isinstance(selection, dict):
+            return selection.get(name)
+        return getattr(selection, name, None)
+
+    def _task_zone(self, task_id) -> str:
+        if not self._valid_area(task_id):
+            return ''
+        getter = getattr(self._task_manager, 'task_zone_name', None)
+        if not callable(getter):
+            return ''
+        try:
+            return str(getter(task_id) or '')
+        except Exception:
+            return ''
+
+    def _zone_preflight(self, zone: str) -> str:
+        """只读分区预检；返回空串表示放行。"""
+        if self._area_lookup is None and self._area_index is None:
+            return ''
+        if self._area_index is not None:
+            # 预检和自动选场一样，只从同一份完整索引同时判断可用性与分区存在性。
+            index = self._selection_area_snapshot()
+            if index is None:
+                return '分区列表不可用（未加载），请先刷新分区后重试'
+            if not self._valid_area(index.get(str(zone or '').strip())):
+                return (f'该分区「{zone}」已不存在（或已下架），'
+                        '请先刷新分区或修正分区名')
+            return ''
+        if not self._area_index_available():
+            return '分区列表不可用（未加载），请先刷新分区后重试'
+        if not self._valid_area(self._area_for(zone)):
+            return (f'该分区「{zone}」已不存在（或已下架），'
+                    '请先刷新分区或修正分区名')
+        return ''
+
+    def preflight_start(self, mode: str, selection) -> str:
+        """手动/指定开播的同步预检（只读）。
+
+        - 单次模式：显式合法 ``area_id`` 直接放行；否则按冻结的分区名校验；
+        - 指定任务：按任务 id 读取当前分区名校验；
+        - 自动模式：不预检（选场阶段自行跳过/移出）。
+        返回空串放行；任何异常都按放行处理（核心与端口仍会兜底拒发空分区）。
+        """
+        try:
+            kind = self._field(selection, 'kind')
+            zone = str(self._field(selection, 'zone_name') or '').strip()
+            explicit = self._field(selection, 'area_id')
+            if mode == MODE_SINGLE or kind == SELECT_SINGLE:
+                if self._valid_area(explicit):
+                    return ''
+                if not zone:
+                    return '请选择要开播的分区'
+                return self._zone_preflight(zone)
+            if kind == SELECT_TASK:
+                zone = self._task_zone(
+                    self._field(selection, 'task_id')) or zone
+                if not zone:
+                    return ''
+                return self._zone_preflight(zone)
+            return ''
+        except Exception:                                 # noqa: BLE001
+            logger.warning('开播分区预检异常（按放行处理）', exc_info=True)
+            return ''
+
+    # ------------------------------------------------------ 分区不可用移出
+
+    def mark_area_unavailable(self, effect) -> TaskAreaMarkResult:
+        """执行核心的“不可完成移出”效果；失败只回执，不抛异常。"""
+        try:
+            ok = self._task_manager.move_out_area_unavailable(
+                task_id=effect.task_id, business_day=effect.business_day,
+                zone_name=effect.zone_name, reason=effect.reason)
+            return TaskAreaMarkResult(
+                operation_id=effect.op_id, ok=bool(ok),
+                reason='' if ok else 'not_applied')
+        except Exception as exc:                          # noqa: BLE001
+            return TaskAreaMarkResult(
+                operation_id=effect.op_id, ok=False,
+                reason=f'{type(exc).__name__}: {exc}')
 
     def _day_has_passed(self, day: date) -> bool:
         current = (self._task_manager.reset_completed_date

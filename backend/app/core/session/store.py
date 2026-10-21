@@ -54,6 +54,7 @@ from .model import (
     STEP_RESUME_QUERY,
     STEP_WAIT_TASKS,
     STOP_ACCOUNT_EXIT,
+    STOP_AREA_UNAVAILABLE,
     STOP_FACE_VERIFY,
     STOP_PLATFORM_REJECTED,
     STOP_SELECTION_REJECTED,
@@ -90,8 +91,8 @@ ALL_STEPS = (
     STEP_OPEN, STEP_LIVE,
 )
 STOP_REASONS = (STOP_USER, STOP_TARGET_REACHED, STOP_FACE_VERIFY,
-                STOP_PLATFORM_REJECTED, STOP_ACCOUNT_EXIT,
-                STOP_SELECTION_REJECTED)
+                STOP_PLATFORM_REJECTED, STOP_AREA_UNAVAILABLE,
+                STOP_ACCOUNT_EXIT, STOP_SELECTION_REJECTED)
 END_REASONS = (END_COMPLETED, END_MIDNIGHT, END_REPLACED)
 
 #: 旧 ``live_state.json`` 的特征键。只有**完全没有**新格式键时才按旧格式解释。
@@ -310,6 +311,9 @@ def _validate_run(raw: Any) -> Tuple[Optional[Run], str]:
     if task_source_revision is not None and (
             not _is_int(task_source_revision) or task_source_revision < 0):
         return None, 'run.task_source_revision 非法'
+    for flag_name in ('area_unavailable', 'area_unavailable_marked'):
+        if not isinstance(raw.get(flag_name, False), bool):
+            return None, f'run.{flag_name} 非法'
     clock, error = _validate_clock(raw.get('clock') or {})
     if clock is None:
         return None, error

@@ -151,6 +151,7 @@ a = Analysis(
         'app.core.config',
         'app.core.db',
         'app.core.task_manager',
+        'app.core.task_margin',
         'app.core.task_manager_recovered',
         'app.core.live_controller',
         'app.core.email_sender',

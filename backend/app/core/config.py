@@ -143,6 +143,11 @@ def get_data_path(filename: str = ""):
     return base / filename if filename else base
 
 
+def data_dir_initialized() -> bool:
+    """数据目录是否已显式初始化（供可持久化判断使用）。"""
+    return _data_dir_initialized
+
+
 def get_project_root() -> Path:
     """获取桌面项目根目录（bilibili-live-manager/）。"""
     return BASE_DIR
@@ -161,8 +166,9 @@ def _p(name: str) -> Path:
 
 
 def area_file_path() -> Path:
-    """运行时分区缓存路径（数据目录内）。"""
-    return _p(AREA_CACHE_FILENAME)
+    """运行时分区缓存路径（环境变量覆盖优先，其次桌面数据目录）。"""
+    from app.core.area_data import area_cache_path
+    return area_cache_path()
 
 
 # ==================== 运行时数据文件（全部在数据目录内） ====================
@@ -218,7 +224,7 @@ API_PORT = int(os.getenv("API_PORT", "8000"))
 
 # ==================== 发布标识 ====================
 #: **唯一的发布构建标识来源**：状态读取与控制受理都以它判断"是否同一发布版本"。
-RELEASE_ID = "20261009-desktop-port-1"
+RELEASE_ID = "20261022-desktop-1.2.0"
 
 # ==================== Bilibili API ====================
 BILIBILI_APP_KEY = "aae92bc66f3edfab"
