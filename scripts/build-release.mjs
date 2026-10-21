@@ -154,7 +154,7 @@ function main() {
 
   // ---------- 源码提交 ----------
   const git = (args) => {
-    const result = spawnSync('git', ['-c', `safe.directory=${ROOT}`, ...args], {
+    const result = spawnSync('git', ['-c', `safe.directory=${ROOT.replaceAll('\\', '/')}`, ...args], {
       cwd: ROOT, encoding: 'utf8', windowsHide: true,
     });
     if (result.error || result.status !== 0) {
